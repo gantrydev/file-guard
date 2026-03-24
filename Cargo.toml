@@ -1,0 +1,47 @@
+[package]
+name = "cred-guard"
+version = "0.1.0"
+edition = "2024"
+description = "Endpoint Security credential access control daemon for macOS"
+license = "MIT"
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Config
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# TUI prompting
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Path expansion
+dirs = "6.0"
+
+# Process info
+sysinfo = "0.33"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Log serialization
+serde_json = "1.0"
+
+# File locking for config append
+fs2 = "0.4"
+
+# macOS Endpoint Security FFI
+libc = "0.2"

@@ -1,0 +1,21 @@
+[settings]
+default_action = "deny"
+prompt_timeout = 30
+prompt_method = "terminal"
+restore_on_stop = false
+
+[[watch]]
+path = "~/.aws/credentials"
+
+[[watch]]
+path = "~/.ssh/id_ed25519"
+
+[[rule]]
+file = "~/.aws/credentials"
+binary = "/opt/homebrew/bin/terraform"
+action = "allow"
+
+[[rule]]
+file = "~/.ssh/id_ed25519"
+binary = "/usr/bin/ssh"
+action = "allow"
