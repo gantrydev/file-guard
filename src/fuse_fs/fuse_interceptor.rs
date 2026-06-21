@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use fuser::MountOption;
+use fuser::{Config, MountOption, SessionACL};
 
 use super::credential_fs::CredentialFs;
 use crate::interceptor::{Interceptor, InterceptorArgs};
@@ -137,17 +137,18 @@ impl Interceptor for FuseInterceptor {
                 )?;
 
                 // Read-write mount: writes are gated per-open like reads.
-                let mut mount_options = vec![MountOption::FSName("file-guard".to_string())];
+                let mut config = Config::default();
+                config.mount_options = vec![MountOption::FSName("file-guard".to_string())];
                 // When the daemon runs as root (the privileged deployment), the
                 // mount must be reachable by the guarded user's own processes.
                 // Requires `user_allow_other` in /etc/fuse.conf
                 // (NixOS: programs.fuse.userAllowOther = true).
                 if unsafe { libc::geteuid() == 0 } {
-                    mount_options.push(MountOption::AllowOther);
+                    config.acl = SessionACL::All;
                 }
 
-                let session = fuser::spawn_mount2(credential_fs, watched_path, &mount_options)
-                    .map_err(|e| {
+                let session =
+                    fuser::spawn_mount2(credential_fs, watched_path, &config).map_err(|e| {
                         anyhow::anyhow!("failed to mount FUSE at {}: {e}", watched_path.display())
                     })?;
 

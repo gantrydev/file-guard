@@ -41,14 +41,14 @@ clap = { version = "4.5", features = ["derive"] }
 
 # Config
 serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
+toml = "1.1"
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
 
 # TUI prompting
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # Logging
 tracing = "0.1"
@@ -61,7 +61,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "6.0"
 
 # Process info
-sysinfo = "0.33"
+sysinfo = "0.39"
 
 # Error handling
 anyhow = "1.0"
@@ -77,11 +77,11 @@ fs2 = "0.4"
 libc = "0.2"
 
 # Binary identity pinning (re-prompt when a binary changes)
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 # Surgical config edits that preserve comments/formatting (`rules remove`)
 toml_edit = "0.25"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = "0.15"
+fuser = "0.17"

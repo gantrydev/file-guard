@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    FUSE_ROOT_ID, FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, INodeNo,
+    LockOwner, OpenFlags, ReplyAttr, ReplyData, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite,
+    Request, TimeOrNow, WriteFlags,
 };
 
 use crate::logging::AccessLogger;
@@ -24,7 +25,7 @@ fn build_file_attr(file_size: u64) -> FileAttr {
     let now = SystemTime::now();
 
     FileAttr {
-        ino: FUSE_ROOT_ID,
+        ino: INodeNo::ROOT,
         size: file_size,
         blocks: 1,
         atime: now,
@@ -44,7 +45,7 @@ fn build_file_attr(file_size: u64) -> FileAttr {
     }
 }
 
-fn slice_content(content: &[u8], offset: i64, size: u32) -> &[u8] {
+fn slice_content(content: &[u8], offset: u64, size: u32) -> &[u8] {
     let start = offset as usize;
     let content_len = content.len();
     let past_end = start >= content_len;
@@ -204,28 +205,29 @@ impl CredentialFs {
 }
 
 impl Filesystem for CredentialFs {
-    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        if ino != FUSE_ROOT_ID {
-            reply.error(libc::ENOENT);
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        if ino != INodeNo::ROOT {
+            reply.error(Errno::ENOENT);
             return;
         }
         let attr = build_file_attr(*self.current_size.lock().unwrap());
         reply.attr(&default_ttl(), &attr);
     }
 
-    fn lookup(&mut self, _req: &Request, _parent: u64, _name: &OsStr, reply: ReplyEntry) {
-        reply.error(libc::ENOENT);
+    fn lookup(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEntry) {
+        reply.error(Errno::ENOENT);
     }
 
-    fn open(&mut self, req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
-        if ino != FUSE_ROOT_ID {
-            reply.error(libc::ENOENT);
+    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        if ino != INodeNo::ROOT {
+            reply.error(Errno::ENOENT);
             return;
         }
 
+        let flags = flags.0;
         let access = Access::from_open_flags(flags);
         if self.authorize(req.pid(), access).is_none() {
-            reply.error(libc::EACCES);
+            reply.error(Errno::EACCES);
             return;
         }
 
@@ -248,22 +250,22 @@ impl Filesystem for CredentialFs {
         }
 
         let fh = self.register_handle(HandleState { access, buf, dirty });
-        reply.opened(fh, 0);
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        if ino != FUSE_ROOT_ID {
-            reply.error(libc::ENOENT);
+        if ino != INodeNo::ROOT {
+            reply.error(Errno::ENOENT);
             return;
         }
 
@@ -271,9 +273,9 @@ impl Filesystem for CredentialFs {
         // the store. An unknown fh was never authorized → EACCES.
         let from_buf = {
             let handles = self.handles.lock().unwrap();
-            match handles.get(&fh) {
+            match handles.get(&fh.0) {
                 None => {
-                    reply.error(libc::EACCES);
+                    reply.error(Errno::EACCES);
                     return;
                 }
                 Some(s) if s.access == Access::Write => Some(s.buf.clone()),
@@ -286,30 +288,30 @@ impl Filesystem for CredentialFs {
     }
 
     fn write(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        if ino != FUSE_ROOT_ID {
-            reply.error(libc::ENOENT);
+        if ino != INodeNo::ROOT {
+            reply.error(Errno::ENOENT);
             return;
         }
 
         let new_len = {
             let mut handles = self.handles.lock().unwrap();
-            let Some(state) = handles.get_mut(&fh) else {
-                reply.error(libc::EACCES);
+            let Some(state) = handles.get_mut(&fh.0) else {
+                reply.error(Errno::EACCES);
                 return;
             };
             if state.access != Access::Write {
-                reply.error(libc::EACCES);
+                reply.error(Errno::EACCES);
                 return;
             }
 
@@ -328,9 +330,9 @@ impl Filesystem for CredentialFs {
     }
 
     fn setattr(
-        &mut self,
+        &self,
         req: &Request,
-        ino: u64,
+        ino: INodeNo,
         _mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
@@ -338,15 +340,15 @@ impl Filesystem for CredentialFs {
         _atime: Option<TimeOrNow>,
         _mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        fh: Option<u64>,
+        fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        if ino != FUSE_ROOT_ID {
-            reply.error(libc::ENOENT);
+        if ino != INodeNo::ROOT {
+            reply.error(Errno::ENOENT);
             return;
         }
 
@@ -354,18 +356,18 @@ impl Filesystem for CredentialFs {
         // the easiest write-bypass to miss. An already-authorized write handle
         // passes; otherwise gate the truncate against the calling process.
         if let Some(new_size) = size {
-            let authorized = match fh.and_then(|h| self.handle_access(h)) {
+            let authorized = match fh.and_then(|h| self.handle_access(h.0)) {
                 Some(Access::Write) => true,
                 Some(_) => false, // a read handle may not resize
                 _ => self.authorize(req.pid(), Access::Write).is_some(),
             };
             if !authorized {
-                reply.error(libc::EACCES);
+                reply.error(Errno::EACCES);
                 return;
             }
-            if let Err(e) = self.apply_truncate(fh, new_size) {
+            if let Err(e) = self.apply_truncate(fh.map(|h| h.0), new_size) {
                 tracing::error!("truncate of {} failed: {e}", self.watched_path.display());
-                reply.error(libc::EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         }
@@ -374,51 +376,65 @@ impl Filesystem for CredentialFs {
         reply.attr(&default_ttl(), &attr);
     }
 
-    fn flush(&mut self, _req: &Request, ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-        if ino != FUSE_ROOT_ID {
-            reply.error(libc::ENOENT);
+    fn flush(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        if ino != INodeNo::ROOT {
+            reply.error(Errno::ENOENT);
             return;
         }
-        match self.persist_handle(fh) {
+        match self.persist_handle(fh.0) {
             Ok(()) => reply.ok(),
             Err(e) => {
                 tracing::error!("flush of {} failed: {e}", self.watched_path.display());
-                reply.error(libc::EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
 
-    fn fsync(&mut self, _req: &Request, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
-        if ino != FUSE_ROOT_ID {
-            reply.error(libc::ENOENT);
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        if ino != INodeNo::ROOT {
+            reply.error(Errno::ENOENT);
             return;
         }
-        match self.persist_handle(fh) {
+        match self.persist_handle(fh.0) {
             Ok(()) => reply.ok(),
             Err(e) => {
                 tracing::error!("fsync of {} failed: {e}", self.watched_path.display());
-                reply.error(libc::EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
 
     fn release(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        if ino != FUSE_ROOT_ID {
-            reply.error(libc::ENOENT);
+        if ino != INodeNo::ROOT {
+            reply.error(Errno::ENOENT);
             return;
         }
 
-        let persisted = self.persist_handle(fh);
-        self.handles.lock().unwrap().remove(&fh);
+        let persisted = self.persist_handle(fh.0);
+        self.handles.lock().unwrap().remove(&fh.0);
 
         match persisted {
             Ok(()) => reply.ok(),
@@ -427,7 +443,7 @@ impl Filesystem for CredentialFs {
                     "release persist of {} failed: {e}",
                     self.watched_path.display()
                 );
-                reply.error(libc::EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
