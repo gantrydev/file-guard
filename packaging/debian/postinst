@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+# Make the freshly-installed units visible to systemd. We do NOT enable or
+# start anything: the admin must set FILE_GUARD_USER in /etc/default/file-guard
+# and add [[watch]] entries to /etc/file-guard/config.toml first.
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+
+exit 0

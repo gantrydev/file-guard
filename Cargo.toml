@@ -1,0 +1,84 @@
+[package]
+name = "file-guard"
+version = "0.1.3"
+edition = "2024"
+description = "Per-process credential access control daemon for Linux (FUSE)"
+license = "MIT"
+
+# ── Debian packaging (cargo-deb) ─────────────────────────────────────────────
+# Build: `cargo deb` → target/debian/file-guard_<ver>_<arch>.deb
+# See packaging/README.md for the unit layout and setup steps.
+[package.metadata.deb]
+maintainer = "gantryops <dianfishekqi@gmail.com>"
+section = "admin"
+priority = "optional"
+extended-description = """
+Per-process access control for on-disk credential files. file-guard mounts a \
+FUSE file over each watched secret and only lets binaries you have authorized \
+(pinned by content hash, and script path for interpreters) read or write it; \
+everything else is denied or prompted via a desktop agent."""
+# fuse3 provides the fusermount3 setuid helper + libfuse3; $auto adds the
+# library deps dpkg-shlibdeps detects.
+depends = "fuse3, $auto"
+recommends = "zenity, libnotify-bin"
+conf-files = ["/etc/file-guard/config.toml", "/etc/default/file-guard"]
+maintainer-scripts = "packaging/debian"
+assets = [
+    ["target/release/file-guard", "usr/bin/", "755"],
+    ["packaging/config.toml", "etc/file-guard/config.toml", "644"],
+    ["packaging/default/file-guard", "etc/default/file-guard", "644"],
+    ["packaging/systemd/file-guard.service", "lib/systemd/system/file-guard.service", "644"],
+    ["packaging/systemd/file-guard-agent.service", "lib/systemd/user/file-guard-agent.service", "644"],
+    ["README.md", "usr/share/doc/file-guard/README.md", "644"],
+    ["packaging/README.md", "usr/share/doc/file-guard/PACKAGING.md", "644"],
+    ["configs/*.toml", "usr/share/doc/file-guard/configs/", "644"],
+    ["LICENSE", "usr/share/doc/file-guard/LICENSE", "644"],
+]
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Config
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# TUI prompting
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Path expansion
+dirs = "6.0"
+
+# Process info
+sysinfo = "0.33"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Log serialization
+serde_json = "1.0"
+
+# File locking for config append
+fs2 = "0.4"
+
+# Platform FFI
+libc = "0.2"
+
+# Binary identity pinning (re-prompt when a binary changes)
+sha2 = "0.10"
+hex = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = "0.15"

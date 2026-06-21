@@ -1,0 +1,9 @@
+# GitHub CLI token (~/.config/gh/hosts.yml).
+
+[[watch]]
+path = "~/.config/gh/hosts.yml"
+
+[[rule]]
+file = "~/.config/gh/hosts.yml"
+binary = "/usr/bin/gh"
+action = "allow"

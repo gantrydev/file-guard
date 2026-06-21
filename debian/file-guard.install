@@ -1,0 +1,12 @@
+target/release/file-guard usr/bin
+README.md usr/share/doc/file-guard
+config.example.toml usr/share/doc/file-guard/examples
+configs/_settings.toml usr/share/doc/file-guard/examples
+configs/aws.toml usr/share/doc/file-guard/examples
+configs/claude.toml usr/share/doc/file-guard/examples
+configs/docker.toml usr/share/doc/file-guard/examples
+configs/gcloud.toml usr/share/doc/file-guard/examples
+configs/github.toml usr/share/doc/file-guard/examples
+configs/kubernetes.toml usr/share/doc/file-guard/examples
+configs/npm.toml usr/share/doc/file-guard/examples
+configs/ssh.toml usr/share/doc/file-guard/examples

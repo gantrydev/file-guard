@@ -1,0 +1,28 @@
+# Google Cloud SDK credentials.
+#
+# gcloud stores secrets in several files under ~/.config/gcloud:
+#   application_default_credentials.json  — ADC (used by client libraries, terraform)
+#   credentials.db                        — sqlite store of user/account creds
+#   access_tokens.db                      — cached OAuth access tokens
+# Per-account legacy creds live under legacy_credentials/<account>/ — file-guard
+# guards single files, not directories, so add those paths individually if needed.
+
+[[watch]]
+path = "~/.config/gcloud/application_default_credentials.json"
+
+[[watch]]
+path = "~/.config/gcloud/credentials.db"
+
+[[watch]]
+path = "~/.config/gcloud/access_tokens.db"
+
+# Example rules — adjust binary paths or capture via prompt.
+[[rule]]
+file = "~/.config/gcloud/application_default_credentials.json"
+binary = "/usr/bin/gcloud"
+action = "allow"
+
+[[rule]]
+file = "~/.config/gcloud/application_default_credentials.json"
+binary = "/usr/bin/terraform"
+action = "allow"

@@ -1,0 +1,7 @@
+# [settings] block — include exactly once, before any [[watch]]/[[rule]] blocks.
+[settings]
+default_action  = "deny"
+prompt_timeout  = 30
+prompt_method   = "terminal"
+restore_on_stop = false
+log_destination = "stdout"

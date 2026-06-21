@@ -1,0 +1,18 @@
+# Per-user prompt agent. Runs inside the user's graphical session so GUI
+# dialogs (zenity) and notifications reach their display, and binds the
+# daemon<->agent socket in the user's runtime dir. Enable it as the user:
+#   systemctl --user enable --now file-guard-agent.service
+[Unit]
+Description=file-guard prompt agent
+Documentation=https://github.com/gantryops/file-guard
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/file-guard agent --method gui
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

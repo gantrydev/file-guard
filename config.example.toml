@@ -1,0 +1,98 @@
+# file-guard — example configuration
+#
+# Copy to the path file-guard reads:
+#   - privileged daemon (recommended): /etc/file-guard/config.toml
+#     (point the daemon at it with FILE_GUARD_CONFIG=/etc/file-guard/config.toml)
+#   - your own user (development only): ~/.config/file-guard/config.toml
+#
+# `~/` in `path` expands to the *guarded* user's home. When the daemon runs as
+# root, set FILE_GUARD_USER=<you> so `~` resolves to your home, not /root.
+#
+# Ready-made per-tool blocks live in ./configs/*.toml — paste in the ones you want.
+
+# ── Global settings ─────────────────────────────────────────────────────────
+[settings]
+default_action  = "deny"     # "allow" | "deny" — applied when a prompt times out
+                             #   or the session agent is unreachable
+prompt_timeout  = 30         # seconds to wait for a response before default_action
+prompt_method   = "terminal" # "terminal" | "gui" | "notification"
+                             #   prompts are rendered by `file-guard agent`;
+                             #   "gui" uses zenity/kdialog in your session.
+restore_on_stop = false      # restore originals to disk when the daemon stops
+log_destination = "stdout"   # "stdout" (file/syslog: not implemented yet)
+
+# ── Files to protect ────────────────────────────────────────────────────────
+# Each [[watch]] is mounted by file-guard; reads require authorization.
+
+[[watch]]
+path = "~/.aws/credentials"
+
+[[watch]]
+path = "~/.config/gcloud/application_default_credentials.json"
+
+[[watch]]
+path = "~/.config/gcloud/credentials.db"
+
+[[watch]]
+path = "~/.config/gcloud/access_tokens.db"
+
+[[watch]]
+path = "~/.claude/.credentials.json"
+
+[[watch]]
+path = "~/.ssh/id_ed25519"
+
+[[watch]]
+path = "~/.kube/config"
+
+[[watch]]
+path = "~/.docker/config.json"
+
+[[watch]]
+path = "~/.config/gh/hosts.yml"
+
+[[watch]]
+path = "~/.netrc"
+
+# A low-sensitivity file you want logged but not gated:
+[[watch]]
+path = "~/.gitconfig"
+default_action = "allow"   # NOTE: per-file default is not honored yet (TODO)
+
+# ── Rules ───────────────────────────────────────────────────────────────────
+# A rule = (file, binary, action [, access, sha256, signature]). `binary` must
+# equal the *resolved* executable path of the caller (`readlink /proc/<pid>/exe`).
+#
+#   access   "read" (default) | "write" | "any" — the direction(s) authorized.
+#            A read rule does NOT authorize writes, and vice-versa.
+#   sha256   when present, the caller's binary must hash to this; on a mismatch
+#            (e.g. an upgrade) the rule no longer matches and file-guard
+#            RE-PROMPTS rather than honoring a stale grant. Hand-written rules
+#            usually omit it (path-only match, with a one-time warning).
+#   signature  macOS code-signing identity (ignored on Linux).
+#
+# The robust way to build rules is to let the daemon prompt you and choose
+# "Allow always": it records the caller's real path AND pins its current sha256
+# and direction automatically — so a later rebuild simply re-prompts. The
+# examples below are conventional non-Nix, unpinned read rules; adjust to your
+# system, or delete them and capture rules via prompts.
+
+[[rule]]
+file = "~/.aws/credentials"
+binary = "/usr/bin/aws"
+action = "allow"
+
+[[rule]]
+file = "~/.config/gcloud/application_default_credentials.json"
+binary = "/usr/bin/gcloud"
+action = "allow"
+
+[[rule]]
+file = "~/.ssh/id_ed25519"
+binary = "/usr/bin/ssh"
+action = "allow"
+
+[[rule]]
+file = "~/.ssh/id_ed25519"
+binary = "/usr/bin/git"
+action = "allow"

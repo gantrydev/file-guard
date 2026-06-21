@@ -1,0 +1,10 @@
+# Docker registry credentials (~/.docker/config.json).
+# Holds registry auth tokens (and references to credential helpers).
+
+[[watch]]
+path = "~/.docker/config.json"
+
+[[rule]]
+file = "~/.docker/config.json"
+binary = "/usr/bin/docker"
+action = "allow"

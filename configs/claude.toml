@@ -1,0 +1,18 @@
+# Claude Code OAuth credentials (~/.claude/.credentials.json).
+#
+# If you scope Claude Code per-project with CLAUDE_CONFIG_DIR (e.g. ~/.claude-work),
+# add a [[watch]] for each such dir's .credentials.json.
+
+[[watch]]
+path = "~/.claude/.credentials.json"
+
+# [[watch]]
+# path = "~/.claude-work/.credentials.json"
+
+# The Claude Code CLI is typically a node script; the resolved binary is usually
+# `node`. Capture the exact path via an "Allow always" prompt — node paths vary
+# wildly (nvm, nix, system), so a hard-coded rule here would likely be wrong.
+# [[rule]]
+# file = "~/.claude/.credentials.json"
+# binary = "/usr/bin/node"
+# action = "allow"

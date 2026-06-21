@@ -1,0 +1,10 @@
+# /etc/default/file-guard — environment for the file-guard daemon.
+
+# REQUIRED. The user whose credentials are guarded and whose graphical session
+# renders prompts. `~` in watched paths resolves to this user's home; the
+# daemon connects to this user's prompt agent. Without it, `~` resolves to
+# root's home and prompts cannot reach a display.
+#FILE_GUARD_USER=alice
+
+# Optional: override the root-owned backing store location.
+#FILE_GUARD_STORE_DIR=/var/lib/file-guard/store

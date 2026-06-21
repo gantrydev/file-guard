@@ -1,0 +1,22 @@
+# SSH private keys.
+#
+# NOTE: if you use the 1Password (or another) SSH agent, your private key may not
+# live on disk at all — there is nothing to guard. These entries are for on-disk
+# keys. file-guard serves files read-only; tools that need write access to the
+# key file (e.g. ssh-keygen) will fail while it is guarded.
+
+[[watch]]
+path = "~/.ssh/id_ed25519"
+
+# [[watch]]
+# path = "~/.ssh/id_rsa"
+
+[[rule]]
+file = "~/.ssh/id_ed25519"
+binary = "/usr/bin/ssh"
+action = "allow"
+
+[[rule]]
+file = "~/.ssh/id_ed25519"
+binary = "/usr/bin/git"
+action = "allow"

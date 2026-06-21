@@ -1,0 +1,15 @@
+# npm registry tokens (~/.npmrc).
+#
+# CAUTION (home-manager / Nix users): ~/.npmrc is frequently a symlink into the
+# read-only Nix store. file-guard removes the original at the watched path and
+# mounts over it — for a symlink that means the symlink is replaced. Guarding
+# Nix-managed (symlinked) cred files is not yet handled cleanly; see the repo
+# README "Limitations" before enabling this on such a setup.
+
+[[watch]]
+path = "~/.npmrc"
+
+[[rule]]
+file = "~/.npmrc"
+binary = "/usr/bin/npm"
+action = "allow"
