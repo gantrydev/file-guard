@@ -1,0 +1,15 @@
+# Kubernetes client config (~/.kube/config).
+# Can embed client certs/keys and bearer tokens for every cluster you touch.
+
+[[watch]]
+path = "~/.kube/config"
+
+[[rule]]
+file = "~/.kube/config"
+binary = "/usr/bin/kubectl"
+action = "allow"
+
+[[rule]]
+file = "~/.kube/config"
+binary = "/usr/bin/helm"
+action = "allow"

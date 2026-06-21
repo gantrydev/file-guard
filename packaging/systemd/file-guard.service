@@ -1,0 +1,25 @@
+[Unit]
+Description=file-guard credential access control daemon
+Documentation=https://github.com/gantryops/file-guard
+After=local-fs.target
+
+[Service]
+Type=exec
+# Set FILE_GUARD_USER=<you> here (REQUIRED): the user whose ~ is guarded and
+# whose graphical session renders prompts.
+EnvironmentFile=-/etc/default/file-guard
+Environment=FILE_GUARD_CONFIG=/etc/file-guard/config.toml
+Environment=FILE_GUARD_STORE_DIR=/var/lib/file-guard/store
+ExecStart=/usr/bin/file-guard start
+Restart=on-failure
+RestartSec=2
+# `start` runs in the foreground and unmounts cleanly on SIGTERM.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+# Root-owned 0700 store, unreadable by the guarded user - this is what makes
+# the tool resist same-uid malware.
+StateDirectory=file-guard
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

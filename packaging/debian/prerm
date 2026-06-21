@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+# On removal, stop the daemon so it unmounts and (when restore_on_stop is set)
+# returns guarded files to disk before the binary disappears.
+if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+    systemctl stop file-guard.service || true
+fi
+
+exit 0

@@ -1,0 +1,15 @@
+Source: file-guard
+Section: misc
+Priority: optional
+Maintainer: File-Guard Contributors <noreply@example.com>
+Build-Depends: debhelper-compat (= 13), cargo, rustc, pkg-config, libfuse3-dev
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/gantryops/file-guard
+
+Package: file-guard
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends}, fuse3, libfuse3-3
+Description: Per-process credential access control daemon
+ file-guard enforces per-process allow/deny policy for sensitive
+ credential files and serves authorized accesses through a FUSE mount.

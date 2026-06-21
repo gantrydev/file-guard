@@ -1,0 +1,18 @@
+# AWS CLI / SDK static credentials.
+[[watch]]
+path = "~/.aws/credentials"
+
+# `~/.aws/config` can hold SSO/role data; uncomment to guard it too.
+# [[watch]]
+# path = "~/.aws/config"
+
+# Example rules - adjust the binary paths to your system, or capture via prompt.
+[[rule]]
+file = "~/.aws/credentials"
+binary = "/usr/bin/aws"
+action = "allow"
+
+[[rule]]
+file = "~/.aws/credentials"
+binary = "/usr/bin/terraform"
+action = "allow"

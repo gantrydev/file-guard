@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Build
+        run: nix build .#file-guard
+      - name: Package (x86_64-linux, dynamically links libfuse3)
+        run: |
+          install -Dm755 result/bin/file-guard "dist/file-guard"
+          tar -C dist -czf "file-guard-${{ github.ref_name }}-x86_64-linux.tar.gz" file-guard
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: file-guard-*.tar.gz
+          generate_release_notes: true
+          body: |
+            Linux x86_64 build. The binary dynamically links **libfuse3** - the
+            target host must provide it (Debian/Ubuntu: `fuse3`; Nix: use the flake).
+            A Debian/Ubuntu `.deb` is attached as well.
+
+  # Debian/Ubuntu .deb, built natively and attached to the same release.
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libfuse3-dev
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+      - name: Build .deb
+        run: cargo deb
+      - name: Publish .deb
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/debian/*.deb
