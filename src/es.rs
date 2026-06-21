@@ -362,10 +362,10 @@ pub struct EsInterceptor {
 
 impl EsInterceptor {
     pub fn new(args: InterceptorArgs) -> Self {
-        return Self {
+        Self {
             args: Some(args),
             client: None,
-        };
+        }
     }
 }
 
@@ -379,12 +379,12 @@ impl Interceptor for EsInterceptor {
         let es = EsClient::new(args.watched_paths, args.policy, args.logger, args.rt_handle)?;
         self.client = Some(es);
 
-        return Ok(());
+        Ok(())
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
         self.client.take();
 
-        return Ok(());
+        Ok(())
     }
 }
