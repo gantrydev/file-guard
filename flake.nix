@@ -157,6 +157,10 @@
           };
 
           config = mkIf cfg.enable {
+            # Put the CLI on the system PATH so the guarded user can run
+            # `file-guard status|log|rules …` against the running daemon.
+            environment.systemPackages = [ cfg.package ];
+
             # Let the guarded user's processes reach the root-owned FUSE mount.
             programs.fuse.userAllowOther = true;
 
