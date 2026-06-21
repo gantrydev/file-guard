@@ -33,7 +33,10 @@ jobs:
             A Debian/Ubuntu `.deb` is attached as well.
 
   # Debian/Ubuntu .deb, built natively and attached to the same release.
+  # Runs after `release` so it updates the existing release rather than racing
+  # to create it (parallel creation fails with tag_name already_exists).
   deb:
+    needs: release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
