@@ -19,7 +19,9 @@ prompt_method   = "terminal" # "terminal" | "gui" | "notification"
                              #   prompts are rendered by `file-guard agent`;
                              #   "gui" uses zenity/kdialog in your session.
 restore_on_stop = false      # restore originals to disk when the daemon stops
-log_destination = "stdout"   # "stdout" (file/syslog: not implemented yet)
+log_destination = "stdout"   # "stdout" (journal), or a file path for an NDJSON
+                             #   audit log queryable with `file-guard log`,
+                             #   e.g. "/var/lib/file-guard/access.log"
 
 # ── Files to protect ────────────────────────────────────────────────────────
 # Each [[watch]] is mounted by file-guard; reads require authorization.

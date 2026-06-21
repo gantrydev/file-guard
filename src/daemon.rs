@@ -61,6 +61,8 @@ impl Daemon {
         interceptor.start()?;
         self.interceptor = Some(interceptor);
 
+        write_pid_file()?;
+
         tracing::info!("file-guard started, watching {} files", watched.len());
 
         Ok(())
@@ -70,8 +72,28 @@ impl Daemon {
         if let Some(mut interceptor) = self.interceptor.take() {
             interceptor.stop()?;
         }
+        remove_pid_file();
         tracing::info!("file-guard stopped");
 
         Ok(())
+    }
+}
+
+/// Record this process's PID so `file-guard stop`/`status` can find it.
+fn write_pid_file() -> anyhow::Result<()> {
+    let path = config::pid_file_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, format!("{}\n", std::process::id()))?;
+    Ok(())
+}
+
+fn remove_pid_file() {
+    let path = config::pid_file_path();
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("failed to remove PID file {}: {e}", path.display());
     }
 }

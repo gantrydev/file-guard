@@ -7,9 +7,10 @@
 # package is therefore safe. Captured "allow always" rules are appended here.
 
 [settings]
-default_action = "deny"     # applied when a prompt times out / the agent is unreachable
-prompt_timeout = 30
-prompt_method  = "gui"      # rendered by the per-user agent (zenity)
+default_action  = "deny"    # applied when a prompt times out / the agent is unreachable
+prompt_timeout  = 30
+prompt_method   = "gui"     # rendered by the per-user agent (zenity)
+log_destination = "/var/lib/file-guard/access.log"  # NDJSON audit log (`file-guard log`)
 
 # Files to guard - uncomment / add as needed. `~` is the FILE_GUARD_USER's home.
 # [[watch]]

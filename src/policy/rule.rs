@@ -10,7 +10,9 @@ pub enum Action {
 
 /// Direction of a credential access. Concrete requests are always `Read` or
 /// `Write`; `Any` only ever appears on a stored rule, meaning it covers both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, clap::ValueEnum,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Access {
     #[default]

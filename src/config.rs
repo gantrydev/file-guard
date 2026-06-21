@@ -125,6 +125,61 @@ impl Config {
         Ok(())
     }
 
+    /// Remove the `[[rule]]` at `index` (0-based, matching `rule` order) from the
+    /// config file, preserving the rest of the file's comments and formatting.
+    /// Returns the removed entry's `(binary, file)` for reporting.
+    pub fn remove_rule_at(index: usize) -> anyhow::Result<(String, String)> {
+        use fs2::FileExt;
+        use std::io::{Seek, Write};
+
+        let path = config_path();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        file.lock_exclusive()?;
+
+        let mut contents = String::new();
+        std::io::Read::read_to_string(&mut file, &mut contents)?;
+        let mut doc = contents.parse::<toml_edit::DocumentMut>()?;
+
+        let rules = doc
+            .get_mut("rule")
+            .and_then(|i| i.as_array_of_tables_mut())
+            .ok_or_else(|| anyhow::anyhow!("no [[rule]] entries in {}", path.display()))?;
+
+        if index >= rules.len() {
+            anyhow::bail!(
+                "rule index {} out of range (have {} rule(s))",
+                index,
+                rules.len()
+            );
+        }
+
+        let removed = rules.get(index).unwrap();
+        let report = (
+            removed
+                .get("binary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string(),
+            removed
+                .get("file")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string(),
+        );
+        rules.remove(index);
+
+        let rendered = doc.to_string();
+        file.set_len(0)?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        file.write_all(rendered.as_bytes())?;
+
+        file.unlock()?;
+        Ok(report)
+    }
+
     /// Expand a leading `~/` to the watched user's home directory.
     ///
     /// When file-guard runs as a privileged system daemon it is *not* the
@@ -214,6 +269,23 @@ pub fn target_uid() -> u32 {
                 .and_then(|u| uid_for_user(&u))
         })
         .unwrap_or_else(|| unsafe { libc::getuid() })
+}
+
+/// Path of the daemon's PID file, used by `file-guard stop` and `status` to
+/// find a running daemon. `FILE_GUARD_PID_FILE` > `/run/file-guard/daemon.pid`
+/// (root) > the user's runtime dir.
+pub fn pid_file_path() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("FILE_GUARD_PID_FILE") {
+        return PathBuf::from(explicit);
+    }
+    if unsafe { libc::geteuid() == 0 } {
+        return PathBuf::from("/run/file-guard/daemon.pid");
+    }
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime).join("file-guard").join("daemon.pid");
+    }
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/run/user/{uid}/file-guard/daemon.pid"))
 }
 
 /// Canonical path of the daemon↔agent socket. Both ends resolve it identically.

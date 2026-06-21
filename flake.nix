@@ -208,6 +208,8 @@
                 KillSignal = "SIGTERM";
                 TimeoutStopSec = 15;
                 # root:root 0700 store, unreadable by the guarded user.
+                # The daemon PID file lives in /run/file-guard (created by the
+                # tmpfiles rule above), the audit log under StateDirectory.
                 StateDirectory = "file-guard";
                 StateDirectoryMode = "0700";
                 Environment = [

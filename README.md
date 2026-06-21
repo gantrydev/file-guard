@@ -51,10 +51,13 @@ unchanged.
 A transient grant ("allow once / this session") is bound to the **exact process
 instance** (pid + start time), so a recycled PID can't inherit it. A permanent
 "allow always" rule **pins the binary's sha256** (and, on macOS, its code
-signature). If that binary later changes - a package upgrade, or malware swapped
-in its place - the pin no longer matches and file-guard **re-prompts** rather
-than silently honoring the old grant. (A mismatch re-prompts; it is not a hard
-deny, so a legitimate rebuild just re-authorizes.)
+signature); for an interpreter it also pins the **entry script's path and
+content hash**, so "python running gcloud" doesn't bless other scripts and an
+in-place edit of the script re-prompts. If a pinned binary or script later
+changes - a package upgrade, or malware swapped in its place - the pin no longer
+matches and file-guard **re-prompts** rather than silently honoring the old
+grant. (A mismatch re-prompts; it is not a hard deny, so a legitimate rebuild
+just re-authorizes.)
 
 ### Prompts: the session agent
 
@@ -68,7 +71,20 @@ socket is root-anchored.
 
 ## Install
 
-Requires Nix with flakes.
+### Debian / Ubuntu
+
+Grab the `.deb` from a [release](https://github.com/gantryops/file-guard/releases):
+
+```sh
+sudo apt install ./file-guard_*_amd64.deb
+```
+
+It installs the binary, a root `file-guard.service`, and a per-user
+`file-guard-agent.service`, and pulls in `fuse3`. Nothing is enabled until you
+configure it - see [2b](#2b-privileged-daemon-the-secure-deployment) and
+[`packaging/README.md`](packaging/README.md).
+
+### Nix
 
 ```sh
 # Try it without installing
@@ -83,7 +99,9 @@ nix build github:gantryops/file-guard
 ./result/bin/file-guard --help
 ```
 
-Non-Nix Linux builds need `pkg-config` and `libfuse3` (Debian/Ubuntu: `fuse3`,
+### From source
+
+Any Linux with `pkg-config` and `libfuse3` (Debian/Ubuntu: `fuse3`,
 `libfuse3-dev`) plus a Rust toolchain, then `cargo build --release`.
 
 ## Quick start
@@ -108,11 +126,26 @@ Runs in the foreground; unknown accesses prompt you in the terminal. Useful to
 see what touches your secrets, but the backing store is readable by your own user
 (so same-uid malware can bypass it). For real protection use 2b.
 
-### 2b. Privileged daemon (NixOS module - the supported secure deployment)
+### 2b. Privileged daemon (the secure deployment)
 
-Add the flake and enable the module. The daemon runs as **root**, so the backing
-store at `/var/lib/file-guard` is root-owned and unreadable by the user the
-malware is running as:
+Run the daemon as **root** so the backing store at `/var/lib/file-guard` is
+root-owned and unreadable by the user the malware runs as. **Both the Debian
+package and the NixOS module do this** - that root-owned store is the protection
+that matters. They differ only in how the prompt agent's socket is created (see
+[the agent-socket note](#security-model--limitations)): NixOS roots the socket by
+default; the `.deb` ships a convenient per-user socket but can be hardened the
+same way.
+
+**Debian / Ubuntu.** After installing the `.deb`:
+
+```sh
+echo 'FILE_GUARD_USER=alice' | sudo tee -a /etc/default/file-guard   # whose ~ is guarded
+sudoedit /etc/file-guard/config.toml                                 # add [[watch]] blocks
+systemctl --user enable --now file-guard-agent.service               # run as alice
+sudo systemctl enable --now file-guard.service
+```
+
+**NixOS.** Add the flake and enable the module:
 
 ```nix
 # flake.nix
@@ -178,13 +211,22 @@ config automatically.
 ## CLI
 
 ```
-file-guard start [-d]          # start the daemon (foreground; -d is a no-op for now)
+file-guard start [-d]                  # run the daemon (foreground; -d is a no-op)
 file-guard agent [--method M] [--socket P]   # run the session prompt agent
-file-guard rules               # list rules
-file-guard store <f>           # move a file into the backing store
-file-guard restore <f>         # restore a file from the backing store
-file-guard stop|status|log|rules add|rules remove   # not implemented yet (exit non-zero)
+file-guard stop                        # SIGTERM the running daemon (unmounts cleanly)
+file-guard status                      # daemon state, mount status, recent access
+file-guard log [-n N] [-f]             # print/follow the audit log (needs a file
+                                       #   log_destination; else use journalctl)
+file-guard rules                       # list rules (with indices)
+file-guard rules add --file F --binary B --action allow|deny [--access read|write|any] [--no-pin]
+file-guard rules remove <index>        # remove the rule at INDEX (preserves comments)
+file-guard store <f>                   # move a file into the backing store
+file-guard restore <f>                 # restore a file from the backing store
 ```
+
+The audit log is NDJSON (one object per access) when `log_destination` is a file
+path, so it's both human-readable via `file-guard log` and machine-queryable
+(e.g. `jq` over the file).
 
 ## Security model & limitations
 
@@ -197,26 +239,31 @@ Known limitations - read before relying on this:
 
 - **Run it privileged, or it does nothing on Linux.** The backing store must be
   owned by a *different* uid than the guarded user; otherwise the same malware
-  just reads the store directly. The NixOS module runs the daemon as root for
-  this reason. Running as your own user is development-only.
-- **The prompt agent must be root-anchored to be trustworthy.** If same-uid
+  just reads the store directly. Both the Debian package and the NixOS module run
+  the daemon as root for this reason. Running as your own user is
+  development-only.
+- **The prompt agent must be root-anchored to be fully trustworthy.** If same-uid
   malware can occupy the agent's socket, it can auto-approve its own prompts. The
   NixOS module prevents this by having **root** create the socket (systemd socket
-  activation) in a root-owned directory. The manual/dev path
-  (`file-guard agent` self-binding in `$XDG_RUNTIME_DIR`) is **not** hardened
-  against same-uid impersonation - use it for testing, not protection.
+  activation) in a root-owned directory. The Debian package's default per-user
+  agent socket (in `$XDG_RUNTIME_DIR`) is **not** hardened against a *targeted*
+  same-uid attacker racing that socket - it is still defense-in-depth against
+  opportunistic malware, and can be hardened to the root-anchored topology (see
+  [`packaging/README.md`](packaging/README.md)). The manual/dev path
+  (`file-guard agent` self-binding) carries the same caveat.
 - **Linux only.** The macOS Endpoint Security path is not built - see
   [macOS](#macos).
-- **Identity = binary hash (+ script path for interpreters); a trusted tool's
-  own deps are still inside the boundary.** A rule pins the caller's binary
-  sha256, and for interpreters (python/node/…) also the **script path** from
-  argv - so "python running gcloud" doesn't authorize "python running something
-  else". Two caveats remain: the script comes from argv, which a *deliberate*
-  impersonator can forge (it's defense-in-depth, strongest against opportunistic
-  disk-scanning malware, not a hard boundary); and nothing can stop a compromised
-  dependency *inside* the legitimate tool from reading the secret that tool is
-  authorized to use. Strongest for compiled tools, where the binary *is* the
-  identity.
+- **Identity = binary hash (+ script path & content hash for interpreters); a
+  trusted tool's own deps are still inside the boundary.** A rule pins the
+  caller's binary sha256, and for interpreters (python/node/…) also the **script
+  path** from argv and the **script's content hash** - so "python running gcloud"
+  doesn't authorize "python running something else", and an in-place edit of the
+  script re-prompts. Two caveats remain: the script *path* comes from argv, which
+  a *deliberate* impersonator can forge (it's defense-in-depth, strongest against
+  opportunistic disk-scanning malware, not a hard boundary); and nothing can stop
+  a compromised dependency *inside* the legitimate tool from reading the secret
+  that tool is authorized to use. Strongest for compiled tools, where the binary
+  *is* the identity.
 - **Nix/home-manager:** the resolved path is a `/nix/store/<hash>` path that
   changes on every package update. Hash-pinned rules **re-prompt** after an
   upgrade (by design) - just re-confirm. Credential files that are **symlinks**
@@ -228,24 +275,6 @@ Known limitations - read before relying on this:
 - **Writes are last-writer-wins.** Concurrent write handles to the same file
   don't merge; the last one to close persists its buffer. Fine for the
   single-writer credential-file case.
-
-## Implementation status
-
-| Area                                   | State                         |
-|----------------------------------------|-------------------------------|
-| Linux FUSE interception (read + write)  | works                         |
-| macOS Endpoint Security                 | not built (backend in-tree)   |
-| Direction-aware policy (read vs write)  | works                         |
-| Process-instance grants (pid+start time)| works                         |
-| Binary hash / signature pinning         | works (Linux hash; macOS sig pending ES) |
-| Session prompt agent + IPC              | works                         |
-| Prompt: GUI (zenity/kdialog)            | works                         |
-| Prompt: terminal / notification         | works                         |
-| Backing store: moved originals          | works                         |
-| Backing store: age-encrypted / `op`     | not implemented               |
-| `stop` / `status` / `log` / `rules add` | not implemented               |
-| Structured audit log to file/syslog     | not implemented (tracing only)|
-| Tests                                   | unit-level                    |
 
 ## Development
 

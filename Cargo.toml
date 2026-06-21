@@ -80,5 +80,8 @@ libc = "0.2"
 sha2 = "0.10"
 hex = "0.4"
 
+# Surgical config edits that preserve comments/formatting (`rules remove`)
+toml_edit = "0.25"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = "0.15"

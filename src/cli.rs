@@ -1,4 +1,5 @@
 use crate::config::PromptMethod;
+use crate::policy::rule::Access;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -32,12 +33,19 @@ pub enum Command {
         #[arg(long, value_enum)]
         method: Option<PromptMethod>,
     },
-    /// Stop the daemon, unmount all FUSE mounts
+    /// Stop the running daemon (SIGTERM; unmounts all FUSE mounts)
     Stop,
-    /// Show watched files, mount state, recent access
+    /// Show daemon state, watched files, mount status, and recent access
     Status,
-    /// Tail the access log
-    Log,
+    /// Print (and optionally follow) the structured audit log
+    Log {
+        /// Number of trailing entries to print
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: usize,
+        /// Keep printing new entries as they are appended
+        #[arg(short, long)]
+        follow: bool,
+    },
     /// Manage access rules
     Rules {
         #[command(subcommand)]
@@ -51,8 +59,31 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum RulesAction {
-    /// Add a rule interactively
-    Add,
-    /// Remove a rule
-    Remove,
+    /// Add a persistent rule. The binary is pinned by its current sha256 so a
+    /// later change re-prompts (pass --no-pin to match on path alone).
+    Add {
+        /// Watched file the rule applies to (e.g. ~/.aws/credentials)
+        #[arg(long)]
+        file: String,
+        /// Absolute path of the binary to authorize
+        #[arg(long)]
+        binary: PathBuf,
+        /// Allow or deny
+        #[arg(long, value_enum)]
+        action: RuleAction,
+        /// Direction the rule covers
+        #[arg(long, value_enum, default_value_t = Access::Any)]
+        access: Access,
+        /// Don't pin the binary's hash (match on path only)
+        #[arg(long)]
+        no_pin: bool,
+    },
+    /// Remove the rule at INDEX (as shown by `file-guard rules`)
+    Remove { index: usize },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum RuleAction {
+    Allow,
+    Deny,
 }

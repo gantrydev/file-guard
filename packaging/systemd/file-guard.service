@@ -17,9 +17,11 @@ RestartSec=2
 KillSignal=SIGTERM
 TimeoutStopSec=15
 # Root-owned 0700 store, unreadable by the guarded user - this is what makes
-# the tool resist same-uid malware.
+# the tool resist same-uid malware. Also holds the NDJSON audit log.
 StateDirectory=file-guard
 StateDirectoryMode=0700
+# /run/file-guard for the daemon PID file (used by `file-guard stop`/`status`).
+RuntimeDirectory=file-guard
 
 [Install]
 WantedBy=multi-user.target

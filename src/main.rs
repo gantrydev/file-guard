@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod control;
 mod daemon;
 mod interceptor;
 mod logging;
@@ -19,6 +20,13 @@ use cli::{Cli, Command, RulesAction};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Restore default SIGPIPE so piping output into `head`/`grep` exits quietly
+    // instead of panicking on EPIPE (Rust ignores SIGPIPE by default).
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -52,41 +60,75 @@ async fn main() -> anyhow::Result<()> {
             prompt::run_agent(method, socket).await?;
         }
         Command::Stop => {
-            // TODO: signal the running daemon via a PID file. Until then, exit
-            // non-zero with a message instead of panicking with a backtrace.
-            anyhow::bail!(
-                "`stop` is not implemented yet (no PID file). \
-                 Stop a foreground daemon with Ctrl-C, or `systemctl stop file-guard`."
-            );
+            control::stop()?;
         }
         Command::Status => {
-            anyhow::bail!("`status` is not implemented yet");
+            let config = config::Config::load()?;
+            control::status(&config)?;
         }
-        Command::Log => {
-            anyhow::bail!("`log` is not implemented yet; logs go to the daemon's stdout/journal");
+        Command::Log { lines, follow } => {
+            let config = config::Config::load()?;
+            control::tail_log(&config, lines, follow)?;
         }
         Command::Rules { action } => match action {
             None => {
                 let config = config::Config::load()?;
-                for rule in &config.rule {
+                for (i, rule) in config.rule.iter().enumerate() {
+                    let pinned = if rule.sha256.is_some() || rule.script_sha256.is_some() {
+                        " (pinned)"
+                    } else {
+                        ""
+                    };
                     println!(
-                        "{action:>5}  {binary}  →  {file}",
+                        "{i:>3}  {action:>5} {access:<6} {binary}  →  {file}{pinned}",
                         action = match rule.action {
                             config::RuleAction::Allow => "allow",
                             config::RuleAction::Deny => "deny",
                         },
+                        access = rule.access.verb(),
                         binary = rule.binary,
                         file = rule.file,
                     );
                 }
             }
-            Some(RulesAction::Add) => anyhow::bail!(
-                "`rules add` is not implemented yet; edit the config file or use an \
-                 allow/deny prompt to add rules"
-            ),
-            Some(RulesAction::Remove) => anyhow::bail!(
-                "`rules remove` is not implemented yet; edit the config file directly"
-            ),
+            Some(RulesAction::Add {
+                file,
+                binary,
+                action,
+                access,
+                no_pin,
+            }) => {
+                let sha256 = if no_pin {
+                    None
+                } else {
+                    match process::integrity::hash_file(&binary) {
+                        Ok(h) => Some(h),
+                        Err(e) => anyhow::bail!(
+                            "cannot hash {} to pin the rule ({e}); pass --no-pin to add it unpinned",
+                            binary.display()
+                        ),
+                    }
+                };
+                let entry = config::RuleEntry {
+                    file: file.clone(),
+                    binary: binary.to_string_lossy().into_owned(),
+                    action: match action {
+                        cli::RuleAction::Allow => config::RuleAction::Allow,
+                        cli::RuleAction::Deny => config::RuleAction::Deny,
+                    },
+                    access,
+                    sha256,
+                    signature: None,
+                    script: None,
+                    script_sha256: None,
+                };
+                config::Config::append_rule(&entry)?;
+                println!("added rule: {} → {}", binary.display(), file);
+            }
+            Some(RulesAction::Remove { index }) => {
+                let (binary, file) = config::Config::remove_rule_at(index)?;
+                println!("removed rule {index}: {binary} → {file}");
+            }
         },
         Command::Store { file } => {
             let store = store::create_store()?;
