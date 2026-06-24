@@ -173,7 +173,10 @@ async fn main() -> anyhow::Result<()> {
             let store = store::create_store()?;
             if !store.exists(&expanded) {
                 if expanded.exists() {
-                    println!("{} is already on disk; nothing to restore.", expanded.display());
+                    println!(
+                        "{} is already on disk; nothing to restore.",
+                        expanded.display()
+                    );
                     return Ok(());
                 }
                 anyhow::bail!(
