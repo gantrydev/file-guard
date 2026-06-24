@@ -21,6 +21,10 @@ impl BackingStore for EncryptedStore {
         todo!("age-encrypted backing store not yet implemented")
     }
 
+    fn exists(&self, _file_id: &Path) -> bool {
+        todo!("age-encrypted backing store not yet implemented")
+    }
+
     fn list(&self) -> anyhow::Result<Vec<PathBuf>> {
         todo!("age-encrypted backing store not yet implemented")
     }

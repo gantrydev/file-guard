@@ -61,6 +61,10 @@ impl Daemon {
         self.interceptor = Some(interceptor);
 
         write_pid_file()?;
+        if let Err(e) = publish_config_pointer() {
+            // Non-fatal: the daemon still runs; only CLI auto-discovery degrades.
+            tracing::warn!("failed to publish config pointer: {e}");
+        }
 
         tracing::info!("file-guard started, watching {} files", watched.len());
 
@@ -72,6 +76,7 @@ impl Daemon {
             interceptor.stop()?;
         }
         remove_pid_file();
+        remove_config_pointer();
         tracing::info!("file-guard stopped");
 
         Ok(())
@@ -94,5 +99,32 @@ fn remove_pid_file() {
         && e.kind() != std::io::ErrorKind::NotFound
     {
         tracing::warn!("failed to remove PID file {}: {e}", path.display());
+    }
+}
+
+/// Publish this daemon's resolved config path so a separate CLI invocation
+/// (which lacks FILE_GUARD_CONFIG) can find and act on the same config.
+fn publish_config_pointer() -> anyhow::Result<()> {
+    let pointer = config::runtime_config_pointer_path();
+    if let Some(parent) = pointer.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&pointer, format!("{}\n", config::config_path().display()))?;
+    // World-readable: it holds only a path, and the guarded (non-root) user
+    // must read it to locate the daemon's config.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pointer, std::fs::Permissions::from_mode(0o644))?;
+    }
+    Ok(())
+}
+
+fn remove_config_pointer() {
+    let path = config::runtime_config_pointer_path();
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("failed to remove config pointer {}: {e}", path.display());
     }
 }

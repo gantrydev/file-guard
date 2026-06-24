@@ -95,11 +95,24 @@ pub enum RuleAction {
 }
 
 impl Config {
-    /// Load from ~/.config/file-guard/config.toml, expanding ~ in all paths.
+    /// Load the daemon's config (see `config_path` for resolution order),
+    /// expanding ~ in all paths.
     pub fn load() -> anyhow::Result<Self> {
         let path = config_path();
-        let contents = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("failed to read config at {}: {}", path.display(), e))?;
+        let contents = std::fs::read_to_string(&path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => anyhow::anyhow!(
+                "no config found at {}. If the daemon should be running, check \
+                 `systemctl status file-guard`; otherwise point FILE_GUARD_CONFIG \
+                 at your config.",
+                path.display()
+            ),
+            std::io::ErrorKind::PermissionDenied => anyhow::anyhow!(
+                "config at {} is not readable by this user; re-run with sudo \
+                 (e.g. `sudo file-guard rules`).",
+                path.display()
+            ),
+            _ => anyhow::anyhow!("failed to read config at {}: {e}", path.display()),
+        })?;
         let config: Config = toml::from_str(&contents)?;
         Ok(config)
     }
@@ -201,12 +214,19 @@ impl Config {
     }
 }
 
-fn config_path() -> PathBuf {
+pub fn config_path() -> PathBuf {
     // Explicit override wins - the systemd unit points this at
-    // /etc/file-guard/config.toml so the root daemon reads the operator's
+    // /var/lib/file-guard/config.toml so the root daemon reads the operator's
     // config rather than /root/.config.
     if let Ok(path) = std::env::var("FILE_GUARD_CONFIG") {
         return PathBuf::from(path);
+    }
+    // A separate CLI invocation (`file-guard rules`, `status`, …) has no
+    // FILE_GUARD_CONFIG, so follow the path the running daemon published. This
+    // makes the CLI act on the daemon's actual config instead of guessing
+    // ~/.config, regardless of where the operator put it.
+    if let Some(path) = published_config_path() {
+        return path;
     }
     if let Some(home) = target_home() {
         return home.join(".config").join("file-guard").join("config.toml");
@@ -215,6 +235,43 @@ fn config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("~/.config"))
         .join("file-guard")
         .join("config.toml")
+}
+
+/// Path of the runtime pointer file in which a running daemon records its
+/// resolved config path, written beside the PID file in the root-owned
+/// rendezvous dir. Mirrors `pid_file_path`'s root-vs-user split (the dev,
+/// user-mode daemon publishes into its own runtime dir).
+pub fn runtime_config_pointer_path() -> PathBuf {
+    if unsafe { libc::geteuid() == 0 } {
+        return PathBuf::from("/run/file-guard/config");
+    }
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime).join("file-guard").join("config");
+    }
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/run/user/{uid}/file-guard/config"))
+}
+
+/// The config path a running daemon has published, if any. Checks the system
+/// daemon's location first, then a dev (user-mode) daemon's runtime dir. The
+/// pointer holds only a path (no secrets) and is world-readable, so an
+/// unprivileged CLI can locate the config even when the config itself is
+/// root-only (a read then fails with a clear "re-run with sudo").
+fn published_config_path() -> Option<PathBuf> {
+    let user_runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })))
+        .join("file-guard")
+        .join("config");
+    for candidate in [PathBuf::from("/run/file-guard/config"), user_runtime] {
+        if let Ok(contents) = std::fs::read_to_string(&candidate) {
+            let path = PathBuf::from(contents.trim());
+            if !path.as_os_str().is_empty() {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 /// The home directory of the user whose credentials are being guarded.

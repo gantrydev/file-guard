@@ -80,6 +80,10 @@ impl BackingStore for MovedStore {
         Ok(())
     }
 
+    fn exists(&self, file_id: &Path) -> bool {
+        self.store_path(file_id).exists()
+    }
+
     fn list(&self) -> anyhow::Result<Vec<PathBuf>> {
         let mut result = Vec::new();
         for entry in std::fs::read_dir(&self.store_dir)? {

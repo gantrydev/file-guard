@@ -14,6 +14,10 @@ pub trait BackingStore: Send + Sync {
     /// Delete stored credential.
     fn delete(&self, file_id: &Path) -> anyhow::Result<()>;
 
+    /// Whether a stored entry exists for this file. Lets `restore` stay
+    /// idempotent instead of failing opaquely when nothing was stored.
+    fn exists(&self, file_id: &Path) -> bool;
+
     /// List all stored credential file IDs.
     #[allow(dead_code)] // TODO: surface in the `status` command.
     fn list(&self) -> anyhow::Result<Vec<PathBuf>>;

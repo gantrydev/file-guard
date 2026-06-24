@@ -7,22 +7,43 @@ use crate::logging;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// PID of the running daemon, or `None` if there is no PID file or the recorded
-/// process is gone (in which case a stale PID file is cleaned up).
+/// PID of the running daemon, or `None` if none is running. Checks this
+/// context's PID path first, then the system daemon's well-known location, so a
+/// guarded (non-root) user - whose context resolves to its own runtime dir -
+/// still sees the root daemon at `/run/file-guard/daemon.pid`.
 pub fn running_pid() -> Option<u32> {
-    let path = config::pid_file_path();
-    let pid: u32 = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
+    let primary = config::pid_file_path();
+    if let Some(pid) = pid_from(&primary) {
+        return Some(pid);
+    }
+    let system = PathBuf::from("/run/file-guard/daemon.pid");
+    if system != primary {
+        return pid_from(&system);
+    }
+    None
+}
+
+/// Read and validate the PID in `path`. A stale file (process gone) is cleaned
+/// up when we have permission; otherwise the removal is ignored.
+fn pid_from(path: &Path) -> Option<u32> {
+    let pid: u32 = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
     if pid_alive(pid) {
         Some(pid)
     } else {
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path);
         None
     }
 }
 
 /// Whether `pid` is a live process (signal 0 probes existence without delivery).
+/// `EPERM` counts as alive: the process exists but is owned by another user
+/// (e.g. the root daemon probed by the guarded user), which is exactly the
+/// cross-user case `status` must report correctly.
 fn pid_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Send SIGTERM to the running daemon and wait for it to exit (and run its
@@ -37,8 +58,14 @@ pub fn stop() -> anyhow::Result<()> {
     };
 
     if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .map_err(|e| anyhow::anyhow!("failed to signal daemon (pid {pid}): {e}"));
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::PermissionDenied {
+            anyhow::bail!(
+                "cannot signal daemon (pid {pid}): it runs as another user. \
+                 Use `sudo systemctl stop file-guard`."
+            );
+        }
+        return Err(err).map_err(|e| anyhow::anyhow!("failed to signal daemon (pid {pid}): {e}"));
     }
     println!("sent SIGTERM to file-guard (pid {pid}); waiting for unmount…");
 
@@ -144,6 +171,12 @@ fn read_from(path: &Path, offset: u64) -> Vec<logging::AccessLogEntry> {
     buf.lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect()
+}
+
+/// Whether `path` is currently served by a live file-guard FUSE mount. Used by
+/// `restore` to refuse acting underneath a mount the daemon still owns.
+pub fn is_fuse_mount(path: &Path) -> bool {
+    fuse_mounts().iter().any(|m| m == path)
 }
 
 /// Mount points currently served by a file-guard FUSE mount, from

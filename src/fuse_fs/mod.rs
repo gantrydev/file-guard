@@ -47,6 +47,9 @@ mod integration_tests {
         fn list(&self) -> anyhow::Result<Vec<PathBuf>> {
             Ok(self.0.lock().unwrap().keys().cloned().collect())
         }
+        fn exists(&self, id: &Path) -> bool {
+            self.0.lock().unwrap().contains_key(id)
+        }
     }
 
     fn fuse_available() -> bool {

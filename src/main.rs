@@ -138,8 +138,32 @@ async fn main() -> anyhow::Result<()> {
             println!("stored {}", expanded.display());
         }
         Command::Restore { file } => {
-            let store = store::create_store()?;
             let expanded = config::Config::expand_path(&file.to_string_lossy());
+
+            // A live mount means the daemon still owns this path; writing under
+            // it fights the daemon and is overwritten when it stops (with
+            // restore_on_stop). Stop the daemon instead, which restores it.
+            if control::is_fuse_mount(&expanded) {
+                anyhow::bail!(
+                    "{} is a live file-guard mount; stop the daemon to recover it \
+                     (`systemctl stop file-guard` writes it back when restore_on_stop \
+                     is set) rather than restoring underneath the mount.",
+                    expanded.display()
+                );
+            }
+
+            let store = store::create_store()?;
+            if !store.exists(&expanded) {
+                if expanded.exists() {
+                    println!("{} is already on disk; nothing to restore.", expanded.display());
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "no backing-store entry for {} and no file on disk - nothing to recover.",
+                    expanded.display()
+                );
+            }
+
             let contents = store.read(&expanded)?;
             std::fs::write(&expanded, contents)?;
             store.delete(&expanded)?;
