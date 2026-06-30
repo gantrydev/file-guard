@@ -1,6 +1,6 @@
 [package]
 name = "file-guard"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 description = "Per-process credential access control daemon for Linux (FUSE)"
 license = "MIT"

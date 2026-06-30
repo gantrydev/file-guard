@@ -128,7 +128,7 @@ mod integration_tests {
         };
         let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
-        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
+        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
 
         let Some((mountpoint, session)) = mount(fs, &tmp) else {
             std::fs::remove_dir_all(&tmp).ok();
@@ -183,7 +183,7 @@ mod integration_tests {
         };
         let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
-        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
+        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
 
         let Some((mountpoint, session)) = mount(fs, &tmp) else {
             std::fs::remove_dir_all(&tmp).ok();
@@ -236,7 +236,7 @@ mod integration_tests {
         };
         let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
-        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
+        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
 
         let Some((mountpoint, session)) = mount(fs, &tmp) else {
             std::fs::remove_dir_all(&tmp).ok();
@@ -252,5 +252,119 @@ mod integration_tests {
             Some(libc::EACCES),
             "denied open should surface as EACCES, got {err:?}"
         );
+    }
+
+    /// A single allow rule for this binary, scoped to `access`.
+    fn rule_config(watched: &Path, access: Access) -> Config {
+        let me = std::env::current_exe().unwrap();
+        Config {
+            settings: settings("deny"),
+            watch: vec![],
+            rule: vec![RuleEntry {
+                file: watched.to_string_lossy().into_owned(),
+                binary: me.to_string_lossy().into_owned(),
+                action: RuleAction::Allow,
+                access,
+                sha256: None,
+                signature: None,
+                script: None,
+                script_sha256: None,
+            }],
+        }
+    }
+
+    /// A write-only grant must not become a read: O_RDONLY and O_RDWR are both
+    /// denied (the latter would otherwise preload the secret into the buffer and
+    /// serve it via read()), while O_WRONLY is allowed.
+    #[test]
+    fn write_only_grant_cannot_read_via_rdwr() {
+        if !fuse_available() {
+            eprintln!("SKIP: no /dev/fuse");
+            return;
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tmp = temp_dir("wronly");
+        let watched = tmp.join("credential");
+        let store = Arc::new(MemStore(Mutex::new(
+            [(watched.clone(), b"TOP-SECRET".to_vec())]
+                .into_iter()
+                .collect(),
+        )));
+        let config = rule_config(&watched, Access::Write);
+        let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
+        let logger = Arc::new(AccessLogger::new("stdout").unwrap());
+        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
+
+        let Some((mountpoint, session)) = mount(fs, &tmp) else {
+            std::fs::remove_dir_all(&tmp).ok();
+            return;
+        };
+
+        let ro = std::fs::OpenOptions::new().read(true).open(&mountpoint);
+        let rw = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&mountpoint);
+        let wo = std::fs::OpenOptions::new().write(true).open(&mountpoint);
+        let wo_ok = wo.is_ok();
+        drop(wo);
+
+        drop(session);
+        std::fs::remove_dir_all(&tmp).ok();
+
+        assert_eq!(
+            ro.err().and_then(|e| e.raw_os_error()),
+            Some(libc::EACCES),
+            "O_RDONLY must be denied for a write-only grant"
+        );
+        assert_eq!(
+            rw.err().and_then(|e| e.raw_os_error()),
+            Some(libc::EACCES),
+            "O_RDWR must be denied (read not authorized) so the secret can't leak via read()"
+        );
+        assert!(wo_ok, "O_WRONLY must be allowed for a write grant");
+    }
+
+    /// A write at an absurd offset is rejected with EFBIG and the daemon stays
+    /// up (a prior version attempted a multi-terabyte allocation and aborted).
+    #[test]
+    fn huge_offset_write_is_efbig_and_daemon_survives() {
+        if !fuse_available() {
+            eprintln!("SKIP: no /dev/fuse");
+            return;
+        }
+        use std::os::unix::fs::FileExt;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tmp = temp_dir("huge");
+        let watched = tmp.join("credential");
+        let store = Arc::new(MemStore(Mutex::new(
+            [(watched.clone(), b"intact".to_vec())].into_iter().collect(),
+        )));
+        let config = rule_config(&watched, Access::Any);
+        let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
+        let logger = Arc::new(AccessLogger::new("stdout").unwrap());
+        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
+
+        let Some((mountpoint, session)) = mount(fs, &tmp) else {
+            std::fs::remove_dir_all(&tmp).ok();
+            return;
+        };
+
+        let write_err = {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&mountpoint)
+                .unwrap();
+            f.write_at(b"x", 1 << 50).err().and_then(|e| e.raw_os_error())
+        };
+        // Daemon must still be alive and serving the original content.
+        let after = std::fs::read(&mountpoint);
+
+        drop(session);
+        std::fs::remove_dir_all(&tmp).ok();
+
+        assert_eq!(write_err, Some(libc::EFBIG), "huge-offset write must be EFBIG");
+        assert_eq!(after.unwrap(), b"intact", "daemon survived and content intact");
     }
 }

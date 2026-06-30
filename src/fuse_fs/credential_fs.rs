@@ -13,9 +13,15 @@ use fuser::{
 
 use crate::logging::AccessLogger;
 use crate::policy::engine::PolicyEngine;
-use crate::policy::rule::Access;
+use crate::policy::rule::{Access, Decision};
 use crate::process::identify::ProcessInfo;
 use crate::store::BackingStore;
+
+/// Upper bound on the in-memory content of a guarded file. Credential files are
+/// tiny; this cap turns a malicious or buggy write/truncate at a huge offset
+/// into an `EFBIG` error instead of a multi-gigabyte allocation that aborts the
+/// daemon (and with it every other mount).
+const MAX_CONTENT_LEN: u64 = 16 * 1024 * 1024;
 
 /// Zero attribute TTL: the kernel must re-`getattr` rather than trust a cached
 /// size. Paired with `FOPEN_DIRECT_IO` (see `open`), this keeps the kernel from
@@ -63,13 +69,34 @@ fn slice_content(content: &[u8], offset: u64, size: u32) -> &[u8] {
     &content[start..start + read_size]
 }
 
-/// Per-open-handle state. A write handle keeps a working copy of the file's
-/// content (`buf`) which is persisted to the backing store on flush/release;
-/// read handles serve directly from the store and keep `buf` empty.
-struct HandleState {
-    access: Access,
-    buf: Vec<u8>,
+/// The end offset a write would reach, rejected (`EFBIG`) if it overflows or
+/// exceeds the content cap. Pure so it can be unit-tested directly.
+fn checked_write_end(offset: u64, len: usize) -> Result<usize, Errno> {
+    let end = offset.checked_add(len as u64).ok_or(Errno::EFBIG)?;
+    if end > MAX_CONTENT_LEN {
+        return Err(Errno::EFBIG);
+    }
+    Ok(end as usize)
+}
+
+/// The single, authoritative live content of the guarded file. Every open
+/// handle reads and writes *this* buffer (POSIX shared-inode semantics), rather
+/// than a private per-handle copy — so concurrent writers can't lose each
+/// other's edits and a truncate can't be reverted by a stale handle buffer.
+struct Content {
+    bytes: Vec<u8>,
+    /// Differs from the backing store and must be persisted on flush/release.
     dirty: bool,
+}
+
+/// Per-open-handle bookkeeping. The buffer lives in `Content`, shared across
+/// handles; a handle only records what it was authorized to do.
+struct OpenHandle {
+    access: Access,
+    /// May this handle serve `read()`? True for `O_RDONLY` and for `O_RDWR`
+    /// opens that also passed read authorization — never for `O_WRONLY`, so a
+    /// write-only grant cannot read the secret back out of the buffer.
+    can_read: bool,
 }
 
 pub struct CredentialFs {
@@ -78,10 +105,13 @@ pub struct CredentialFs {
     policy: Arc<PolicyEngine>,
     logger: Arc<AccessLogger>,
     rt_handle: tokio::runtime::Handle,
-    handles: Mutex<HashMap<u64, HandleState>>,
+    /// Expected requester uid (the owner of the guarded file's directory). When
+    /// set, only that uid — or root — may access the mount, even though
+    /// `allow_other` makes it reachable by any local user.
+    owner_uid: Option<u32>,
+    content: Mutex<Content>,
+    handles: Mutex<HashMap<u64, OpenHandle>>,
     next_fh: AtomicU64,
-    /// Live file size reported by `getattr`, updated as writes/truncates land.
-    current_size: Mutex<u64>,
 }
 
 impl CredentialFs {
@@ -91,13 +121,16 @@ impl CredentialFs {
         policy: Arc<PolicyEngine>,
         logger: Arc<AccessLogger>,
         rt_handle: tokio::runtime::Handle,
+        owner_uid: Option<u32>,
     ) -> anyhow::Result<Self> {
-        // Tolerate an absent store entry (the watched file may not exist yet):
-        // serve an empty file and let an authorized writer populate it.
-        let file_size = store
-            .read(&watched_path)
-            .map(|c| c.len() as u64)
-            .unwrap_or(0);
+        // Load the authoritative content once. `exists()` distinguishes "not
+        // stored yet" (serve empty) from a genuine read failure on an existing
+        // entry, which must surface rather than masquerade as an empty file.
+        let bytes = if store.exists(&watched_path) {
+            store.read(&watched_path)?
+        } else {
+            Vec::new()
+        };
 
         Ok(Self {
             watched_path,
@@ -105,22 +138,43 @@ impl CredentialFs {
             policy,
             logger,
             rt_handle,
+            owner_uid,
+            content: Mutex::new(Content {
+                bytes,
+                dirty: false,
+            }),
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
-            current_size: Mutex::new(file_size),
         })
     }
 
     /// Identify the calling process, evaluate policy for `access`, and return
-    /// the process info iff allowed.
-    fn authorize(&self, pid: u32, access: Access) -> Option<ProcessInfo> {
-        let info = match crate::process::identify::identify(pid) {
+    /// the process info iff allowed. A foreign uid is rejected before policy is
+    /// even consulted.
+    fn authorize(&self, req: &Request, access: Access) -> Option<ProcessInfo> {
+        let info = match crate::process::identify::identify(req.pid()) {
             Ok(info) => info,
             Err(e) => {
-                tracing::warn!("failed to identify pid {pid}: {e}");
+                tracing::warn!("failed to identify pid {}: {e}", req.pid());
                 return None;
             }
         };
+
+        // Reject a foreign uid before consulting policy: `allow_other` makes the
+        // root mount reachable by any local user, but only the owning user (or
+        // root) may access another user's credential.
+        if let Some(owner) = self.owner_uid {
+            let uid = req.uid();
+            if uid != owner && uid != 0 {
+                tracing::warn!(
+                    "denying uid {uid} access to {} (owner uid {owner})",
+                    self.watched_path.display()
+                );
+                self.logger
+                    .log(&info, &self.watched_path, access, &Decision::DenyOnce, None);
+                return None;
+            }
+        }
 
         let decision =
             self.rt_handle
@@ -131,96 +185,70 @@ impl CredentialFs {
         decision.is_allowed().then_some(info)
     }
 
-    fn read_store_or_empty(&self) -> Vec<u8> {
-        // A read error here is, in practice, "not stored yet" (new file) - serve
-        // empty. Genuine IO errors on the root-owned store are surfaced by the
-        // write path (store() errors map to EIO).
-        self.store.read(&self.watched_path).unwrap_or_default()
-    }
-
-    fn set_size(&self, size: u64) {
-        *self.current_size.lock().unwrap() = size;
-    }
-
-    fn grow_size_to(&self, size: u64) {
-        let mut current = self.current_size.lock().unwrap();
-        if size > *current {
-            *current = size;
-        }
-    }
-
-    fn register_handle(&self, state: HandleState) -> u64 {
+    fn register_handle(&self, handle: OpenHandle) -> u64 {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        self.handles.lock().unwrap().insert(fh, state);
+        self.handles.lock().unwrap().insert(fh, handle);
         fh
     }
 
-    fn handle_access(&self, fh: u64) -> Option<Access> {
-        self.handles.lock().unwrap().get(&fh).map(|s| s.access)
+    /// Apply a write into the shared content at `offset`, growing (and
+    /// zero-filling any gap) as needed. Rejects an unknown/non-write handle
+    /// (`EACCES`) and an out-of-bounds extent (`EFBIG`).
+    fn apply_write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, Errno> {
+        match self.handles.lock().unwrap().get(&fh) {
+            Some(h) if h.access == Access::Write => {}
+            Some(_) | None => return Err(Errno::EACCES),
+        }
+
+        let end = checked_write_end(offset, data.len())?;
+        let start = offset as usize;
+
+        let mut content = self.content.lock().unwrap();
+        if content.bytes.len() < end {
+            content.bytes.resize(end, 0); // sparse gap zero-filled
+        }
+        content.bytes[start..end].copy_from_slice(data);
+        content.dirty = true;
+        Ok(data.len() as u32)
     }
 
-    /// Persist a write handle's buffer to the store if dirty. Clones the buffer
-    /// before releasing the lock so the store write doesn't block other ops; on
-    /// failure `dirty` stays set so a later flush/release retries.
-    fn persist_handle(&self, fh: u64) -> anyhow::Result<()> {
-        let buf = {
-            let handles = self.handles.lock().unwrap();
-            match handles.get(&fh) {
-                Some(s) if s.access == Access::Write && s.dirty => s.buf.clone(),
-                _ => return Ok(()),
-            }
-        };
-
-        self.store.store(&self.watched_path, &buf)?;
-
-        let mut handles = self.handles.lock().unwrap();
-        if let Some(s) = handles.get_mut(&fh) {
-            s.dirty = false;
+    /// Resize the shared content to `new_size` (zero-filling on grow), rejecting
+    /// an oversized truncate. Acts on the single shared buffer, so no open
+    /// handle can later resurrect the dropped tail.
+    fn apply_truncate(&self, new_size: u64) -> Result<(), Errno> {
+        if new_size > MAX_CONTENT_LEN {
+            return Err(Errno::EFBIG);
         }
-        self.set_size(buf.len() as u64);
+        let mut content = self.content.lock().unwrap();
+        content.bytes.resize(new_size as usize, 0);
+        content.dirty = true;
         Ok(())
     }
 
-    /// Apply a truncate, either against an open write handle's buffer or, when
-    /// there is none, directly against the store.
-    fn apply_truncate(&self, fh: Option<u64>, new_size: u64) -> anyhow::Result<()> {
-        let n = new_size as usize;
+    /// Empty the shared content (an `O_TRUNC` open), marking it dirty so the
+    /// truncation persists even if the handle is closed without a write.
+    fn truncate_on_open(&self) {
+        let mut content = self.content.lock().unwrap();
+        content.bytes.clear();
+        content.dirty = true;
+    }
 
-        if let Some(h) = fh {
-            let mut handles = self.handles.lock().unwrap();
-            if let Some(state) = handles.get_mut(&h)
-                && state.access == Access::Write
-            {
-                state.buf.resize(n, 0);
-                state.dirty = true;
-                drop(handles);
-                self.set_size(new_size);
-                return Ok(());
-            }
+    /// Persist the shared content to the store if dirty. The content lock is
+    /// held across the store write so a concurrent write/truncate can neither
+    /// interleave into a half-persisted state nor have its dirty flag cleared
+    /// without being written; on failure `dirty` stays set for a later retry.
+    fn persist(&self) -> anyhow::Result<()> {
+        let mut content = self.content.lock().unwrap();
+        if !content.dirty {
+            return Ok(());
         }
-
-        // A truncate that carries no (matching) write handle — a path-based
-        // truncate, or an `ftruncate` the kernel routed without an fh. Apply it
-        // to the store, and — critically — to every open write handle's working
-        // buffer too. A handle opened before this truncate still holds the older,
-        // longer content; if left untouched it re-persists that stale buffer on
-        // release and silently reverts the truncate, leaving the dropped tail
-        // behind. Resizing the live handles keeps the truncate from being undone.
-        {
-            let mut handles = self.handles.lock().unwrap();
-            for state in handles.values_mut() {
-                if state.access == Access::Write {
-                    state.buf.resize(n, 0);
-                    state.dirty = true;
-                }
-            }
-        }
-
-        let mut content = self.read_store_or_empty();
-        content.resize(n, 0);
-        self.store.store(&self.watched_path, &content)?;
-        self.set_size(new_size);
+        self.store.store(&self.watched_path, &content.bytes)?;
+        content.dirty = false;
         Ok(())
+    }
+
+    fn current_size(&self) -> u64 {
+        self.content.lock().unwrap().bytes.len() as u64
     }
 }
 
@@ -230,8 +258,7 @@ impl Filesystem for CredentialFs {
             reply.error(Errno::ENOENT);
             return;
         }
-        let attr = build_file_attr(*self.current_size.lock().unwrap());
-        reply.attr(&default_ttl(), &attr);
+        reply.attr(&default_ttl(), &build_file_attr(self.current_size()));
     }
 
     fn lookup(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEntry) {
@@ -245,37 +272,31 @@ impl Filesystem for CredentialFs {
         }
 
         let flags = flags.0;
+        let accmode = flags & libc::O_ACCMODE;
         let access = Access::from_open_flags(flags);
-        if self.authorize(req.pid(), access).is_none() {
+
+        if self.authorize(req, access).is_none() {
             reply.error(Errno::EACCES);
             return;
         }
 
-        let truncating = (flags & libc::O_TRUNC) != 0;
-        let buf = if access == Access::Write {
-            if truncating || (flags & libc::O_CREAT) != 0 {
-                Vec::new()
-            } else {
-                self.read_store_or_empty()
-            }
-        } else {
-            Vec::new()
-        };
-
-        // O_TRUNC empties the file immediately, even if the handle is closed
-        // without a subsequent write - mark dirty so that empties is persisted.
-        let dirty = access == Access::Write && truncating;
-        if dirty {
-            self.set_size(0);
+        // O_RDWR can both read and write. `from_open_flags` classifies it as a
+        // write; it must *additionally* pass read authorization, otherwise a
+        // write-only grant could open O_RDWR and read the secret out of the
+        // shared buffer via read().
+        let can_read = accmode == libc::O_RDONLY || accmode == libc::O_RDWR;
+        if accmode == libc::O_RDWR && self.authorize(req, Access::Read).is_none() {
+            reply.error(Errno::EACCES);
+            return;
         }
 
-        // FOPEN_DIRECT_IO: bypass the kernel page cache entirely. Reads and
-        // writes are delivered to us at the exact offsets/sizes the caller
-        // issued, with no read-ahead and no deferred write-back. Without it the
-        // kernel can cache pages for the old, longer file and flush stale ranges
-        // after a shrink, appending resurrected bytes (the tail-duplication
-        // corruption). Content is small, so the lost caching costs nothing.
-        let fh = self.register_handle(HandleState { access, buf, dirty });
+        // O_TRUNC empties the shared file immediately, even if the handle is
+        // closed without a subsequent write.
+        if access == Access::Write && (flags & libc::O_TRUNC) != 0 {
+            self.truncate_on_open();
+        }
+
+        let fh = self.register_handle(OpenHandle { access, can_read });
         reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
     }
 
@@ -295,22 +316,17 @@ impl Filesystem for CredentialFs {
             return;
         }
 
-        // A write handle reads back its own working buffer; a read handle reads
-        // the store. An unknown fh was never authorized → EACCES.
-        let from_buf = {
-            let handles = self.handles.lock().unwrap();
-            match handles.get(&fh.0) {
-                None => {
-                    reply.error(Errno::EACCES);
-                    return;
-                }
-                Some(s) if s.access == Access::Write => Some(s.buf.clone()),
-                Some(_) => None,
+        // An unknown fh was never authorized; a write-only handle may not read.
+        match self.handles.lock().unwrap().get(&fh.0) {
+            Some(h) if h.can_read => {}
+            Some(_) | None => {
+                reply.error(Errno::EACCES);
+                return;
             }
-        };
+        }
 
-        let content = from_buf.unwrap_or_else(|| self.read_store_or_empty());
-        reply.data(slice_content(&content, offset, size));
+        let content = self.content.lock().unwrap();
+        reply.data(slice_content(&content.bytes, offset, size));
     }
 
     fn write(
@@ -330,29 +346,10 @@ impl Filesystem for CredentialFs {
             return;
         }
 
-        let new_len = {
-            let mut handles = self.handles.lock().unwrap();
-            let Some(state) = handles.get_mut(&fh.0) else {
-                reply.error(Errno::EACCES);
-                return;
-            };
-            if state.access != Access::Write {
-                reply.error(Errno::EACCES);
-                return;
-            }
-
-            let start = offset as usize;
-            let end = start + data.len();
-            if state.buf.len() < end {
-                state.buf.resize(end, 0); // sparse gap zero-filled
-            }
-            state.buf[start..end].copy_from_slice(data);
-            state.dirty = true;
-            state.buf.len() as u64
-        };
-
-        self.grow_size_to(new_len);
-        reply.written(data.len() as u32);
+        match self.apply_write(fh.0, offset, data) {
+            Ok(written) => reply.written(written),
+            Err(e) => reply.error(e),
+        }
     }
 
     fn setattr(
@@ -378,35 +375,46 @@ impl Filesystem for CredentialFs {
             return;
         }
 
-        // The only attribute we enforce is size (truncate) - it is a write and
+        // The only attribute we enforce is size (truncate) — it is a write and
         // the easiest write-bypass to miss. An already-authorized write handle
-        // passes; otherwise gate the truncate against the calling process.
+        // passes; a handle-less truncate is gated against the calling process.
         if let Some(new_size) = size {
-            let authorized = match fh.and_then(|h| self.handle_access(h.0)) {
-                Some(Access::Write) => true,
-                Some(_) => false, // a read handle may not resize
-                _ => self.authorize(req.pid(), Access::Write).is_some(),
+            let authorized = match fh.and_then(|h| {
+                self.handles
+                    .lock()
+                    .unwrap()
+                    .get(&h.0)
+                    .map(|s| s.access == Access::Write)
+            }) {
+                Some(true) => true,
+                Some(false) => false, // a read handle may not resize
+                None => self.authorize(req, Access::Write).is_some(),
             };
             if !authorized {
                 reply.error(Errno::EACCES);
                 return;
             }
-            if let Err(e) = self.apply_truncate(fh.map(|h| h.0), new_size) {
+            if let Err(e) = self.apply_truncate(new_size) {
+                reply.error(e);
+                return;
+            }
+            // A truncate is a durable operation on its own (a handle-less
+            // truncate(2) has no later flush/release), so persist immediately.
+            if let Err(e) = self.persist() {
                 tracing::error!("truncate of {} failed: {e}", self.watched_path.display());
                 reply.error(Errno::EIO);
                 return;
             }
         }
 
-        let attr = build_file_attr(*self.current_size.lock().unwrap());
-        reply.attr(&default_ttl(), &attr);
+        reply.attr(&default_ttl(), &build_file_attr(self.current_size()));
     }
 
     fn flush(
         &self,
         _req: &Request,
         ino: INodeNo,
-        fh: FileHandle,
+        _fh: FileHandle,
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
@@ -414,7 +422,7 @@ impl Filesystem for CredentialFs {
             reply.error(Errno::ENOENT);
             return;
         }
-        match self.persist_handle(fh.0) {
+        match self.persist() {
             Ok(()) => reply.ok(),
             Err(e) => {
                 tracing::error!("flush of {} failed: {e}", self.watched_path.display());
@@ -427,7 +435,7 @@ impl Filesystem for CredentialFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        fh: FileHandle,
+        _fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
@@ -435,7 +443,7 @@ impl Filesystem for CredentialFs {
             reply.error(Errno::ENOENT);
             return;
         }
-        match self.persist_handle(fh.0) {
+        match self.persist() {
             Ok(()) => reply.ok(),
             Err(e) => {
                 tracing::error!("fsync of {} failed: {e}", self.watched_path.display());
@@ -459,7 +467,7 @@ impl Filesystem for CredentialFs {
             return;
         }
 
-        let persisted = self.persist_handle(fh.0);
+        let persisted = self.persist();
         self.handles.lock().unwrap().remove(&fh.0);
 
         match persisted {
@@ -496,6 +504,23 @@ mod tests {
         assert_eq!(slice_content(c, 0, 0), b""); // zero size
     }
 
+    /// `fuser::Errno` has no `PartialEq`; compare via its libc code instead.
+    fn code<T>(r: Result<T, Errno>) -> Result<T, i32> {
+        r.map_err(|e| e.code())
+    }
+
+    #[test]
+    fn checked_write_end_rejects_overflow_and_cap() {
+        assert_eq!(code(checked_write_end(0, 5)), Ok(5));
+        assert_eq!(
+            code(checked_write_end(MAX_CONTENT_LEN - 3, 3)),
+            Ok(MAX_CONTENT_LEN as usize)
+        );
+        assert_eq!(code(checked_write_end(MAX_CONTENT_LEN, 1)), Err(libc::EFBIG));
+        assert_eq!(code(checked_write_end(u64::MAX, 1)), Err(libc::EFBIG));
+        assert_eq!(code(checked_write_end(1 << 50, 0)), Err(libc::EFBIG)); // huge sparse offset
+    }
+
     struct MemStore(StdMutex<StdHashMap<PathBuf, Vec<u8>>>);
 
     impl BackingStore for MemStore {
@@ -526,8 +551,8 @@ mod tests {
         }
     }
 
-    /// A `CredentialFs` over an in-memory store, seeded with `initial`. The
-    /// policy/logger are never exercised by the buffer-level methods under test.
+    /// A `CredentialFs` over an in-memory store seeded with `initial`. The
+    /// policy/logger are never exercised by the content-level methods under test.
     fn fixture(initial: &[u8]) -> (CredentialFs, PathBuf, Arc<MemStore>, tokio::runtime::Runtime) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let watched = PathBuf::from("/credential");
@@ -554,63 +579,138 @@ mod tests {
             policy,
             logger,
             rt.handle().clone(),
+            None,
         )
         .unwrap();
         (fs, watched, store, rt)
     }
 
-    /// The race that corrupted the ADC file: a write handle is open with the old,
-    /// longer content buffered when a handle-less truncate (path truncate, or an
-    /// `ftruncate` delivered without an fh) shrinks the file. The truncate must
-    /// reach the live handle, or its stale buffer re-grows the file on release.
-    #[test]
-    fn fhless_truncate_is_not_reverted_by_open_write_handle() {
-        let (fs, watched, store, _rt) = fixture(b"OLD-LONG-CONTENT");
-
-        // Writer opens in place (no O_TRUNC): the handle preloads existing bytes.
-        let buf = fs.read_store_or_empty();
-        let fh = fs.register_handle(HandleState {
+    fn write_handle(fs: &CredentialFs) -> u64 {
+        fs.register_handle(OpenHandle {
             access: Access::Write,
-            buf,
-            dirty: false,
-        });
-
-        // Writer overwrites the head with shorter content, leaving a stale tail
-        // in the handle buffer (write() only grows — POSIX-correct on its own).
-        // This mirrors `write(offset=0, b"NEW")` without a kernel `ReplyWrite`.
-        {
-            let mut handles = fs.handles.lock().unwrap();
-            let state = handles.get_mut(&fh).unwrap();
-            state.buf[0..3].copy_from_slice(b"NEW");
-            state.dirty = true;
-        }
-
-        // A truncate arrives WITHOUT the fh (the bug trigger).
-        fs.apply_truncate(None, 3).unwrap();
-
-        // Release persists the handle. Pre-fix this re-wrote "NEW-LONG-CONTENT";
-        // the truncate must win.
-        fs.persist_handle(fh).unwrap();
-
-        assert_eq!(
-            store.read(&watched).unwrap(),
-            b"NEW",
-            "fh-less truncate was reverted by the open write handle's stale buffer"
-        );
+            can_read: false,
+        })
     }
 
-    /// A truncate that DOES carry its write handle shrinks that handle's buffer,
-    /// so the shorter content is what gets persisted (the editor ftruncate path).
+    /// Two concurrent write handles editing disjoint regions: with a shared
+    /// content buffer, both edits survive — the previous per-handle-buffer model
+    /// lost the first writer's bytes (last-writer-wins whole-file overwrite).
     #[test]
-    fn handle_truncate_shrinks_persisted_content() {
-        let (fs, watched, store, _rt) = fixture(b"");
-        let fh = fs.register_handle(HandleState {
-            access: Access::Write,
-            buf: b"HELLO WORLD".to_vec(),
-            dirty: true,
+    fn concurrent_disjoint_writes_preserve_both_edits() {
+        let (fs, watched, store, _rt) = fixture(&[b'x'; 200]);
+        let p1 = write_handle(&fs);
+        let p2 = write_handle(&fs);
+
+        fs.apply_write(p1, 0, b"AAA").unwrap();
+        fs.apply_write(p2, 100, b"BBB").unwrap();
+        fs.persist().unwrap();
+
+        let got = store.read(&watched).unwrap();
+        assert_eq!(&got[0..3], b"AAA");
+        assert_eq!(&got[100..103], b"BBB");
+        assert_eq!(got.len(), 200);
+    }
+
+    /// A truncate is not reverted by another open write handle that never saw it
+    /// (the original corruption class), because the buffer is shared.
+    #[test]
+    fn truncate_not_reverted_by_sibling_handle() {
+        let (fs, watched, store, _rt) = fixture(b"OLD-LONG-SECRET");
+        let sibling = write_handle(&fs); // open, dirty, holds no private copy now
+        fs.apply_write(sibling, 0, b"OLD-LONG-SECRET").unwrap();
+
+        fs.apply_truncate(3).unwrap();
+        fs.persist().unwrap(); // sibling's later persist sees the same 3-byte content
+
+        assert_eq!(store.read(&watched).unwrap(), b"OLD");
+    }
+
+    /// O_TRUNC-at-open empties the shared file even with no following write.
+    #[test]
+    fn otrunc_open_then_close_persists_empty() {
+        let (fs, watched, store, _rt) = fixture(b"SECRET");
+        fs.truncate_on_open();
+        fs.persist().unwrap();
+        assert_eq!(store.read(&watched).unwrap(), b"");
+    }
+
+    /// A write at a huge offset is rejected with EFBIG, not attempted as a
+    /// multi-terabyte allocation that would abort the daemon.
+    #[test]
+    fn write_at_huge_offset_is_efbig() {
+        let (fs, _watched, _store, _rt) = fixture(b"");
+        let fh = write_handle(&fs);
+        assert_eq!(code(fs.apply_write(fh, 1 << 50, b"x")), Err(libc::EFBIG));
+        assert_eq!(fs.current_size(), 0); // nothing allocated/grown
+    }
+
+    /// A sparse write past EOF zero-fills the gap and grows the file.
+    #[test]
+    fn sparse_write_zero_fills_gap() {
+        let (fs, watched, store, _rt) = fixture(b"ab");
+        let fh = write_handle(&fs);
+        fs.apply_write(fh, 5, b"Z").unwrap();
+        fs.persist().unwrap();
+        assert_eq!(store.read(&watched).unwrap(), b"ab\0\0\0Z");
+    }
+
+    /// An unknown fh and a non-write handle are both refused by apply_write.
+    #[test]
+    fn write_rejects_unknown_and_read_handle() {
+        let (fs, _watched, _store, _rt) = fixture(b"");
+        assert_eq!(code(fs.apply_write(999, 0, b"x")), Err(libc::EACCES));
+        let read_fh = fs.register_handle(OpenHandle {
+            access: Access::Read,
+            can_read: true,
         });
-        fs.apply_truncate(Some(fh), 5).unwrap();
-        fs.persist_handle(fh).unwrap();
-        assert_eq!(store.read(&watched).unwrap(), b"HELLO");
+        assert_eq!(code(fs.apply_write(read_fh, 0, b"x")), Err(libc::EACCES));
+    }
+
+    /// Construction surfaces a genuine store read error (existing entry that
+    /// fails to read) instead of silently serving an empty file.
+    #[test]
+    fn new_propagates_store_read_error() {
+        struct FailingStore;
+        impl BackingStore for FailingStore {
+            fn read(&self, _: &Path) -> anyhow::Result<Vec<u8>> {
+                anyhow::bail!("disk on fire")
+            }
+            fn store(&self, _: &Path, _: &[u8]) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn delete(&self, _: &Path) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn list(&self) -> anyhow::Result<Vec<PathBuf>> {
+                Ok(vec![])
+            }
+            fn exists(&self, _: &Path) -> bool {
+                true // entry "exists" but read fails
+            }
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let config = Config {
+            settings: toml::from_str::<Settings>("default_action = \"deny\"").unwrap(),
+            watch: vec![],
+            rule: vec![],
+        };
+        let policy = Arc::new(PolicyEngine::new(
+            &config,
+            Arc::new(PromptClient::new(
+                PathBuf::from("/x.sock"),
+                Duration::from_millis(50),
+                0,
+            )),
+        ));
+        let logger = Arc::new(AccessLogger::new("stdout").unwrap());
+        let err = CredentialFs::new(
+            PathBuf::from("/credential"),
+            Arc::new(FailingStore),
+            policy,
+            logger,
+            rt.handle().clone(),
+            None,
+        );
+        assert!(err.is_err(), "a failing read of an existing entry must not be served as empty");
     }
 }
