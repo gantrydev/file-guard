@@ -71,8 +71,17 @@ impl PromptClient {
     ) -> anyhow::Result<PromptOutcome> {
         // Fill the parent chain here, on the (rare) prompt path only: it scans
         // the process table and `identify` deliberately skips it on every open.
+        // The scan is synchronous/blocking, so offload it like `decide_open`
+        // does for `identify` rather than stalling an async worker.
+        let pid = process.pid;
+        let parents = tokio::task::spawn_blocking(move || {
+            crate::process::identify::parent_chain(pid)
+        })
+        .await
+        .unwrap_or_default();
+
         let mut process_desc = ProcessDesc::from(process);
-        process_desc.parents = crate::process::identify::parent_chain(process.pid)
+        process_desc.parents = parents
             .into_iter()
             .map(|p| ParentDesc {
                 pid: p.pid,

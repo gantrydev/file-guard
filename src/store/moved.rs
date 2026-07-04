@@ -51,23 +51,12 @@ impl MovedStore {
     /// `/home/a/.aws/credentials` → `store_dir/home%2Fa%2F.aws%2Fcredentials`.
     ///
     /// The key is a percent-encoding of the absolute path (only `/` and `%` are
-    /// escaped), which is *injective*: distinct paths never collide. The prior
+    /// escaped), which is *injective*: distinct paths never collide. A prior
     /// `/`→`--` scheme could both collide (`/a-/b` and `/a/-b` mapped to the same
     /// file, silently clobbering one credential with another) and round-trip
     /// wrong for any path already containing `--`.
     fn store_path(&self, file_id: &Path) -> PathBuf {
         self.store_dir.join(encode_key(file_id))
-    }
-
-    /// The pre-percent-encoding store location, kept so existing stores keep
-    /// working across the upgrade: reads/deletes fall back to it and a read
-    /// migrates the entry to the new key. See `store_path`.
-    fn legacy_store_path(&self, file_id: &Path) -> PathBuf {
-        let encoded = file_id
-            .to_string_lossy()
-            .trim_start_matches('/')
-            .replace('/', "--");
-        self.store_dir.join(encoded)
     }
 }
 
@@ -88,22 +77,30 @@ fn encode_key(path: &Path) -> String {
     out
 }
 
-/// Inverse of `encode_key`, for `list()`. Legacy `--`-encoded names (no `%`)
-/// are decoded with the old scheme so a mixed store still lists sensibly.
+/// Inverse of `encode_key`, for `list()`.
+///
+/// Operates on raw bytes with an explicit ASCII-hex check: slicing the `&str`
+/// at `%`-relative offsets could panic on a non-char-boundary, and
+/// `from_str_radix` would wrongly accept a leading `+`.
 fn decode_key(name: &str) -> PathBuf {
     use std::os::unix::ffi::OsStrExt;
-    if !name.contains('%') {
-        return PathBuf::from(format!("/{}", name.replace("--", "/")));
-    }
+    let hex = |b: u8| -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            _ => None,
+        }
+    };
     let bytes = name.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
-            && let Ok(v) = u8::from_str_radix(&name[i + 1..i + 3], 16)
+            && let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
         {
-            out.push(v);
+            out.push(hi * 16 + lo);
             i += 3;
             continue;
         }
@@ -116,36 +113,13 @@ fn decode_key(name: &str) -> PathBuf {
 impl BackingStore for MovedStore {
     fn read(&self, file_id: &Path) -> anyhow::Result<Vec<u8>> {
         let path = self.store_path(file_id);
-        match std::fs::read(&path) {
-            Ok(contents) => Ok(contents),
-            // Fall back to a pre-upgrade entry and migrate it forward so the new
-            // key holds it from now on. A failed migration is non-fatal - the
-            // legacy copy still exists and is returned.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let legacy = self.legacy_store_path(file_id);
-                let contents = std::fs::read(&legacy).map_err(|_| {
-                    anyhow::anyhow!("failed to read backing store {}: {e}", path.display())
-                })?;
-                if std::fs::rename(&legacy, &path).is_ok() {
-                    tracing::info!("migrated backing-store entry to {}", path.display());
-                }
-                Ok(contents)
-            }
-            Err(e) => Err(anyhow::anyhow!(
-                "failed to read backing store {}: {e}",
-                path.display()
-            )),
-        }
+        std::fs::read(&path)
+            .map_err(|e| anyhow::anyhow!("failed to read backing store {}: {e}", path.display()))
     }
 
     fn store(&self, file_id: &Path, contents: &[u8]) -> anyhow::Result<()> {
         use std::io::Write;
         let path = self.store_path(file_id);
-        // Drop any stale legacy-keyed copy so the two encodings can't diverge.
-        let legacy = self.legacy_store_path(file_id);
-        if legacy != path {
-            let _ = std::fs::remove_file(&legacy);
-        }
 
         // Write the new contents to a sibling temp file, fsync it, then rename
         // it over the target. A crash at any point leaves either the old file or
@@ -187,17 +161,15 @@ impl BackingStore for MovedStore {
     }
 
     fn delete(&self, file_id: &Path) -> anyhow::Result<()> {
-        // Remove both the current and any legacy-keyed copy.
-        for path in [self.store_path(file_id), self.legacy_store_path(file_id)] {
-            if path.exists() {
-                std::fs::remove_file(&path)?;
-            }
+        let path = self.store_path(file_id);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
         }
         Ok(())
     }
 
     fn exists(&self, file_id: &Path) -> bool {
-        self.store_path(file_id).exists() || self.legacy_store_path(file_id).exists()
+        self.store_path(file_id).exists()
     }
 
     fn list(&self) -> anyhow::Result<Vec<PathBuf>> {
@@ -240,27 +212,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn read_migrates_a_legacy_keyed_entry() {
-        let dir = std::env::temp_dir().join(format!("fg-store-legacy-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = MovedStore {
-            store_dir: dir.clone(),
-        };
-        let id = Path::new("/home/u/.aws/credentials");
-
-        // Seed an entry under the old `--` encoding only.
-        let legacy = store.legacy_store_path(id);
-        std::fs::write(&legacy, b"legacy-secret").unwrap();
-
-        assert!(store.exists(id), "legacy entry must be visible");
-        assert_eq!(store.read(id).unwrap(), b"legacy-secret");
-        // Read migrated it to the new key and removed the legacy file.
-        assert!(store.store_path(id).exists(), "entry migrated to new key");
-        assert!(!legacy.exists(), "legacy file removed after migration");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
 
     #[test]
     fn store_round_trips_at_0600_and_leaves_no_temp() {

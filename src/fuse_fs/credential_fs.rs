@@ -401,6 +401,14 @@ impl Filesystem for CredentialFs {
         let needs_write = Access::from_open_flags(flags) == Access::Write;
         let truncate_on_open = needs_write && (flags & libc::O_TRUNC) != 0;
 
+        // An open requesting neither read nor write (the invalid `O_ACCMODE == 3`
+        // ioctl-only form) is meaningless for a credential file and would sail
+        // through policy vacuously — reject it rather than log a spurious ALLOW.
+        if !needs_read && !needs_write {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+
         // Authorize off the FUSE session thread: a prompt can take seconds, and
         // the single-threaded session would otherwise stall every other op on
         // this mount (a concurrent `stat`, a read on another handle) until the
