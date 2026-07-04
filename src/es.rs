@@ -242,9 +242,12 @@ unsafe extern "C" fn handle_event(_client: *mut es_client_t, message: *const es_
 
     let result = match crate::process::identify::identify(pid) {
         Ok(info) => {
-            let decision = ctx
-                .rt_handle
-                .block_on(ctx.policy.evaluate(&info, &file_path, access));
+            let decision = ctx.rt_handle.block_on(ctx.policy.evaluate_open(
+                &info,
+                &file_path,
+                /* needs_read */ true,
+                /* needs_write */ false,
+            ));
 
             ctx.logger.log(&info, &file_path, access, &decision, None);
             decision.is_allowed()

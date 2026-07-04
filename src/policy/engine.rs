@@ -63,48 +63,81 @@ impl PolicyEngine {
             .unwrap_or(self.global_default)
     }
 
-    /// Evaluate policy for a process accessing a watched file in a given
-    /// direction. May block while prompting the user.
-    pub async fn evaluate(
+    /// Evaluate an `open()` that may need to read, write, or both, prompting the
+    /// user **at most once** for the whole open.
+    ///
+    /// Each required direction is first resolved non-interactively against
+    /// persistent rules and session grants, so the read-vs-write distinction is
+    /// still enforced (a write-only rule never authorizes a read, and a deny
+    /// rule wins outright). Only if some required direction is still unresolved
+    /// do we prompt - once - and apply that single decision to the whole open,
+    /// rather than firing a separate dialog (and audit line) per direction as a
+    /// naive read-then-write gate would for an `O_RDWR` open of e.g. an sqlite
+    /// credential DB.
+    pub async fn evaluate_open(
         &self,
         process: &ProcessInfo,
         watched_file: &Path,
-        access: Access,
+        needs_read: bool,
+        needs_write: bool,
     ) -> Decision {
-        // 1. Persistent rules (identity-pinned).
-        if let Some(action) = self.lookup_rule(process, watched_file, access) {
-            return match action {
-                Action::Allow => Decision::AllowAlways,
-                Action::Deny => Decision::DenyAlways,
-            };
-        }
-
-        // 2. Session grants, keyed on this exact process instance.
         let proc_id = ProcessId::from(process);
-        if self
-            .session
-            .is_session_allowed(&proc_id, watched_file, access)
-        {
-            return Decision::AllowSession;
+
+        let mut all_pre_authorized = true;
+        for (needed, access) in [(needs_read, Access::Read), (needs_write, Access::Write)] {
+            if !needed {
+                continue;
+            }
+            match self.lookup_rule(process, watched_file, access) {
+                // A persistent deny on any required direction denies the open.
+                Some(Action::Deny) => return Decision::DenyAlways,
+                Some(Action::Allow) => continue,
+                None => {
+                    if !self.session.is_session_allowed(&proc_id, watched_file, access) {
+                        all_pre_authorized = false;
+                    }
+                }
+            }
         }
 
-        // 3. Unknown - prompt the user (via the session agent). On no response,
-        // the client applies this file's default action.
+        // Every required direction was already granted (rule or session): no prompt.
+        if all_pre_authorized {
+            return Decision::AllowAlways;
+        }
+
+        // Prompt once. The verb shown reflects what the open actually needs.
+        let prompt_access = match (needs_read, needs_write) {
+            (true, true) => Access::Any,
+            (_, true) => Access::Write,
+            _ => Access::Read,
+        };
+        self.prompt_and_apply(process, proc_id, watched_file, prompt_access)
+            .await
+    }
+
+    /// Prompt the user for an unresolved access and turn their choice into a
+    /// `Decision`, persisting a rule or session grant as chosen. A permanent or
+    /// session grant covers both directions (`Access::Any`) so a tool that both
+    /// reads and writes a file isn't re-prompted per direction.
+    async fn prompt_and_apply(
+        &self,
+        process: &ProcessInfo,
+        proc_id: ProcessId,
+        watched_file: &Path,
+        prompt_access: Access,
+    ) -> Decision {
         let choice = self
             .prompter
             .prompt(
                 process,
                 watched_file,
-                access,
+                prompt_access,
                 self.default_for(watched_file),
             )
             .await;
 
         match choice {
             UserChoice::AllowOnce => Decision::AllowOnce,
-            // A permanent grant means "I trust this binary with this file" - it
-            // covers both directions, so a tool that reads *and* writes a file
-            // (e.g. an sqlite credential DB) isn't prompted once per direction.
             UserChoice::AllowAlways => {
                 self.persist_rule(process, watched_file, Access::Any, Action::Allow);
                 Decision::AllowAlways
@@ -434,8 +467,8 @@ mod tests {
         let proc = info_for(Path::new("/usr/bin/whatever"));
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let a = rt.block_on(eng.evaluate(&proc, Path::new("/a"), Access::Read));
-        let b = rt.block_on(eng.evaluate(&proc, Path::new("/b"), Access::Read));
+        let a = rt.block_on(eng.evaluate_open(&proc, Path::new("/a"), true, false));
+        let b = rt.block_on(eng.evaluate_open(&proc, Path::new("/b"), true, false));
         assert_eq!(a, Decision::AllowOnce);
         assert_eq!(b, Decision::DenyOnce);
     }

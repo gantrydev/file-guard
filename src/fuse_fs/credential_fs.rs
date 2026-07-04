@@ -99,92 +99,18 @@ struct OpenHandle {
     can_read: bool,
 }
 
-pub struct CredentialFs {
-    watched_path: PathBuf,
-    store: Arc<dyn BackingStore>,
-    policy: Arc<PolicyEngine>,
-    logger: Arc<AccessLogger>,
-    rt_handle: tokio::runtime::Handle,
-    /// Expected requester uid (the owner of the guarded file's directory). When
-    /// set, only that uid — or root — may access the mount, even though
-    /// `allow_other` makes it reachable by any local user.
-    owner_uid: Option<u32>,
+/// Mutable state shared between the FUSE handlers and any authorization task
+/// spawned off the session thread (see `open`). Held behind an `Arc` so an
+/// async `open` can register its handle / apply an `O_TRUNC` after the (possibly
+/// user-blocking) policy decision without pinning the single-threaded FUSE read
+/// loop.
+struct Shared {
     content: Mutex<Content>,
     handles: Mutex<HashMap<u64, OpenHandle>>,
     next_fh: AtomicU64,
 }
 
-impl CredentialFs {
-    pub fn new(
-        watched_path: PathBuf,
-        store: Arc<dyn BackingStore>,
-        policy: Arc<PolicyEngine>,
-        logger: Arc<AccessLogger>,
-        rt_handle: tokio::runtime::Handle,
-        owner_uid: Option<u32>,
-    ) -> anyhow::Result<Self> {
-        // Load the authoritative content once. `exists()` distinguishes "not
-        // stored yet" (serve empty) from a genuine read failure on an existing
-        // entry, which must surface rather than masquerade as an empty file.
-        let bytes = if store.exists(&watched_path) {
-            store.read(&watched_path)?
-        } else {
-            Vec::new()
-        };
-
-        Ok(Self {
-            watched_path,
-            store,
-            policy,
-            logger,
-            rt_handle,
-            owner_uid,
-            content: Mutex::new(Content {
-                bytes,
-                dirty: false,
-            }),
-            handles: Mutex::new(HashMap::new()),
-            next_fh: AtomicU64::new(1),
-        })
-    }
-
-    /// Identify the calling process, evaluate policy for `access`, and return
-    /// the process info iff allowed. A foreign uid is rejected before policy is
-    /// even consulted.
-    fn authorize(&self, req: &Request, access: Access) -> Option<ProcessInfo> {
-        let info = match crate::process::identify::identify(req.pid()) {
-            Ok(info) => info,
-            Err(e) => {
-                tracing::warn!("failed to identify pid {}: {e}", req.pid());
-                return None;
-            }
-        };
-
-        // Reject a foreign uid before consulting policy: `allow_other` makes the
-        // root mount reachable by any local user, but only the owning user (or
-        // root) may access another user's credential.
-        if let Some(owner) = self.owner_uid {
-            let uid = req.uid();
-            if uid != owner && uid != 0 {
-                tracing::warn!(
-                    "denying uid {uid} access to {} (owner uid {owner})",
-                    self.watched_path.display()
-                );
-                self.logger
-                    .log(&info, &self.watched_path, access, &Decision::DenyOnce, None);
-                return None;
-            }
-        }
-
-        let decision =
-            self.rt_handle
-                .block_on(self.policy.evaluate(&info, &self.watched_path, access));
-        self.logger
-            .log(&info, &self.watched_path, access, &decision, None);
-
-        decision.is_allowed().then_some(info)
-    }
-
+impl Shared {
     fn register_handle(&self, handle: OpenHandle) -> u64 {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         self.handles.lock().unwrap().insert(fh, handle);
@@ -233,12 +159,125 @@ impl CredentialFs {
         content.dirty = true;
     }
 
+    fn current_size(&self) -> u64 {
+        self.content.lock().unwrap().bytes.len() as u64
+    }
+}
+
+pub struct CredentialFs {
+    watched_path: PathBuf,
+    store: Arc<dyn BackingStore>,
+    policy: Arc<PolicyEngine>,
+    logger: Arc<AccessLogger>,
+    rt_handle: tokio::runtime::Handle,
+    /// Expected requester uid (the owner of the guarded file's directory). When
+    /// set, only that uid — or root — may access the mount, even though
+    /// `allow_other` makes it reachable by any local user.
+    owner_uid: Option<u32>,
+    shared: Arc<Shared>,
+}
+
+impl CredentialFs {
+    pub fn new(
+        watched_path: PathBuf,
+        store: Arc<dyn BackingStore>,
+        policy: Arc<PolicyEngine>,
+        logger: Arc<AccessLogger>,
+        rt_handle: tokio::runtime::Handle,
+        owner_uid: Option<u32>,
+    ) -> anyhow::Result<Self> {
+        // Load the authoritative content once. `exists()` distinguishes "not
+        // stored yet" (serve empty) from a genuine read failure on an existing
+        // entry, which must surface rather than masquerade as an empty file.
+        let bytes = if store.exists(&watched_path) {
+            store.read(&watched_path)?
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self {
+            watched_path,
+            store,
+            policy,
+            logger,
+            rt_handle,
+            owner_uid,
+            shared: Arc::new(Shared {
+                content: Mutex::new(Content {
+                    bytes,
+                    dirty: false,
+                }),
+                handles: Mutex::new(HashMap::new()),
+                next_fh: AtomicU64::new(1),
+            }),
+        })
+    }
+
+    /// Whether `uid` may reach the mount at all. `allow_other` makes the root
+    /// mount reachable by any local user, but only the owning user (or root)
+    /// may touch another user's credential — enforced on every entry point, not
+    /// just `open`, so a foreign user can't even `stat` it to learn its size.
+    fn uid_permitted(&self, uid: u32) -> bool {
+        match self.owner_uid {
+            Some(owner) => uid == owner || uid == 0,
+            None => true,
+        }
+    }
+
+    /// Identify the calling process, evaluate policy for a single `access`
+    /// direction, and return the process info iff allowed. Runs on the caller's
+    /// thread (used by the handle-less `setattr` truncate); `open` uses the
+    /// off-thread `decide_open` instead so a pending prompt can't freeze the
+    /// single-threaded FUSE session.
+    fn authorize(&self, req: &Request, access: Access) -> Option<ProcessInfo> {
+        let info = match crate::process::identify::identify(req.pid()) {
+            Ok(info) => info,
+            Err(e) => {
+                tracing::warn!("failed to identify pid {}: {e}", req.pid());
+                return None;
+            }
+        };
+
+        if !self.uid_permitted(req.uid()) {
+            tracing::warn!(
+                "denying uid {} access to {} (owner uid {:?})",
+                req.uid(),
+                self.watched_path.display(),
+                self.owner_uid,
+            );
+            self.logger
+                .log(&info, &self.watched_path, access, &Decision::DenyOnce, None);
+            return None;
+        }
+
+        let needs_read = access != Access::Write;
+        let needs_write = access != Access::Read;
+        let decision = self.rt_handle.block_on(self.policy.evaluate_open(
+            &info,
+            &self.watched_path,
+            needs_read,
+            needs_write,
+        ));
+        self.logger
+            .log(&info, &self.watched_path, access, &decision, None);
+
+        decision.is_allowed().then_some(info)
+    }
+
+    fn apply_write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, Errno> {
+        self.shared.apply_write(fh, offset, data)
+    }
+
+    fn apply_truncate(&self, new_size: u64) -> Result<(), Errno> {
+        self.shared.apply_truncate(new_size)
+    }
+
     /// Persist the shared content to the store if dirty. The content lock is
     /// held across the store write so a concurrent write/truncate can neither
     /// interleave into a half-persisted state nor have its dirty flag cleared
     /// without being written; on failure `dirty` stays set for a later retry.
     fn persist(&self) -> anyhow::Result<()> {
-        let mut content = self.content.lock().unwrap();
+        let mut content = self.shared.content.lock().unwrap();
         if !content.dirty {
             return Ok(());
         }
@@ -248,14 +287,77 @@ impl CredentialFs {
     }
 
     fn current_size(&self) -> u64 {
-        self.content.lock().unwrap().bytes.len() as u64
+        self.shared.current_size()
     }
 }
 
+/// Off-thread `open()` authorization: identify the caller, apply the uid gate,
+/// and evaluate policy for the direction(s) the open needs. Returns the process
+/// info iff the open is allowed. Kept free-standing so it can run inside a task
+/// spawned off the FUSE session thread — a user prompt taking seconds must not
+/// block unrelated operations on the (single-threaded) mount.
+#[allow(clippy::too_many_arguments)]
+async fn decide_open(
+    policy: &PolicyEngine,
+    logger: &AccessLogger,
+    watched: &std::path::Path,
+    owner_uid: Option<u32>,
+    uid: u32,
+    pid: u32,
+    needs_read: bool,
+    needs_write: bool,
+) -> Option<ProcessInfo> {
+    // Identifying a process stats /proc and hashes the binary — offload it so it
+    // doesn't occupy an async worker thread.
+    let info = match tokio::task::spawn_blocking(move || crate::process::identify::identify(pid))
+        .await
+    {
+        Ok(Ok(info)) => info,
+        Ok(Err(e)) => {
+            tracing::warn!("failed to identify pid {pid}: {e}");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!("identify task for pid {pid} panicked: {e}");
+            return None;
+        }
+    };
+
+    let log_access = match (needs_read, needs_write) {
+        (true, true) => Access::Any,
+        (_, true) => Access::Write,
+        _ => Access::Read,
+    };
+
+    if let Some(owner) = owner_uid
+        && uid != owner
+        && uid != 0
+    {
+        tracing::warn!(
+            "denying uid {uid} access to {} (owner uid {owner})",
+            watched.display()
+        );
+        logger.log(&info, watched, log_access, &Decision::DenyOnce, None);
+        return None;
+    }
+
+    let decision = policy
+        .evaluate_open(&info, watched, needs_read, needs_write)
+        .await;
+    logger.log(&info, watched, log_access, &decision, None);
+    decision.is_allowed().then_some(info)
+}
+
 impl Filesystem for CredentialFs {
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         if ino != INodeNo::ROOT {
             reply.error(Errno::ENOENT);
+            return;
+        }
+        // Gate the probe on uid too: the reported `size` is the secret's length,
+        // which a foreign local user must not learn via `stat` under allow_other.
+        if !self.uid_permitted(req.uid()) {
+            reply.error(Errno::EACCES);
             return;
         }
         reply.attr(&default_ttl(), &build_file_attr(self.current_size()));
@@ -267,12 +369,16 @@ impl Filesystem for CredentialFs {
 
     /// `access(2)` is only an advisory permission probe — it grants nothing. The
     /// real boundary is `open()`/`read()`/`write()`, each gated by policy, so we
-    /// answer the probe affirmatively rather than leave it unimplemented (which
-    /// made fuser log a `[Not Implemented]` warning on every check) and never
-    /// leak the policy decision through a side channel.
-    fn access(&self, _req: &Request, ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
+    /// answer the probe affirmatively (for a permitted uid) rather than leave it
+    /// unimplemented (which made fuser log a `[Not Implemented]` warning on every
+    /// check) and never leak the policy decision through a side channel.
+    fn access(&self, req: &Request, ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
         if ino != INodeNo::ROOT {
             reply.error(Errno::ENOENT);
+            return;
+        }
+        if !self.uid_permitted(req.uid()) {
+            reply.error(Errno::EACCES);
             return;
         }
         reply.ok();
@@ -286,31 +392,60 @@ impl Filesystem for CredentialFs {
 
         let flags = flags.0;
         let accmode = flags & libc::O_ACCMODE;
-        let access = Access::from_open_flags(flags);
 
-        if self.authorize(req, access).is_none() {
-            reply.error(Errno::EACCES);
-            return;
-        }
+        // O_RDWR needs both read and write authority; a write-only grant must
+        // not read the secret back out of the shared buffer via read(). Both
+        // directions are resolved in a *single* policy decision (one prompt,
+        // one audit line) rather than a separate read-then-write gate.
+        let needs_read = accmode == libc::O_RDONLY || accmode == libc::O_RDWR;
+        let needs_write = Access::from_open_flags(flags) == Access::Write;
+        let truncate_on_open = needs_write && (flags & libc::O_TRUNC) != 0;
 
-        // O_RDWR can both read and write. `from_open_flags` classifies it as a
-        // write; it must *additionally* pass read authorization, otherwise a
-        // write-only grant could open O_RDWR and read the secret out of the
-        // shared buffer via read().
-        let can_read = accmode == libc::O_RDONLY || accmode == libc::O_RDWR;
-        if accmode == libc::O_RDWR && self.authorize(req, Access::Read).is_none() {
-            reply.error(Errno::EACCES);
-            return;
-        }
+        // Authorize off the FUSE session thread: a prompt can take seconds, and
+        // the single-threaded session would otherwise stall every other op on
+        // this mount (a concurrent `stat`, a read on another handle) until the
+        // user answers. The reply is delivered from the spawned task.
+        let policy = self.policy.clone();
+        let logger = self.logger.clone();
+        let shared = self.shared.clone();
+        let watched = self.watched_path.clone();
+        let owner_uid = self.owner_uid;
+        let uid = req.uid();
+        let pid = req.pid();
 
-        // O_TRUNC empties the shared file immediately, even if the handle is
-        // closed without a subsequent write.
-        if access == Access::Write && (flags & libc::O_TRUNC) != 0 {
-            self.truncate_on_open();
-        }
-
-        let fh = self.register_handle(OpenHandle { access, can_read });
-        reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
+        self.rt_handle.spawn(async move {
+            match decide_open(
+                &policy,
+                &logger,
+                &watched,
+                owner_uid,
+                uid,
+                pid,
+                needs_read,
+                needs_write,
+            )
+            .await
+            {
+                Some(_info) => {
+                    // O_TRUNC empties the shared file immediately, even if the
+                    // handle is closed without a subsequent write.
+                    if truncate_on_open {
+                        shared.truncate_on_open();
+                    }
+                    let access = if needs_write {
+                        Access::Write
+                    } else {
+                        Access::Read
+                    };
+                    let fh = shared.register_handle(OpenHandle {
+                        access,
+                        can_read: needs_read,
+                    });
+                    reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO);
+                }
+                None => reply.error(Errno::EACCES),
+            }
+        });
     }
 
     fn read(
@@ -330,7 +465,7 @@ impl Filesystem for CredentialFs {
         }
 
         // An unknown fh was never authorized; a write-only handle may not read.
-        match self.handles.lock().unwrap().get(&fh.0) {
+        match self.shared.handles.lock().unwrap().get(&fh.0) {
             Some(h) if h.can_read => {}
             Some(_) | None => {
                 reply.error(Errno::EACCES);
@@ -338,7 +473,7 @@ impl Filesystem for CredentialFs {
             }
         }
 
-        let content = self.content.lock().unwrap();
+        let content = self.shared.content.lock().unwrap();
         reply.data(slice_content(&content.bytes, offset, size));
     }
 
@@ -393,7 +528,8 @@ impl Filesystem for CredentialFs {
         // passes; a handle-less truncate is gated against the calling process.
         if let Some(new_size) = size {
             let authorized = match fh.and_then(|h| {
-                self.handles
+                self.shared
+                    .handles
                     .lock()
                     .unwrap()
                     .get(&h.0)
@@ -481,7 +617,7 @@ impl Filesystem for CredentialFs {
         }
 
         let persisted = self.persist();
-        self.handles.lock().unwrap().remove(&fh.0);
+        self.shared.handles.lock().unwrap().remove(&fh.0);
 
         match persisted {
             Ok(()) => reply.ok(),
@@ -599,7 +735,7 @@ mod tests {
     }
 
     fn write_handle(fs: &CredentialFs) -> u64 {
-        fs.register_handle(OpenHandle {
+        fs.shared.register_handle(OpenHandle {
             access: Access::Write,
             can_read: false,
         })
@@ -642,7 +778,7 @@ mod tests {
     #[test]
     fn otrunc_open_then_close_persists_empty() {
         let (fs, watched, store, _rt) = fixture(b"SECRET");
-        fs.truncate_on_open();
+        fs.shared.truncate_on_open();
         fs.persist().unwrap();
         assert_eq!(store.read(&watched).unwrap(), b"");
     }
@@ -672,7 +808,7 @@ mod tests {
     fn write_rejects_unknown_and_read_handle() {
         let (fs, _watched, _store, _rt) = fixture(b"");
         assert_eq!(code(fs.apply_write(999, 0, b"x")), Err(libc::EACCES));
-        let read_fh = fs.register_handle(OpenHandle {
+        let read_fh = fs.shared.register_handle(OpenHandle {
             access: Access::Read,
             can_read: true,
         });

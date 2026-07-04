@@ -47,9 +47,22 @@ impl MovedStore {
         Ok(Self { store_dir })
     }
 
-    /// Map a watched file path to its store location.
-    /// e.g., ~/.aws/credentials → store_dir/aws--credentials
+    /// Map a watched file path to its store location, e.g.
+    /// `/home/a/.aws/credentials` → `store_dir/home%2Fa%2F.aws%2Fcredentials`.
+    ///
+    /// The key is a percent-encoding of the absolute path (only `/` and `%` are
+    /// escaped), which is *injective*: distinct paths never collide. The prior
+    /// `/`→`--` scheme could both collide (`/a-/b` and `/a/-b` mapped to the same
+    /// file, silently clobbering one credential with another) and round-trip
+    /// wrong for any path already containing `--`.
     fn store_path(&self, file_id: &Path) -> PathBuf {
+        self.store_dir.join(encode_key(file_id))
+    }
+
+    /// The pre-percent-encoding store location, kept so existing stores keep
+    /// working across the upgrade: reads/deletes fall back to it and a read
+    /// migrates the entry to the new key. See `store_path`.
+    fn legacy_store_path(&self, file_id: &Path) -> PathBuf {
         let encoded = file_id
             .to_string_lossy()
             .trim_start_matches('/')
@@ -58,16 +71,81 @@ impl MovedStore {
     }
 }
 
+/// Percent-encode an absolute path into a single, collision-free filename.
+/// Bytes outside `[A-Za-z0-9._-]` (notably `/` and `%`) become `%XX`.
+fn encode_key(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Inverse of `encode_key`, for `list()`. Legacy `--`-encoded names (no `%`)
+/// are decoded with the old scheme so a mixed store still lists sensibly.
+fn decode_key(name: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    if !name.contains('%') {
+        return PathBuf::from(format!("/{}", name.replace("--", "/")));
+    }
+    let bytes = name.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(v) = u8::from_str_radix(&name[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    PathBuf::from(std::ffi::OsStr::from_bytes(&out))
+}
+
 impl BackingStore for MovedStore {
     fn read(&self, file_id: &Path) -> anyhow::Result<Vec<u8>> {
         let path = self.store_path(file_id);
-        std::fs::read(&path)
-            .map_err(|e| anyhow::anyhow!("failed to read backing store {}: {e}", path.display()))
+        match std::fs::read(&path) {
+            Ok(contents) => Ok(contents),
+            // Fall back to a pre-upgrade entry and migrate it forward so the new
+            // key holds it from now on. A failed migration is non-fatal - the
+            // legacy copy still exists and is returned.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let legacy = self.legacy_store_path(file_id);
+                let contents = std::fs::read(&legacy).map_err(|_| {
+                    anyhow::anyhow!("failed to read backing store {}: {e}", path.display())
+                })?;
+                if std::fs::rename(&legacy, &path).is_ok() {
+                    tracing::info!("migrated backing-store entry to {}", path.display());
+                }
+                Ok(contents)
+            }
+            Err(e) => Err(anyhow::anyhow!(
+                "failed to read backing store {}: {e}",
+                path.display()
+            )),
+        }
     }
 
     fn store(&self, file_id: &Path, contents: &[u8]) -> anyhow::Result<()> {
         use std::io::Write;
         let path = self.store_path(file_id);
+        // Drop any stale legacy-keyed copy so the two encodings can't diverge.
+        let legacy = self.legacy_store_path(file_id);
+        if legacy != path {
+            let _ = std::fs::remove_file(&legacy);
+        }
 
         // Write the new contents to a sibling temp file, fsync it, then rename
         // it over the target. A crash at any point leaves either the old file or
@@ -109,15 +187,17 @@ impl BackingStore for MovedStore {
     }
 
     fn delete(&self, file_id: &Path) -> anyhow::Result<()> {
-        let path = self.store_path(file_id);
-        if path.exists() {
-            std::fs::remove_file(&path)?;
+        // Remove both the current and any legacy-keyed copy.
+        for path in [self.store_path(file_id), self.legacy_store_path(file_id)] {
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
         }
         Ok(())
     }
 
     fn exists(&self, file_id: &Path) -> bool {
-        self.store_path(file_id).exists()
+        self.store_path(file_id).exists() || self.legacy_store_path(file_id).exists()
     }
 
     fn list(&self) -> anyhow::Result<Vec<PathBuf>> {
@@ -130,8 +210,7 @@ impl BackingStore for MovedStore {
             if raw.starts_with(".tmp.") {
                 continue;
             }
-            let name = raw.replace("--", "/");
-            result.push(PathBuf::from(format!("/{name}")));
+            result.push(decode_key(&raw));
         }
         Ok(result)
     }
@@ -148,8 +227,39 @@ mod tests {
         };
         assert_eq!(
             store.store_path(Path::new("/home/alice/.aws/credentials")),
-            PathBuf::from("/var/lib/file-guard/store/home--alice--.aws--credentials"),
+            PathBuf::from("/var/lib/file-guard/store/%2Fhome%2Falice%2F.aws%2Fcredentials"),
         );
+    }
+
+    #[test]
+    fn encoding_is_injective_and_round_trips() {
+        // The two paths that collided under the old `/`→`--` scheme.
+        assert_ne!(encode_key(Path::new("/a-/b")), encode_key(Path::new("/a/-b")));
+        for p in ["/home/u/.aws/credentials", "/a-/b", "/a/-b", "/weird--dir/x"] {
+            assert_eq!(decode_key(&encode_key(Path::new(p))), PathBuf::from(p));
+        }
+    }
+
+    #[test]
+    fn read_migrates_a_legacy_keyed_entry() {
+        let dir = std::env::temp_dir().join(format!("fg-store-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = MovedStore {
+            store_dir: dir.clone(),
+        };
+        let id = Path::new("/home/u/.aws/credentials");
+
+        // Seed an entry under the old `--` encoding only.
+        let legacy = store.legacy_store_path(id);
+        std::fs::write(&legacy, b"legacy-secret").unwrap();
+
+        assert!(store.exists(id), "legacy entry must be visible");
+        assert_eq!(store.read(id).unwrap(), b"legacy-secret");
+        // Read migrated it to the new key and removed the legacy file.
+        assert!(store.store_path(id).exists(), "entry migrated to new key");
+        assert!(!legacy.exists(), "legacy file removed after migration");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

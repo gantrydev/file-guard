@@ -38,7 +38,6 @@ pub fn identify(pid: u32) -> anyhow::Result<ProcessInfo> {
         .unwrap_or_else(|| format!("pid:{pid}"));
     let start_time = platform::start_time(pid)?;
     let script = interpreter_script(pid, &binary_name);
-    let parent_chain = parent_chain(pid);
     let code_signature = platform::code_signature(pid);
 
     Ok(ProcessInfo {
@@ -47,7 +46,11 @@ pub fn identify(pid: u32) -> anyhow::Result<ProcessInfo> {
         binary_path,
         binary_name,
         script,
-        parent_chain,
+        // Left empty on the access hot path: walking the parent chain scans the
+        // whole process table (`sysinfo::System::new_all`) and is only needed to
+        // *display* a prompt, so it's filled lazily by the prompt client (see
+        // `PromptClient`) rather than on every open a rule already decides.
+        parent_chain: Vec::new(),
         code_signature,
     })
 }

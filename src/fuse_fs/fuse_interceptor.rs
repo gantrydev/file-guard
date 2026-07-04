@@ -123,23 +123,22 @@ impl FuseInterceptor {
         clear_stale_mount(watched_path);
 
         // M3: never operate on a symlink - following it could expose or clobber
-        // an unintended target. Require the operator to resolve it first.
-        if let Ok(meta) = std::fs::symlink_metadata(watched_path)
-            && meta.file_type().is_symlink()
-        {
-            anyhow::bail!(
-                "{} is a symlink; refusing to guard it (point the watch at the real file)",
-                watched_path.display()
-            );
-        }
-
+        // an unintended target. `O_NOFOLLOW` refuses the final-component symlink
+        // *atomically* with the read: a separate lstat-then-read left a TOCTOU
+        // window in which a same-uid user could swap the file for a symlink and
+        // make this (root) daemon capture an arbitrary target's contents.
+        //
         // A read error must NOT be coerced to "absent": treating e.g. EACCES/EIO
         // as no-file would let the next step clobber a real credential with an
         // empty placeholder and lose it forever. Only a genuine NotFound counts
         // as absent; anything else aborts the guard loudly.
-        let on_disk = match std::fs::read(watched_path) {
+        let on_disk = match read_no_follow(watched_path) {
             Ok(content) => Some(content),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => anyhow::bail!(
+                "{} is a symlink; refusing to guard it (point the watch at the real file)",
+                watched_path.display()
+            ),
             Err(e) => anyhow::bail!(
                 "refusing to guard {}: cannot read existing file: {e}",
                 watched_path.display()
@@ -221,8 +220,28 @@ impl FuseInterceptor {
     }
 }
 
+/// Read `path` without following a final-component symlink (`O_NOFOLLOW`), so a
+/// symlink swapped in at the watched path can't redirect the read to another
+/// (possibly root-only) target. A symlink surfaces as `ELOOP`.
+fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts.open(path)?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
 /// Write `contents` to `path`, creating it at mode 0600 (owner-only) so a
-/// restored/placed credential is never left world-readable.
+/// restored/placed credential is never left world-readable. `O_NOFOLLOW`
+/// refuses to write *through* a symlink swapped in at the path (it would
+/// otherwise clobber the link target), matching the capture-side guard.
 fn write_file_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
@@ -231,6 +250,7 @@ fn write_file_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
+        opts.custom_flags(libc::O_NOFOLLOW);
     }
     let mut f = opts.open(path)?;
     f.write_all(contents)?;
