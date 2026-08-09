@@ -206,12 +206,19 @@ mod tests {
     #[test]
     fn encoding_is_injective_and_round_trips() {
         // The two paths that collided under the old `/`→`--` scheme.
-        assert_ne!(encode_key(Path::new("/a-/b")), encode_key(Path::new("/a/-b")));
-        for p in ["/home/u/.aws/credentials", "/a-/b", "/a/-b", "/weird--dir/x"] {
+        assert_ne!(
+            encode_key(Path::new("/a-/b")),
+            encode_key(Path::new("/a/-b"))
+        );
+        for p in [
+            "/home/u/.aws/credentials",
+            "/a-/b",
+            "/a/-b",
+            "/weird--dir/x",
+        ] {
             assert_eq!(decode_key(&encode_key(Path::new(p))), PathBuf::from(p));
         }
     }
-
 
     #[test]
     fn store_round_trips_at_0600_and_leaves_no_temp() {
@@ -229,7 +236,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(store.store_path(id)).unwrap().permissions().mode();
+            let mode = std::fs::metadata(store.store_path(id))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600, "stored credential must be 0600");
         }
 

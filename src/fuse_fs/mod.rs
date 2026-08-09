@@ -128,7 +128,8 @@ mod integration_tests {
         };
         let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
-        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
+        let fs =
+            CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
 
         let Some((mountpoint, session)) = mount(fs, &tmp) else {
             std::fs::remove_dir_all(&tmp).ok();
@@ -183,7 +184,8 @@ mod integration_tests {
         };
         let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
-        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
+        let fs =
+            CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
 
         let Some((mountpoint, session)) = mount(fs, &tmp) else {
             std::fs::remove_dir_all(&tmp).ok();
@@ -236,7 +238,8 @@ mod integration_tests {
         };
         let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
-        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
+        let fs =
+            CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
 
         let Some((mountpoint, session)) = mount(fs, &tmp) else {
             std::fs::remove_dir_all(&tmp).ok();
@@ -293,7 +296,8 @@ mod integration_tests {
         let config = rule_config(&watched, Access::Write);
         let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
-        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
+        let fs =
+            CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
 
         let Some((mountpoint, session)) = mount(fs, &tmp) else {
             std::fs::remove_dir_all(&tmp).ok();
@@ -339,12 +343,15 @@ mod integration_tests {
         let tmp = temp_dir("huge");
         let watched = tmp.join("credential");
         let store = Arc::new(MemStore(Mutex::new(
-            [(watched.clone(), b"intact".to_vec())].into_iter().collect(),
+            [(watched.clone(), b"intact".to_vec())]
+                .into_iter()
+                .collect(),
         )));
         let config = rule_config(&watched, Access::Any);
         let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
-        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
+        let fs =
+            CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
 
         let Some((mountpoint, session)) = mount(fs, &tmp) else {
             std::fs::remove_dir_all(&tmp).ok();
@@ -356,7 +363,9 @@ mod integration_tests {
                 .write(true)
                 .open(&mountpoint)
                 .unwrap();
-            f.write_at(b"x", 1 << 50).err().and_then(|e| e.raw_os_error())
+            f.write_at(b"x", 1 << 50)
+                .err()
+                .and_then(|e| e.raw_os_error())
         };
         // Daemon must still be alive and serving the original content.
         let after = std::fs::read(&mountpoint);
@@ -364,7 +373,15 @@ mod integration_tests {
         drop(session);
         std::fs::remove_dir_all(&tmp).ok();
 
-        assert_eq!(write_err, Some(libc::EFBIG), "huge-offset write must be EFBIG");
-        assert_eq!(after.unwrap(), b"intact", "daemon survived and content intact");
+        assert_eq!(
+            write_err,
+            Some(libc::EFBIG),
+            "huge-offset write must be EFBIG"
+        );
+        assert_eq!(
+            after.unwrap(),
+            b"intact",
+            "daemon survived and content intact"
+        );
     }
 }

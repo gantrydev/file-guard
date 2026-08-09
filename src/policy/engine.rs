@@ -93,7 +93,10 @@ impl PolicyEngine {
                 Some(Action::Deny) => return Decision::DenyAlways,
                 Some(Action::Allow) => continue,
                 None => {
-                    if !self.session.is_session_allowed(&proc_id, watched_file, access) {
+                    if !self
+                        .session
+                        .is_session_allowed(&proc_id, watched_file, access)
+                    {
                         all_pre_authorized = false;
                     }
                 }

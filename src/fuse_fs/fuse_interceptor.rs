@@ -182,7 +182,10 @@ impl FuseInterceptor {
         }
 
         write_file_private(watched_path, b"").map_err(|e| {
-            anyhow::anyhow!("failed to create mountpoint {}: {e}", watched_path.display())
+            anyhow::anyhow!(
+                "failed to create mountpoint {}: {e}",
+                watched_path.display()
+            )
         })
     }
 
@@ -382,8 +385,8 @@ mod tests {
         FuseInterceptor, file_guard_mountpoints, owner_uid_of, unescape_mount_field,
         write_file_private,
     };
-    use FuseInterceptor as Fi;
     use crate::store::BackingStore;
+    use FuseInterceptor as Fi;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
@@ -444,7 +447,8 @@ mod tests {
 
     #[test]
     fn parser_tolerates_short_and_malformed_lines() {
-        let mounts = file_guard_mountpoints("file-guard\nfile-guard /only-two\n\nfile-guard /p fuse rw\n");
+        let mounts =
+            file_guard_mountpoints("file-guard\nfile-guard /only-two\n\nfile-guard /p fuse rw\n");
         assert_eq!(mounts, vec!["/p".to_string()]);
     }
 

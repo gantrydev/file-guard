@@ -74,11 +74,10 @@ impl PromptClient {
         // The scan is synchronous/blocking, so offload it like `decide_open`
         // does for `identify` rather than stalling an async worker.
         let pid = process.pid;
-        let parents = tokio::task::spawn_blocking(move || {
-            crate::process::identify::parent_chain(pid)
-        })
-        .await
-        .unwrap_or_default();
+        let parents =
+            tokio::task::spawn_blocking(move || crate::process::identify::parent_chain(pid))
+                .await
+                .unwrap_or_default();
 
         let mut process_desc = ProcessDesc::from(process);
         process_desc.parents = parents

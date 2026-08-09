@@ -309,19 +309,18 @@ async fn decide_open(
 ) -> Option<ProcessInfo> {
     // Identifying a process stats /proc and hashes the binary — offload it so it
     // doesn't occupy an async worker thread.
-    let info = match tokio::task::spawn_blocking(move || crate::process::identify::identify(pid))
-        .await
-    {
-        Ok(Ok(info)) => info,
-        Ok(Err(e)) => {
-            tracing::warn!("failed to identify pid {pid}: {e}");
-            return None;
-        }
-        Err(e) => {
-            tracing::warn!("identify task for pid {pid} panicked: {e}");
-            return None;
-        }
-    };
+    let info =
+        match tokio::task::spawn_blocking(move || crate::process::identify::identify(pid)).await {
+            Ok(Ok(info)) => info,
+            Ok(Err(e)) => {
+                tracing::warn!("failed to identify pid {pid}: {e}");
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!("identify task for pid {pid} panicked: {e}");
+                return None;
+            }
+        };
 
     let log_access = match (needs_read, needs_write) {
         (true, true) => Access::Any,
@@ -673,7 +672,10 @@ mod tests {
             code(checked_write_end(MAX_CONTENT_LEN - 3, 3)),
             Ok(MAX_CONTENT_LEN as usize)
         );
-        assert_eq!(code(checked_write_end(MAX_CONTENT_LEN, 1)), Err(libc::EFBIG));
+        assert_eq!(
+            code(checked_write_end(MAX_CONTENT_LEN, 1)),
+            Err(libc::EFBIG)
+        );
         assert_eq!(code(checked_write_end(u64::MAX, 1)), Err(libc::EFBIG));
         assert_eq!(code(checked_write_end(1 << 50, 0)), Err(libc::EFBIG)); // huge sparse offset
     }
@@ -710,7 +712,14 @@ mod tests {
 
     /// A `CredentialFs` over an in-memory store seeded with `initial`. The
     /// policy/logger are never exercised by the content-level methods under test.
-    fn fixture(initial: &[u8]) -> (CredentialFs, PathBuf, Arc<MemStore>, tokio::runtime::Runtime) {
+    fn fixture(
+        initial: &[u8],
+    ) -> (
+        CredentialFs,
+        PathBuf,
+        Arc<MemStore>,
+        tokio::runtime::Runtime,
+    ) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let watched = PathBuf::from("/credential");
         let store = Arc::new(MemStore(StdMutex::new(
@@ -868,6 +877,9 @@ mod tests {
             rt.handle().clone(),
             None,
         );
-        assert!(err.is_err(), "a failing read of an existing entry must not be served as empty");
+        assert!(
+            err.is_err(),
+            "a failing read of an existing entry must not be served as empty"
+        );
     }
 }
