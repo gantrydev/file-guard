@@ -14,6 +14,7 @@ mod integration_tests {
     use crate::policy::engine::PolicyEngine;
     use crate::policy::rule::Access;
     use crate::prompt::PromptClient;
+    use crate::rule_store::MemoryRuleStore;
     use crate::testing::{MemoryStore, mount_intent_record};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -57,6 +58,17 @@ mod integration_tests {
         ))
     }
 
+    fn policy(config: &Config) -> Arc<PolicyEngine> {
+        Arc::new(
+            PolicyEngine::new(
+                config,
+                unreachable_client(),
+                Arc::new(MemoryRuleStore::new()),
+            )
+            .unwrap(),
+        )
+    }
+
     /// An "allow always" rule for this test binary lets the same binary read the
     /// real stored contents straight back through the mount.
     #[test]
@@ -85,7 +97,7 @@ mod integration_tests {
                 script_sha256: None,
             }],
         };
-        let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
+        let policy = policy(&config);
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
         let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
 
@@ -133,7 +145,7 @@ mod integration_tests {
                 script_sha256: None,
             }],
         };
-        let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
+        let policy = policy(&config);
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
         let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
 
@@ -185,7 +197,7 @@ mod integration_tests {
             watch: vec![],
             rule: vec![],
         };
-        let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
+        let policy = policy(&config);
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
         let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
 
@@ -232,7 +244,7 @@ mod integration_tests {
         let watched = tmp.join("credential");
         let store = memory_store(&watched, b"TOP-SECRET");
         let config = rule_config(&watched, Access::Write);
-        let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
+        let policy = policy(&config);
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
         let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
 
@@ -275,7 +287,7 @@ mod integration_tests {
         let watched = tmp.join("credential");
         let store = memory_store(&watched, b"intact");
         let config = rule_config(&watched, Access::Any);
-        let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
+        let policy = policy(&config);
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
         let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
 

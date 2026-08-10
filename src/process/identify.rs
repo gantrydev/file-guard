@@ -6,11 +6,12 @@ use super::linux as platform;
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
     pub pid: u32,
-    /// Process start time - together with `pid` it forms a recycle-proof
-    /// identity for session grants (see `policy::session::ProcessId`).
+    /// Process start time, used with the captured executable identity to keep
+    /// session grants scoped across PID reuse and `exec`.
     pub start_time: u64,
     pub binary_path: PathBuf,
     pub binary_name: String,
+    pub binary_sha256: String,
     /// For an interpreter (python/node/bash/…), the main script it is running,
     /// resolved from argv. Lets a rule distinguish "python running gcloud" from
     /// "python running something else" - `None` for compiled tools. Best-effort
@@ -27,18 +28,21 @@ pub struct ParentProcess {
 }
 
 pub fn identify(pid: u32) -> anyhow::Result<ProcessInfo> {
-    let binary_path = platform::binary_path(pid)?;
+    let start_time = platform::start_time(pid)?;
+    let executable = super::integrity::capture_process_executable(pid, start_time)?;
+    let binary_path = executable.path;
     let binary_name = binary_path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| format!("pid:{pid}"));
-    let start_time = platform::start_time(pid)?;
+    let binary_sha256 = executable.sha256;
     let script = interpreter_script(pid, &binary_name);
     Ok(ProcessInfo {
         pid,
         start_time,
         binary_path,
         binary_name,
+        binary_sha256,
         script,
         // Left empty on the access hot path: walking the parent chain reads
         // /proc per hop and is only needed to *display* a prompt, so it's

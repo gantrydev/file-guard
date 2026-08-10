@@ -5,13 +5,16 @@ use std::sync::RwLock;
 use crate::policy::rule::Access;
 use crate::process::identify::ProcessInfo;
 
-/// Unique process identity - `pid` plus `start_time`, so a recycled PID cannot
-/// inherit a prior process's session grant. The kernel guarantees the pair is
-/// unique for the lifetime of a process.
+/// Identity of one executable image in one process instance. Linux preserves
+/// process start time across `exec`, so PID and start time alone are not enough
+/// to prevent a replacement image from inheriting a session grant.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ProcessId {
-    pub pid: u32,
-    pub start_time: u64,
+    pid: u32,
+    start_time: u64,
+    binary_path: PathBuf,
+    binary_sha256: String,
+    script: Option<PathBuf>,
 }
 
 impl From<&ProcessInfo> for ProcessId {
@@ -19,7 +22,58 @@ impl From<&ProcessInfo> for ProcessId {
         Self {
             pid: info.pid,
             start_time: info.start_time,
+            binary_path: info.binary_path.clone(),
+            binary_sha256: info.binary_sha256.clone(),
+            script: info.script.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn process(binary: &str, hash: &str, script: Option<&str>) -> ProcessInfo {
+        ProcessInfo {
+            pid: 42,
+            start_time: 7,
+            binary_path: PathBuf::from(binary),
+            binary_name: "tool".into(),
+            binary_sha256: hash.into(),
+            script: script.map(PathBuf::from),
+            parent_chain: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exec_identity_cannot_inherit_a_session_grant() {
+        let state = SessionState::new();
+        let file = PathBuf::from("/credential");
+        let original = ProcessId::from(&process("/usr/bin/tool", "one", None));
+        state.grant_session(original.clone(), file.clone(), Access::Any);
+
+        assert!(state.is_session_allowed(&original, &file, Access::Read));
+        let replacement = ProcessId::from(&process("/usr/bin/other", "two", None));
+        assert!(!state.is_session_allowed(&replacement, &file, Access::Read));
+    }
+
+    #[test]
+    fn interpreter_session_grants_are_script_scoped() {
+        let state = SessionState::new();
+        let file = PathBuf::from("/credential");
+        let original = ProcessId::from(&process(
+            "/usr/bin/python",
+            "interpreter",
+            Some("/program/one.py"),
+        ));
+        state.grant_session(original, file.clone(), Access::Any);
+
+        let other_script = ProcessId::from(&process(
+            "/usr/bin/python",
+            "interpreter",
+            Some("/program/two.py"),
+        ));
+        assert!(!state.is_session_allowed(&other_script, &file, Access::Write));
     }
 }
 

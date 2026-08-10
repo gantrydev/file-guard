@@ -1,11 +1,16 @@
 use crate::config::Config;
 use crate::policy::rule::{Access, Decision};
 use crate::process::identify::ProcessInfo;
+use std::collections::VecDeque;
+use std::io::BufRead;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+
+const MAX_AUDIT_LINE_BYTES: usize = 64 * 1024;
 
 /// A single access-log entry. Serialized as one JSON object per line (NDJSON)
 /// to the audit-log file, forming a queryable audit trail.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AccessLogEntry {
     pub timestamp: String,
     pub decision: String,
@@ -58,10 +63,8 @@ impl AccessLogger {
         let sink = match destination.trim() {
             "" | "stdout" | "journal" => Sink::Stdout,
             path => {
-                let path = Config::expand_path(path);
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
+                let path = Config::expand_path(path)?;
+                prepare_audit_file(&path)?;
                 Sink::File(path)
             }
         };
@@ -114,10 +117,10 @@ fn append_entry(path: &Path, entry: &AccessLogEntry) -> anyhow::Result<()> {
     use std::io::Write;
 
     let line = serde_json::to_string(entry)?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    if line.len() > MAX_AUDIT_LINE_BYTES {
+        anyhow::bail!("audit entry exceeds {MAX_AUDIT_LINE_BYTES} bytes");
+    }
+    let file = open_audit_append(path)?;
     rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)?;
     let mut writer = std::io::BufWriter::new(&file);
     writeln!(writer, "{line}")?;
@@ -127,18 +130,363 @@ fn append_entry(path: &Path, entry: &AccessLogEntry) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn prepare_audit_file(path: &Path) -> anyhow::Result<()> {
+    if !path.is_absolute() {
+        anyhow::bail!("audit log path must be absolute: {}", path.display());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("audit log {} has no parent", path.display()))?;
+    crate::secure_file::ensure_trusted_directory(parent, 0o755)?;
+    open_audit_append(path)?.sync_all()?;
+    Ok(())
+}
+
+fn open_audit_append(path: &Path) -> anyhow::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o644)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != effective_uid {
+        anyhow::bail!(
+            "audit log {} must be a singly-linked regular file owned by uid {effective_uid}",
+            path.display()
+        );
+    }
+    if metadata.mode() & 0o022 != 0 {
+        anyhow::bail!(
+            "audit log {} must not be writable by group or others",
+            path.display()
+        );
+    }
+    Ok(file)
+}
+
+fn open_audit_read(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("audit log {} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
 /// Read the last `n` audit entries from `path`, oldest first. Missing file →
 /// empty. Malformed lines are skipped.
 pub fn read_recent(path: &Path, n: usize) -> Vec<AccessLogEntry> {
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return Vec::new();
+    read_recent_batch(path, n)
+        .map(|batch| batch.entries)
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AuditCursor {
+    file: Option<std::fs::File>,
+    offset: u64,
+}
+
+pub(crate) struct AuditBatch {
+    pub entries: Vec<AccessLogEntry>,
+    pub cursor: AuditCursor,
+}
+
+pub(crate) struct AuditUpdate {
+    pub entries: Vec<AccessLogEntry>,
+    pub advanced: bool,
+}
+
+pub(crate) fn read_recent_batch(path: &Path, n: usize) -> anyhow::Result<AuditBatch> {
+    let file = match open_audit_read(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AuditBatch {
+                entries: Vec::new(),
+                cursor: AuditCursor::default(),
+            });
+        }
+        Err(error) => return Err(error.into()),
     };
-    let mut entries: Vec<AccessLogEntry> = contents
-        .lines()
-        .rev()
-        .take(n)
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    entries.reverse();
-    entries
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared)?;
+    let result = scan_recent(std::io::BufReader::new(&file), n);
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock)?;
+    let (entries, offset) = result?;
+    Ok(AuditBatch {
+        entries,
+        cursor: AuditCursor {
+            file: Some(file),
+            offset,
+        },
+    })
+}
+
+pub(crate) fn read_new(
+    path: &Path,
+    cursor: &mut AuditCursor,
+    max_bytes: usize,
+) -> anyhow::Result<AuditUpdate> {
+    use std::io::{Read, Seek};
+
+    if max_bytes == 0 {
+        anyhow::bail!("audit read limit must be greater than zero");
+    }
+    let candidate = match open_audit_read(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AuditUpdate {
+                entries: Vec::new(),
+                advanced: false,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let candidate_metadata = candidate.metadata()?;
+    let replaced = cursor
+        .file
+        .as_ref()
+        .is_none_or(|current| match current.metadata() {
+            Ok(metadata) => {
+                metadata.dev() != candidate_metadata.dev()
+                    || metadata.ino() != candidate_metadata.ino()
+            }
+            Err(_) => true,
+        });
+    if replaced {
+        cursor.file = Some(candidate);
+        cursor.offset = 0;
+    }
+
+    let file = cursor
+        .file
+        .as_mut()
+        .expect("audit cursor file was installed");
+    rustix::fs::flock(&*file, rustix::fs::FlockOperation::LockShared)?;
+    let result = (|| -> anyhow::Result<AuditUpdate> {
+        let metadata = file.metadata()?;
+        let truncated = metadata.len() < cursor.offset;
+        if truncated {
+            cursor.offset = 0;
+        }
+        let start = cursor.offset;
+        if start == metadata.len() {
+            return Ok(AuditUpdate {
+                entries: Vec::new(),
+                advanced: replaced || truncated,
+            });
+        }
+
+        file.seek(std::io::SeekFrom::Start(start))?;
+        let read_len = metadata.len().saturating_sub(start).min(max_bytes as u64);
+        let mut bytes = Vec::with_capacity(read_len as usize);
+        (&mut *file).take(read_len).read_to_end(&mut bytes)?;
+
+        let Some(complete_len) = bytes.iter().rposition(|byte| *byte == b'\n').map(|i| i + 1)
+        else {
+            if bytes.len() == max_bytes {
+                anyhow::bail!("audit log contains a record larger than {max_bytes} bytes");
+            }
+            return Ok(AuditUpdate {
+                entries: Vec::new(),
+                advanced: replaced || truncated,
+            });
+        };
+        let entries = bytes[..complete_len]
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty() && line.len() <= MAX_AUDIT_LINE_BYTES)
+            .filter_map(|line| serde_json::from_slice(line).ok())
+            .collect();
+        cursor.offset = start + complete_len as u64;
+        Ok(AuditUpdate {
+            entries,
+            advanced: true,
+        })
+    })();
+    let unlock = rustix::fs::flock(&*file, rustix::fs::FlockOperation::Unlock);
+    match (result, unlock) {
+        (Ok(update), Ok(())) => Ok(update),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+    }
+}
+
+fn scan_recent(
+    mut reader: impl BufRead,
+    limit: usize,
+) -> anyhow::Result<(Vec<AccessLogEntry>, u64)> {
+    let mut recent = VecDeque::with_capacity(limit);
+    let mut line = Vec::new();
+    let mut discarding = false;
+    let mut consumed = 0_u64;
+    let mut complete_offset = 0_u64;
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        let available_len = available.len();
+        let mut position = 0;
+        while position < available_len {
+            let remainder = &available[position..];
+            let newline = remainder.iter().position(|byte| *byte == b'\n');
+            let segment_len = newline.unwrap_or(remainder.len());
+            let segment = &remainder[..segment_len];
+            if !discarding {
+                if line.len() + segment.len() <= MAX_AUDIT_LINE_BYTES {
+                    line.extend_from_slice(segment);
+                } else {
+                    line.clear();
+                    discarding = true;
+                }
+            }
+            position += segment_len;
+            if newline.is_some() {
+                position += 1;
+                complete_offset = consumed + position as u64;
+                if !discarding
+                    && let Ok(entry) = serde_json::from_slice(&line)
+                    && limit > 0
+                {
+                    if recent.len() == limit {
+                        recent.pop_front();
+                    }
+                    recent.push_back(entry);
+                }
+                line.clear();
+                discarding = false;
+            }
+        }
+        reader.consume(available_len);
+        consumed += available_len as u64;
+    }
+
+    Ok((recent.into_iter().collect(), complete_offset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn path() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        std::env::temp_dir().join(format!(
+            "file-guard-audit-{}-{}.log",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn entry(pid: u32) -> AccessLogEntry {
+        AccessLogEntry {
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            decision: "ALLOW".into(),
+            access: "READ".into(),
+            file: "/credential".into(),
+            binary: "/usr/bin/tool".into(),
+            pid,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn cursor_advances_only_past_complete_records() {
+        let path = path();
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&entry(1)).unwrap()).unwrap();
+        let partial = serde_json::to_string(&entry(2)).unwrap();
+        write!(file, "{}", &partial[..partial.len() / 2]).unwrap();
+        file.flush().unwrap();
+
+        let initial = read_recent_batch(&path, 10).unwrap();
+        assert_eq!(initial.entries, vec![entry(1)]);
+        let mut cursor = initial.cursor;
+        let waiting = read_new(&path, &mut cursor, 1024).unwrap();
+        assert!(waiting.entries.is_empty());
+        assert!(!waiting.advanced);
+
+        writeln!(file, "{}", &partial[partial.len() / 2..]).unwrap();
+        file.flush().unwrap();
+        let completed = read_new(&path, &mut cursor, 1024).unwrap();
+        assert_eq!(completed.entries, vec![entry(2)]);
+        assert!(completed.advanced);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cursor_detects_file_replacement_even_when_the_new_file_is_larger() {
+        let path = path();
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&entry(1)).unwrap()),
+        )
+        .unwrap();
+        let initial = read_recent_batch(&path, 10).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&entry(2)).unwrap(),
+                serde_json::to_string(&entry(3)).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let mut cursor = initial.cursor;
+        let replaced = read_new(&path, &mut cursor, 1024).unwrap();
+        assert_eq!(replaced.entries, vec![entry(2), entry(3)]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn audit_sink_rejects_symlinks_and_hard_links() {
+        let target = path();
+        let symlink_path = path();
+        let hardlink_path = path();
+        std::fs::write(&target, b"").unwrap();
+        symlink(&target, &symlink_path).unwrap();
+        assert!(AccessLogger::new(symlink_path.to_str().unwrap()).is_err());
+
+        std::fs::hard_link(&target, &hardlink_path).unwrap();
+        assert!(
+            AccessLogger::new(hardlink_path.to_str().unwrap())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("singly-linked")
+        );
+
+        std::fs::remove_file(symlink_path).unwrap();
+        std::fs::remove_file(hardlink_path).unwrap();
+        std::fs::remove_file(target).unwrap();
+    }
+
+    #[test]
+    fn audit_sink_rejects_group_or_world_writable_files() {
+        let path = path();
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        assert!(
+            AccessLogger::new(path.to_str().unwrap())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("must not be writable")
+        );
+
+        std::fs::remove_file(path).unwrap();
+    }
 }

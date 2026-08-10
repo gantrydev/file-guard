@@ -105,11 +105,11 @@
               type = types.path;
               example = "/etc/file-guard/config.toml";
               description = ''
-                Path to the live config.toml the daemon reads and owns. When
-                `seedFile` is set this is the mutable copy the daemon writes
-                (settings/watches from the seed, plus learned "allow always"
-                rules); point it at a writable location like
-                `/var/lib/file-guard/config.toml`.
+                Path to the live config.toml the daemon reads. When `seedFile`
+                is set this is an atomically refreshed copy of that complete
+                declarative file; learned rules are stored separately in the
+                daemon's rule database. Its parent directory must already
+                exist and be root-owned.
               '';
             };
 
@@ -118,12 +118,10 @@
               default = null;
               example = "config.toml from pkgs.writeText";
               description = ''
-                Optional declarative seed. When set, on every start the daemon
-                reconciles `configFile`: `[settings]` and `[[watch]]` are taken
-                from this seed, while learned `[[rule]]` entries already in
-                `configFile` are preserved. This makes declarative changes apply
-                on `nixos-rebuild` without hand-deleting the live file. Leave
-                null to manage `configFile` yourself (copy-once / by hand).
+                Optional declarative source of truth. On every start the daemon
+                validates it and atomically replaces `configFile` with the
+                complete seed. Interactive rules remain in the separate SQLite
+                rule store. Leave null to manage `configFile` yourself.
               '';
             };
 

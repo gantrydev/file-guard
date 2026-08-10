@@ -118,8 +118,9 @@ blocks from [`configs/`](configs/):
 
 ```sh
 sudo install -d -m 0700 /var/lib/file-guard-dev
+sudo install -m 0644 "$HOME/.config/file-guard/config.toml" /var/lib/file-guard-dev/config.toml
 sudo env \
-  FILE_GUARD_CONFIG="$HOME/.config/file-guard/config.toml" \
+  FILE_GUARD_CONFIG=/var/lib/file-guard-dev/config.toml \
   FILE_GUARD_STORE_DIR=/var/lib/file-guard-dev/store \
   target/debug/file-guard start
 ```
@@ -201,8 +202,9 @@ point the root development daemon at the same socket and private store:
 ```sh
 file-guard agent --method gui &
 sudo install -d -m 0700 /var/lib/file-guard-dev
+sudo install -m 0644 "$HOME/.config/file-guard/config.toml" /var/lib/file-guard-dev/config.toml
 sudo env \
-  FILE_GUARD_CONFIG="$HOME/.config/file-guard/config.toml" \
+  FILE_GUARD_CONFIG=/var/lib/file-guard-dev/config.toml \
   FILE_GUARD_STORE_DIR=/var/lib/file-guard-dev/store \
   FILE_GUARD_AGENT_SOCKET="$XDG_RUNTIME_DIR/file-guard-agent.sock" \
   target/debug/file-guard start
@@ -215,8 +217,14 @@ A single TOML file (no `include` mechanism yet). See
 [`configs/`](configs/) for drop-in per-tool blocks (aws, gcloud, claude, ssh,
 docker, kubernetes, github, npm).
 
-Rules created via "Allow always" / "Deny always" prompts are appended to the
-config automatically.
+The config is administrator-owned and read-only at runtime. Rules created via
+"Allow always" / "Deny always" prompts are stored separately in
+`/var/lib/file-guard/rules.sqlite`. Rule CLI mutations use the daemon control
+socket while it is running and the same database transactions while offline.
+A sidecar owner lease prevents daemon startup and an offline command from
+opening divergent views of that state. On the first seeded startup after an
+upgrade, rules that existed only in the old live TOML are committed to SQLite
+before the declarative file is replaced.
 
 ## CLI
 
@@ -229,14 +237,25 @@ file-guard log [-n N] [-f]             # print/follow the audit log (needs a fil
                                        #   log_destination; else use journalctl)
 file-guard rules                       # list rules (with indices)
 file-guard rules add --file F --binary B --action allow|deny [--access read|write|any] [--no-pin]
-file-guard rules remove <index>        # remove the rule at INDEX (preserves comments)
+file-guard rules edit <index> [--action A] [--access A] [--repin|--no-pin]
+file-guard rules remove <index>        # remove a learned rule at INDEX
+file-guard rules find [--file F] [--binary B] [--action A]
+file-guard rules export                # export declarative + learned rules as TOML
+file-guard rules import                # import learned rules as TOML from stdin
 file-guard store <f>                   # snapshot and remove a file for offline storage
 file-guard restore <f>                 # restore a file from its snapshot
 ```
 
 The audit log is NDJSON (one object per access) when `log_destination` is a file
 path, so it's both human-readable via `file-guard log` and machine-queryable
-(e.g. `jq` over the file).
+(e.g. `jq` over the file). A privileged daemon requires the log's parent path
+and file to be root-controlled; it refuses symlinks, hard links, special files,
+and files writable by group or others.
+
+The list labels each rule as `config` or `learned`. Declarative config rules are
+read-only through the CLI; edit the config with administrator tooling. A root
+daemon accepts learned-rule mutations only from root, so use `sudo` for
+add/edit/remove/import in the packaged deployment.
 
 ## Security model & limitations
 
@@ -266,8 +285,9 @@ Known limitations - read before relying on this:
 - **Linux only.** FUSE and `/proc` are required.
 - **Identity = binary hash (+ script path & content hash for interpreters); a
   trusted tool's own deps are still inside the boundary.** A rule pins the
-  caller's binary sha256, and for interpreters (python/node/…) also the **script
-  path** from argv and the **script's content hash** - so "python running gcloud"
+  caller's running executable object from `/proc/<pid>/exe`, rather than a later
+  lookup of its pathname. For interpreters (python/node/…) it also pins the
+  **script path** from argv and the **script's content hash** - so "python running gcloud"
   doesn't authorize "python running something else", and an in-place edit of the
   script re-prompts. Two caveats remain: the script *path* comes from argv, which
   a *deliberate* impersonator can forge (it's defense-in-depth, strongest against
@@ -284,9 +304,9 @@ Known limitations - read before relying on this:
   given the user's display env (`agentEnvironment`); otherwise it falls back to
   the terminal and unknown accesses deny on timeout. Optional notifications also
   require a working desktop session bus.
-- **Writes are last-writer-wins.** Concurrent write handles to the same file
-  don't merge; the last one to close persists its buffer. Fine for the
-  single-writer credential-file case.
+- **Writes are serialized per credential.** Each write or truncate commits one
+  successor snapshot before the next mutation prepares. Disjoint writes are
+  preserved; overlapping writes follow their serialized operation order.
 
 ## How it compares
 

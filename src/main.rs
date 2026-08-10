@@ -1,12 +1,14 @@
 mod cli;
 mod config;
 mod control;
+mod control_api;
 mod daemon;
 mod interceptor;
 mod logging;
 mod policy;
 mod process;
 mod prompt;
+mod rule_store;
 mod secure_file;
 mod store;
 #[cfg(test)]
@@ -18,14 +20,17 @@ mod fuse_fs;
 
 use clap::Parser;
 use cli::{Cli, Command, RuleAction, RulesAction};
+use control_api::{ControlCommand, ControlPayload};
+use policy::engine::{ManagedRule, RulePinUpdate};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Restore default SIGPIPE so piping output into `head`/`grep` exits quietly
-    // instead of panicking on EPIPE (Rust ignores SIGPIPE by default).
     #[cfg(unix)]
     unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGPIPE, &action, std::ptr::null_mut());
     }
 
     tracing_subscriber::fmt()
@@ -39,11 +44,17 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Start { daemon: _daemonize } => {
-            // Apply declarative seed changes (settings + watches) before load,
-            // preserving learned rules; no-op unless FILE_GUARD_SEED_CONFIG set.
-            config::Config::reconcile_seed()?;
+            let database_path = rule_store::rule_store_path()?;
+            let rule_lease = std::sync::Arc::new(
+                rule_store::RuleLease::try_acquire(database_path)?.ok_or_else(|| {
+                    anyhow::anyhow!("another learned-rule owner is already active")
+                })?,
+            );
+            config::Config::reconcile_seed(|previous, declarative| {
+                migrate_legacy_rules(&rule_lease, previous, declarative)
+            })?;
             let config = config::Config::load()?;
-            let mut d = daemon::Daemon::new(config)?;
+            let mut d = daemon::Daemon::new(config, rule_lease)?;
             d.start().await?;
 
             tracing::info!("file-guard running; Ctrl+C or SIGTERM to stop");
@@ -78,23 +89,8 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Rules { action } => match action {
             None => {
-                let config = config::Config::load()?;
-                for (i, rule) in config.rule.iter().enumerate() {
-                    let pinned = if rule.sha256.is_some() || rule.script_sha256.is_some() {
-                        " (pinned)"
-                    } else {
-                        ""
-                    };
-                    println!(
-                        "{i:>3}  {action:>5} {access:<6} {binary}  →  {file}{pinned}",
-                        action = match rule.action {
-                            config::RuleAction::Allow => "allow",
-                            config::RuleAction::Deny => "deny",
-                        },
-                        access = rule.access.verb(),
-                        binary = rule.binary,
-                        file = rule.file,
-                    );
+                for (index, rule) in list_managed_rules().await?.iter().enumerate() {
+                    print_rule(index, rule);
                 }
             }
             Some(RulesAction::Add {
@@ -128,15 +124,27 @@ async fn main() -> anyhow::Result<()> {
                     script: None,
                     script_sha256: None,
                 };
-                if config::Config::append_rule(&entry)? {
+                let result = control_api::dispatch(ControlCommand::AddRule { entry }).await?;
+                let ControlPayload::Added(added) = result else {
+                    anyhow::bail!("control server returned an invalid add-rule response");
+                };
+                if added {
                     println!("added rule: {} → {}", binary.display(), file);
                 } else {
                     println!("rule already exists: {} → {}", binary.display(), file);
                 }
             }
             Some(RulesAction::Remove { index }) => {
-                let (binary, file) = config::Config::remove_rule_at(index)?;
-                println!("removed rule {index}: {binary} → {file}");
+                let rules = list_managed_rules().await?;
+                let (id, _) = learned_rule_at(&rules, index)?;
+                let result = control_api::dispatch(ControlCommand::RemoveRule { id }).await?;
+                let ControlPayload::Removed(removed) = result else {
+                    anyhow::bail!("control server returned an invalid remove-rule response");
+                };
+                println!(
+                    "removed rule {index}: {} → {}",
+                    removed.binary, removed.file
+                );
             }
             Some(RulesAction::Edit {
                 index,
@@ -145,16 +153,34 @@ async fn main() -> anyhow::Result<()> {
                 repin,
                 no_pin,
             }) => {
-                let (binary, file) = config::Config::edit_rule_at(
-                    index,
-                    action.map(|a| match a {
-                        RuleAction::Allow => config::RuleAction::Allow,
-                        RuleAction::Deny => config::RuleAction::Deny,
-                    }),
+                let rules = list_managed_rules().await?;
+                let (id, entry) = learned_rule_at(&rules, index)?;
+                let action = action.map(|action| match action {
+                    RuleAction::Allow => config::RuleAction::Allow,
+                    RuleAction::Deny => config::RuleAction::Deny,
+                });
+                let pin = if no_pin {
+                    RulePinUpdate::Unpin
+                } else if repin {
+                    let binary = std::path::PathBuf::from(&entry.binary);
+                    RulePinUpdate::Repin(process::integrity::hash_file(&binary).map_err(
+                        |error| anyhow::anyhow!("cannot re-pin {}: {error}", binary.display()),
+                    )?)
+                } else {
+                    RulePinUpdate::Keep
+                };
+                let binary = entry.binary.clone();
+                let file = entry.file.clone();
+                let result = control_api::dispatch(ControlCommand::EditRule {
+                    id,
+                    action,
                     access,
-                    repin,
-                    no_pin,
-                )?;
+                    pin,
+                })
+                .await?;
+                if !matches!(result, ControlPayload::Replaced) {
+                    anyhow::bail!("control server returned an invalid replace-rule response");
+                }
                 println!("edited rule {index}: {binary} → {file}");
             }
             Some(RulesAction::Find {
@@ -162,38 +188,32 @@ async fn main() -> anyhow::Result<()> {
                 binary,
                 action,
             }) => {
-                let config = config::Config::load()?;
-                for (i, rule) in config.rule.iter().enumerate() {
-                    let matches_file = file.as_ref().is_none_or(|f| rule.file.contains(f));
-                    let matches_binary = binary.as_ref().is_none_or(|b| rule.binary.contains(b));
+                for (index, rule) in list_managed_rules().await?.iter().enumerate() {
+                    let matches_file = file
+                        .as_ref()
+                        .is_none_or(|file| rule.entry.file.contains(file));
+                    let matches_binary = binary
+                        .as_ref()
+                        .is_none_or(|binary| rule.entry.binary.contains(binary));
                     let matches_action = action.is_none_or(|a| {
                         let want = match a {
                             RuleAction::Allow => config::RuleAction::Allow,
                             RuleAction::Deny => config::RuleAction::Deny,
                         };
-                        rule.action == want
+                        rule.entry.action == want
                     });
                     if matches_file && matches_binary && matches_action {
-                        let pinned = if rule.sha256.is_some() || rule.script_sha256.is_some() {
-                            " (pinned)"
-                        } else {
-                            ""
-                        };
-                        println!(
-                            "{i:>3}  {action:>5} {access:<6} {binary}  →  {file}{pinned}",
-                            action = match rule.action {
-                                config::RuleAction::Allow => "allow",
-                                config::RuleAction::Deny => "deny",
-                            },
-                            access = rule.access.verb(),
-                            binary = rule.binary,
-                            file = rule.file,
-                        );
+                        print_rule(index, rule);
                     }
                 }
             }
             Some(RulesAction::Export) => {
-                let rules_toml = config::Config::export_rules()?;
+                let rules = list_managed_rules()
+                    .await?
+                    .into_iter()
+                    .map(|rule| rule.entry)
+                    .collect();
+                let rules_toml = config::serialize_rules_document(rules)?;
                 if rules_toml.is_empty() {
                     println!("# no rules configured");
                 } else {
@@ -206,12 +226,16 @@ async fn main() -> anyhow::Result<()> {
                 std::io::stdin()
                     .read_to_string(&mut stdin)
                     .map_err(|e| anyhow::anyhow!("reading stdin: {e}"))?;
-                let added = config::Config::import_rules(&stdin)?;
+                let entries = config::parse_rules_document(&stdin)?;
+                let result = control_api::dispatch(ControlCommand::ImportRules { entries }).await?;
+                let ControlPayload::Imported(added) = result else {
+                    anyhow::bail!("control server returned an invalid import-rules response");
+                };
                 println!("imported {added} rule(s)");
             }
         },
         Command::Store { file } => {
-            let expanded = config::Config::expand_path(&file.to_string_lossy());
+            let expanded = config::Config::expand_path(&file.to_string_lossy())?;
 
             // A live mount means the daemon already guards this path (it
             // captured the original itself); storing again and removing the
@@ -229,7 +253,7 @@ async fn main() -> anyhow::Result<()> {
             println!("moved {} into the backing store", expanded.display());
         }
         Command::Restore { file } => {
-            let expanded = config::Config::expand_path(&file.to_string_lossy());
+            let expanded = config::Config::expand_path(&file.to_string_lossy())?;
 
             // A live mount means the daemon still owns this path; writing under
             // it fights the daemon and is overwritten when it stops (with
@@ -269,6 +293,86 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn migrate_legacy_rules(
+    lease: &std::sync::Arc<rule_store::RuleLease>,
+    previous: Vec<config::RuleEntry>,
+    declarative: Vec<config::RuleEntry>,
+) -> anyhow::Result<()> {
+    let legacy = legacy_rules(previous, declarative)?;
+    if legacy.is_empty() {
+        return Ok(());
+    }
+    let store = rule_store::RuleStore::open(std::sync::Arc::clone(lease))?;
+    let migrated = store.insert_many(&legacy)?.len();
+    tracing::info!("migrated {migrated} legacy learned rule(s) into the rule store");
+    Ok(())
+}
+
+fn legacy_rules(
+    previous: Vec<config::RuleEntry>,
+    declarative: Vec<config::RuleEntry>,
+) -> anyhow::Result<Vec<config::RuleEntry>> {
+    let declarative = declarative
+        .into_iter()
+        .map(policy::engine::normalize_rule_entry)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(previous
+        .into_iter()
+        .map(policy::engine::normalize_rule_entry)
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|entry| !declarative.contains(entry))
+        .collect())
+}
+
+async fn list_managed_rules() -> anyhow::Result<Vec<ManagedRule>> {
+    let payload = control_api::dispatch(ControlCommand::ListRules).await?;
+    let ControlPayload::Rules(rules) = payload else {
+        anyhow::bail!("control server returned an invalid list-rules response");
+    };
+    Ok(rules)
+}
+
+fn learned_rule_at(
+    rules: &[ManagedRule],
+    index: usize,
+) -> anyhow::Result<(i64, config::RuleEntry)> {
+    let rule = rules.get(index).ok_or_else(|| {
+        anyhow::anyhow!(
+            "rule index {index} out of range (have {} rule(s))",
+            rules.len()
+        )
+    })?;
+    let id = rule.learned_id.ok_or_else(|| {
+        anyhow::anyhow!("rule {index} is declarative and read-only; edit FILE_GUARD_CONFIG instead")
+    })?;
+    Ok((id, rule.entry.clone()))
+}
+
+fn print_rule(index: usize, rule: &ManagedRule) {
+    let entry = &rule.entry;
+    let pinned = if entry.sha256.is_some() || entry.script_sha256.is_some() {
+        " (pinned)"
+    } else {
+        ""
+    };
+    let source = if rule.learned_id.is_some() {
+        "learned"
+    } else {
+        "config"
+    };
+    println!(
+        "{index:>3}  {action:>5} {access:<6} {binary}  →  {file}{pinned} [{source}]",
+        action = match entry.action {
+            config::RuleAction::Allow => "allow",
+            config::RuleAction::Deny => "deny",
+        },
+        access = entry.access.verb(),
+        binary = entry.binary,
+        file = entry.file,
+    );
+}
+
 /// Block until the daemon is asked to shut down. Handles SIGINT (Ctrl-C) and,
 /// on Unix, SIGTERM (what `systemctl stop` / launchd send) so the daemon
 /// always runs its unmount path instead of being killed with mounts live.
@@ -287,5 +391,36 @@ async fn wait_for_shutdown() -> anyhow::Result<()> {
     {
         tokio::signal::ctrl_c().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    fn rule(binary: &str, hash: &str) -> config::RuleEntry {
+        config::RuleEntry {
+            file: "/credential".into(),
+            binary: binary.into(),
+            action: config::RuleAction::Allow,
+            access: policy::rule::Access::Any,
+            sha256: Some(hash.repeat(64)),
+            signature: None,
+            script: None,
+            script_sha256: None,
+        }
+    }
+
+    #[test]
+    fn seed_migration_keeps_only_legacy_rules() {
+        let seed_in_live = rule("/usr/bin/seed", "A");
+        let legacy = rule("/usr/bin/legacy", "b");
+        let selected = legacy_rules(
+            vec![seed_in_live, legacy.clone()],
+            vec![rule("/usr/bin/seed", "a")],
+        )
+        .unwrap();
+
+        assert_eq!(selected, vec![legacy]);
     }
 }

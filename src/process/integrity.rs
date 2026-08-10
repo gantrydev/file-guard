@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 /// module-level docs for rationale.
 const MAX_CACHE_ENTRIES: usize = 1000;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
 struct Stamp {
     device: u64,
     inode: u64,
@@ -59,26 +59,101 @@ impl Stamp {
     }
 }
 
-fn cache() -> &'static Mutex<HashMap<PathBuf, (Stamp, String)>> {
-    static CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, (Stamp, String)>>> =
+#[derive(Clone, Hash, PartialEq, Eq)]
+enum CacheKey {
+    Path(PathBuf),
+    Object { device: u64, inode: u64 },
+}
+
+fn cache() -> &'static Mutex<HashMap<CacheKey, (Stamp, String)>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<CacheKey, (Stamp, String)>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// sha256 (hex) of a stable file descriptor's contents.
+///
+/// The returned hash always describes the opened object. A post-open path stat
+/// rejects replacement during resolution; replacement afterward cannot change
+/// the object held by the file descriptor.
 pub fn hash_file(path: &Path) -> anyhow::Result<String> {
-    let mut file = std::fs::File::open(path)
+    let file = std::fs::File::open(path)
         .map_err(|e| anyhow::anyhow!("open {} for hashing: {e}", path.display()))?;
-    let before_metadata = file
+    let fd_metadata = file
         .metadata()
-        .map_err(|e| anyhow::anyhow!("stat {} for hashing: {e}", path.display()))?;
-    if !before_metadata.is_file() {
+        .map_err(|e| anyhow::anyhow!("stat {} via fd: {e}", path.display()))?;
+
+    if !fd_metadata.is_file() {
         anyhow::bail!("{} is not a regular file", path.display())
     }
-    let before = Stamp::from(&before_metadata);
+    let path_metadata = std::fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("re-stat {} for verification: {e}", path.display()))?;
+    if fd_metadata.dev() != path_metadata.dev() || fd_metadata.ino() != path_metadata.ino() {
+        anyhow::bail!("{} was replaced during open", path.display())
+    }
+
+    hash_opened(file, CacheKey::Path(path.to_path_buf()), path)
+}
+
+pub struct CapturedExecutable {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
+pub fn capture_process_executable(pid: u32, start_time: u64) -> anyhow::Result<CapturedExecutable> {
+    if crate::process::start_time(pid)? != start_time {
+        anyhow::bail!("pid {pid} was recycled before executable capture");
+    }
+    let proc_path = PathBuf::from(format!("/proc/{pid}/exe"));
+    let file = std::fs::File::open(&proc_path)
+        .map_err(|error| anyhow::anyhow!("open {}: {error}", proc_path.display()))?;
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        anyhow::bail!(
+            "{} does not reference a regular executable",
+            proc_path.display()
+        );
+    }
+    let binary_path = std::fs::read_link(&proc_path)?;
+    let current = std::fs::metadata(&proc_path)?;
+    if opened.dev() != current.dev() || opened.ino() != current.ino() {
+        anyhow::bail!("pid {pid} changed executable during capture");
+    }
+    let key = CacheKey::Object {
+        device: opened.dev(),
+        inode: opened.ino(),
+    };
+    let sha256 = hash_opened(file, key, &proc_path)?;
+    if crate::process::start_time(pid)? != start_time {
+        anyhow::bail!("pid {pid} exited or was recycled during executable capture");
+    }
+    let after = std::fs::metadata(&proc_path)?;
+    if opened.dev() != after.dev()
+        || opened.ino() != after.ino()
+        || std::fs::read_link(&proc_path)? != binary_path
+    {
+        anyhow::bail!("pid {pid} changed executable during capture");
+    }
+    Ok(CapturedExecutable {
+        path: binary_path,
+        sha256,
+    })
+}
+
+fn hash_opened(
+    mut file: std::fs::File,
+    key: CacheKey,
+    display_path: &Path,
+) -> anyhow::Result<String> {
+    let fd_metadata = file.metadata()?;
+    if !fd_metadata.is_file() {
+        anyhow::bail!("{} is not a regular file", display_path.display());
+    }
+
+    let before = Stamp::from(&fd_metadata);
 
     if before.cacheable()
-        && let Some((cached, hash)) = cache().lock().unwrap().get(path)
+        && let Some((cached, hash)) = cache().lock().unwrap().get(&key)
         && *cached == before
     {
         let after = Stamp::from(&file.metadata()?);
@@ -90,16 +165,19 @@ pub fn hash_file(path: &Path) -> anyhow::Result<String> {
     let hash = hash_contents(&mut file)?;
     let after = Stamp::from(&file.metadata()?);
     if after != before {
-        anyhow::bail!("{} changed while it was being hashed", path.display())
+        anyhow::bail!(
+            "{} changed while it was being hashed",
+            display_path.display()
+        )
     }
     let mut cache = cache().lock().unwrap();
     if after.cacheable() {
         if cache.len() >= MAX_CACHE_ENTRIES {
             cache.clear();
         }
-        cache.insert(path.to_path_buf(), (after, hash.clone()));
+        cache.insert(key.clone(), (after, hash.clone()));
     } else {
-        cache.remove(path);
+        cache.remove(&key);
     }
     Ok(hash)
 }
@@ -172,5 +250,33 @@ mod tests {
 
         assert_ne!(hash_file(&tmp).unwrap(), original_hash);
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn hashes_hardlinks_and_symlink_paths_by_opened_identity() {
+        let original = temp_path("linked-original");
+        let hardlink = temp_path("hardlink");
+        let symlink = temp_path("symlink");
+        std::fs::write(&original, b"linked-content").unwrap();
+        std::fs::hard_link(&original, &hardlink).unwrap();
+        std::os::unix::fs::symlink(&original, &symlink).unwrap();
+
+        let expected = hash_file(&original).unwrap();
+        assert_eq!(hash_file(&hardlink).unwrap(), expected);
+        assert_eq!(hash_file(&symlink).unwrap(), expected);
+
+        std::fs::remove_file(&symlink).ok();
+        std::fs::remove_file(&hardlink).ok();
+        std::fs::remove_file(&original).ok();
+    }
+
+    #[test]
+    fn process_hash_uses_the_running_executable_object() {
+        let pid = std::process::id();
+        let start_time = crate::process::start_time(pid).unwrap();
+        let process = capture_process_executable(pid, start_time).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        assert_eq!(process.path, executable);
+        assert_eq!(process.sha256, hash_file(&executable).unwrap());
     }
 }

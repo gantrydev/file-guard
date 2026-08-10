@@ -569,7 +569,17 @@ fn verify_finalization_data(
 
 pub fn default_staging_root(target: &ResolvedPath) -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("FILE_GUARD_STAGING_DIR") {
-        return Ok(PathBuf::from(path));
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "FILE_GUARD_STAGING_DIR must be absolute: {}",
+                    path.display()
+                ),
+            ));
+        }
+        return Ok(path);
     }
     let expected_device = target.parent_identity()?.device;
     let conventional = PathBuf::from("/var/lib/file-guard/staging-v2");
@@ -875,6 +885,11 @@ fn validate_trusted_ancestors(path: &Path) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "staging path has no parent"))?;
+    validate_trusted_directory(parent)
+}
+
+pub(crate) fn validate_trusted_directory(path: &Path) -> io::Result<()> {
+    let path = absolute_lexical(path)?;
     let effective_uid = unsafe { libc::geteuid() };
     let mut directory = File::from(open_at(
         libc::AT_FDCWD,
@@ -884,7 +899,7 @@ fn validate_trusted_ancestors(path: &Path) -> io::Result<()> {
     )?);
     validate_trusted_ancestor(Path::new("/"), &directory, effective_uid)?;
     let mut traversed = PathBuf::from("/");
-    for component in parent.components() {
+    for component in path.components() {
         match component {
             Component::RootDir | Component::CurDir => {}
             Component::Normal(name) => {
@@ -902,6 +917,34 @@ fn validate_trusted_ancestors(path: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn ensure_trusted_directory(path: &Path, mode: u32) -> io::Result<()> {
+    let path = absolute_lexical(path)?;
+    if let Err(error) = std::fs::symlink_metadata(&path) {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "directory has no parent")
+        })?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "directory has no name"))?;
+        validate_trusted_directory(parent)?;
+        let parent = File::from(resolve_directory(parent)?);
+        match mkdir_at(parent.as_raw_fd(), &cstring(name)?, mode) {
+            Ok(()) => {
+                let directory = File::from(open_directory(parent.as_raw_fd(), &cstring(name)?)?);
+                set_mode(directory.as_raw_fd(), mode)?;
+                directory.sync_all()?;
+                parent.sync_all()?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    validate_trusted_directory(&path)
 }
 
 fn validate_trusted_ancestor(path: &Path, directory: &File, effective_uid: u32) -> io::Result<()> {

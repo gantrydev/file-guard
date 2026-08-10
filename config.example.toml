@@ -7,6 +7,8 @@
 #
 # `~/` in `path` expands to the *guarded* user's home. When the daemon runs as
 # root, set FILE_GUARD_USER=<you> so `~` resolves to your home, not /root.
+# A privileged daemon requires the config and every parent directory to be
+# root-controlled; it refuses writable files, symlinks, and special files.
 #
 # Ready-made per-tool blocks live in ./configs/*.toml - paste in the ones you want.
 
@@ -60,7 +62,7 @@ path = "~/.netrc"
 # A low-sensitivity file you want logged but not gated:
 [[watch]]
 path = "~/.gitconfig"
-default_action = "allow"   # NOTE: per-file default is not honored yet (TODO)
+default_action = "allow"
 
 # ── Rules ───────────────────────────────────────────────────────────────────
 # A rule = (file, binary, action [, access, sha256]). `binary` must

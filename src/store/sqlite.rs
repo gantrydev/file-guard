@@ -95,7 +95,7 @@ impl SqliteStore {
                 "the snapshot database must be opened by the root daemon".to_string(),
             ));
         }
-        let root = absolute_lexical(&default_store_root())?;
+        let root = absolute_lexical(&default_store_root()?)?;
         validate_trusted_ancestors(&root)?;
         Self::open_with_hook(root, Arc::new(NoopStoreHook))
     }
@@ -1297,10 +1297,17 @@ fn revision_to_sql(revision: u64) -> StoreResult<i64> {
         .map_err(|_| StoreError::Corrupt("snapshot revision is out of range".to_string()))
 }
 
-fn default_store_root() -> PathBuf {
-    std::env::var_os("FILE_GUARD_STORE_DIR")
+fn default_store_root() -> StoreResult<PathBuf> {
+    let path = std::env::var_os("FILE_GUARD_STORE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/var/lib/file-guard/store"))
+        .unwrap_or_else(|| PathBuf::from("/var/lib/file-guard/store"));
+    if !path.is_absolute() {
+        return Err(StoreError::UnsafeConfiguration(format!(
+            "FILE_GUARD_STORE_DIR must be absolute: {}",
+            path.display()
+        )));
+    }
+    Ok(path)
 }
 
 fn prepare_private_root(path: &Path) -> StoreResult<PathBuf> {

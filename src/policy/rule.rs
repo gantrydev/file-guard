@@ -52,26 +52,42 @@ impl Access {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityPin {
+    Sha256(String),
+    Unpinned,
+}
+
+impl IdentityPin {
+    #[cfg(test)]
+    pub fn from_sha256(value: Option<String>) -> Self {
+        value.map_or(Self::Unpinned, Self::Sha256)
+    }
+
+    pub fn sha256(&self) -> Option<&str> {
+        match self {
+            Self::Sha256(value) => Some(value),
+            Self::Unpinned => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptIdentity {
+    pub path: String,
+    pub pin: IdentityPin,
+}
+
 /// A persistent rule: binary X accessing file Y -> allow/deny, scoped to a
-/// direction and optionally pinned to the binary's content hash.
+/// direction and carrying an explicit binary identity policy.
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub file: PathBuf,
     pub binary: PathBuf,
     pub action: Action,
     pub access: Access,
-    /// sha256 hex of the binary at the time the rule was captured. When set, a
-    /// caller whose hash differs does **not** match (it re-prompts) rather than
-    /// being denied - so a legitimate rebuild re-authorizes instead of breaking.
-    pub sha256: Option<String>,
-    /// For interpreter rules, the pinned script path. When set, a caller running
-    /// the same interpreter but a *different* script does not match (re-prompts),
-    /// narrowing "any python" to "this program".
-    pub script: Option<String>,
-    /// sha256 of the pinned script's contents. When set, a caller whose script
-    /// hashes differently does not match (re-prompts) - catches in-place edits
-    /// where the script path stays the same.
-    pub script_sha256: Option<String>,
+    pub identity: IdentityPin,
+    pub script: Option<ScriptIdentity>,
 }
 
 /// Outcome of a policy evaluation.

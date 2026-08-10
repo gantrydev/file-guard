@@ -45,20 +45,20 @@ enum ProcessProbe {
 /// context's PID path first, then the system daemon's well-known location, so a
 /// guarded (non-root) user - whose context resolves to its own runtime dir -
 /// still sees the root daemon at `/run/file-guard/daemon.pid`.
-pub fn running_pid() -> Option<u32> {
-    running_process().map(|process| process.identity().pid)
+pub fn running_pid() -> anyhow::Result<Option<u32>> {
+    Ok(running_process()?.map(|process| process.identity().pid))
 }
 
-fn running_process() -> Option<DaemonProcess> {
-    let primary = config::pid_file_path();
+fn running_process() -> anyhow::Result<Option<DaemonProcess>> {
+    let primary = config::pid_file_path()?;
     if let Some(process) = process_from(&primary) {
-        return Some(process);
+        return Ok(Some(process));
     }
     let system = PathBuf::from("/run/file-guard/daemon.pid");
     if system != primary {
-        return process_from(&system);
+        return Ok(process_from(&system));
     }
-    None
+    Ok(None)
 }
 
 fn process_from(path: &Path) -> Option<DaemonProcess> {
@@ -123,11 +123,12 @@ fn probe_process(pid: u32) -> ProcessProbe {
 /// Send SIGTERM to the running daemon and wait for it to exit (and run its
 /// unmount path). Errors if no daemon is running.
 pub fn stop() -> anyhow::Result<()> {
-    let Some(process) = running_process() else {
+    let pid_path = config::pid_file_path()?;
+    let Some(process) = running_process()? else {
         anyhow::bail!(
             "no running daemon found (no matching process identity at {}). \
              Under systemd use `systemctl stop file-guard`.",
-            config::pid_file_path().display()
+            pid_path.display()
         );
     };
     let identity = match process {
@@ -277,7 +278,7 @@ fn signal_daemon(identity: DaemonIdentity) -> anyhow::Result<()> {
 
 /// Print daemon state, each watched file's mount status, and recent accesses.
 pub fn status(config: &Config) -> anyhow::Result<()> {
-    match running_pid() {
+    match running_pid()? {
         Some(pid) => println!("daemon:  running (pid {pid})"),
         None => println!("daemon:  not running"),
     }
@@ -287,7 +288,7 @@ pub fn status(config: &Config) -> anyhow::Result<()> {
     if config.watch.is_empty() {
         println!("  (none configured)");
     }
-    for path in config.watched_paths() {
+    for path in config.watched_paths()? {
         let state = if mounts.contains(&path) {
             "mounted"
         } else {
@@ -301,7 +302,7 @@ pub fn status(config: &Config) -> anyhow::Result<()> {
     if matches!(log_dest, "" | "stdout" | "journal") {
         println!("  (audit log goes to the journal; set log_destination to a file path)");
     } else {
-        let entries = logging::read_recent(&Config::expand_path(log_dest), 10);
+        let entries = logging::read_recent(&Config::expand_path(log_dest)?, 10);
         if entries.is_empty() {
             println!("  (no entries)");
         }
@@ -322,52 +323,32 @@ pub fn tail_log(config: &Config, n: usize, follow: bool) -> anyhow::Result<()> {
              Set log_destination to a path to enable `file-guard log`."
         );
     }
-    let path = Config::expand_path(dest);
+    let path = Config::expand_path(dest)?;
 
-    for entry in logging::read_recent(&path, n) {
+    let initial = logging::read_recent_batch(&path, n)?;
+    for entry in initial.entries {
         println!("{entry}");
     }
     if !follow {
         return Ok(());
     }
 
-    // Poll for growth and print newly-appended entries.
-    let mut offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let mut cursor = initial.cursor;
     loop {
         std::thread::sleep(Duration::from_millis(500));
-        let len = match std::fs::metadata(&path) {
-            Ok(m) => m.len(),
-            Err(_) => continue,
-        };
-        if len < offset {
-            offset = 0; // truncated/rotated - restart from the top
-        }
-        if len > offset {
-            for entry in read_from(&path, offset) {
+        loop {
+            let batch = logging::read_new(&path, &mut cursor, MAX_LOG_READ_BYTES)?;
+            if !batch.advanced {
+                break;
+            }
+            for entry in batch.entries {
                 println!("{entry}");
             }
-            offset = len;
         }
     }
 }
 
-/// Parse audit entries appended after byte `offset`.
-fn read_from(path: &Path, offset: u64) -> Vec<logging::AccessLogEntry> {
-    use std::io::{Read, Seek};
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
-    if f.seek(std::io::SeekFrom::Start(offset)).is_err() {
-        return Vec::new();
-    }
-    let mut buf = String::new();
-    if f.read_to_string(&mut buf).is_err() {
-        return Vec::new();
-    }
-    buf.lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
-}
+const MAX_LOG_READ_BYTES: usize = 16 * 1024 * 1024;
 
 /// Whether `path` is currently served by a live file-guard FUSE mount. Used by
 /// `restore` to refuse acting underneath a mount the daemon still owns.

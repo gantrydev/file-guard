@@ -139,6 +139,7 @@ struct OpenHandle {
 /// user-blocking) policy decision without pinning the single-threaded FUSE read
 /// loop.
 struct Shared {
+    mutation: Mutex<()>,
     content: Mutex<Content>,
     handles: Mutex<HashMap<u64, OpenHandle>>,
     next_fh: AtomicU64,
@@ -165,18 +166,27 @@ impl Shared {
 
         let end = checked_write_end(offset, data.len()).map_err(MutationError::Invalid)?;
         let start = offset as usize;
+        let _mutation = self.mutation.lock().unwrap();
 
-        let mut content = self.content.lock().unwrap();
-        let mut candidate = content.bytes.clone();
-        if candidate.len() < end {
-            candidate.resize(end, 0);
-        }
-        candidate[start..end].copy_from_slice(data);
+        let (candidate, record) = {
+            let content = self.content.lock().unwrap();
+            let mut candidate = content.bytes.clone();
+            if candidate.len() < end {
+                candidate.resize(end, 0);
+            }
+            candidate[start..end].copy_from_slice(data);
+            (candidate, content.record.clone())
+        };
+
         let next = manager
-            .update_contents(&content.record, candidate.clone())
+            .update_contents(&record, candidate.clone())
             .map_err(MutationError::Commit)?;
-        content.bytes = candidate;
-        content.record = next;
+
+        {
+            let mut content = self.content.lock().unwrap();
+            content.bytes = candidate;
+            content.record = next;
+        }
         Ok(data.len() as u32)
     }
 
@@ -188,14 +198,24 @@ impl Shared {
         if new_size > MAX_CONTENT_LEN {
             return Err(MutationError::Invalid(Errno::EFBIG));
         }
-        let mut content = self.content.lock().unwrap();
-        let mut candidate = content.bytes.clone();
-        candidate.resize(new_size as usize, 0);
+        let _mutation = self.mutation.lock().unwrap();
+
+        let (candidate, record) = {
+            let content = self.content.lock().unwrap();
+            let mut candidate = content.bytes.clone();
+            candidate.resize(new_size as usize, 0);
+            (candidate, content.record.clone())
+        };
+
         let next = manager
-            .update_contents(&content.record, candidate.clone())
+            .update_contents(&record, candidate.clone())
             .map_err(MutationError::Commit)?;
-        content.bytes = candidate;
-        content.record = next;
+
+        {
+            let mut content = self.content.lock().unwrap();
+            content.bytes = candidate;
+            content.record = next;
+        }
         Ok(())
     }
 
@@ -260,6 +280,7 @@ impl CredentialFs {
             owner_uid,
             presentation,
             shared: Arc::new(Shared {
+                mutation: Mutex::new(()),
                 content: Mutex::new(Content { bytes, record }),
                 handles: Mutex::new(HashMap::new()),
                 next_fh: AtomicU64::new(1),
@@ -715,10 +736,12 @@ mod tests {
     use crate::logging::AccessLogger;
     use crate::policy::engine::PolicyEngine;
     use crate::prompt::PromptClient;
+    use crate::rule_store::MemoryRuleStore;
     use crate::store::{FinalizationRecord, RecordVersion, StoreError, StoreResult};
     use crate::testing::{MemoryStore, mount_intent_record};
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
 
     #[test]
     fn slice_content_bounds() {
@@ -767,14 +790,18 @@ mod tests {
             watch: vec![],
             rule: vec![],
         };
-        let policy = Arc::new(PolicyEngine::new(
-            &config,
-            Arc::new(PromptClient::new(
-                PathBuf::from("/nonexistent.sock"),
-                Duration::from_millis(50),
-                0,
-            )),
-        ));
+        let policy = Arc::new(
+            PolicyEngine::new(
+                &config,
+                Arc::new(PromptClient::new(
+                    PathBuf::from("/nonexistent.sock"),
+                    Duration::from_millis(50),
+                    0,
+                )),
+                Arc::new(MemoryRuleStore::new()),
+            )
+            .unwrap(),
+        );
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
         let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
         (fs, rt)
@@ -863,6 +890,50 @@ mod tests {
         }
     }
 
+    struct BlockingStore {
+        inner: MemoryStore,
+        commits: AtomicUsize,
+        commit_started: mpsc::SyncSender<usize>,
+        release_first: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl BackingStore for BlockingStore {
+        fn load(&self, file_id: &Path) -> StoreResult<Entry> {
+            self.inner.load(file_id)
+        }
+
+        fn commit(
+            &self,
+            file_id: &Path,
+            expected: Option<&RecordVersion>,
+            next: &SnapshotRecord,
+        ) -> StoreResult<RecordVersion> {
+            let commit = self.commits.fetch_add(1, Ordering::SeqCst);
+            self.commit_started.send(commit).unwrap();
+            if commit == 0 {
+                self.release_first.lock().unwrap().recv().unwrap();
+            }
+            self.inner.commit(file_id, expected, next)
+        }
+
+        fn begin_finalization(
+            &self,
+            file_id: &Path,
+            expected: &RecordVersion,
+            marker: &FinalizationRecord,
+        ) -> StoreResult<RecordVersion> {
+            self.inner.begin_finalization(file_id, expected, marker)
+        }
+
+        fn finish_finalization(&self, file_id: &Path, expected: &RecordVersion) -> StoreResult<()> {
+            self.inner.finish_finalization(file_id, expected)
+        }
+
+        fn list(&self) -> StoreResult<Vec<Entry>> {
+            self.inner.list()
+        }
+    }
+
     fn write_handle(fs: &CredentialFs) -> u64 {
         fs.shared.register_handle(OpenHandle {
             access: Access::Write,
@@ -870,19 +941,46 @@ mod tests {
         })
     }
 
-    /// Two concurrent write handles editing disjoint regions: with a shared
-    /// content buffer, both edits survive — the previous per-handle-buffer model
-    /// lost the first writer's bytes (last-writer-wins whole-file overwrite).
     #[test]
     fn concurrent_disjoint_writes_preserve_both_edits() {
-        let (fs, watched, store, _rt) = fixture(&[b'x'; 200]);
+        let watched = PathBuf::from("/credential");
+        let (commit_started_tx, commit_started_rx) = mpsc::sync_channel(2);
+        let (release_first_tx, release_first_rx) = mpsc::sync_channel(1);
+        let store = Arc::new(BlockingStore {
+            inner: MemoryStore::with_record(
+                watched.clone(),
+                mount_intent_record(&watched, &[b'x'; 200]),
+            ),
+            commits: AtomicUsize::new(0),
+            commit_started: commit_started_tx,
+            release_first: Mutex::new(release_first_rx),
+        });
+        let (fs, _rt) = credential_fs(watched.clone(), store.clone());
         let p1 = write_handle(&fs);
         let p2 = write_handle(&fs);
+        let shared = Arc::clone(&fs.shared);
+        let manager = fs.manager.clone();
 
-        fs.apply_write(p1, 0, b"AAA").unwrap();
-        fs.apply_write(p2, 100, b"BBB").unwrap();
+        let first = std::thread::spawn(move || shared.apply_write(&manager, p1, 0, b"AAA"));
+        assert_eq!(commit_started_rx.recv().unwrap(), 0);
 
-        let got = store.contents(&watched);
+        let shared = Arc::clone(&fs.shared);
+        let manager = fs.manager.clone();
+        let second = std::thread::spawn(move || shared.apply_write(&manager, p2, 100, b"BBB"));
+
+        assert!(
+            commit_started_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "the second mutation reached the store before the first committed"
+        );
+        release_first_tx.send(()).unwrap();
+
+        assert_eq!(first.join().unwrap().unwrap(), 3);
+        assert_eq!(commit_started_rx.recv().unwrap(), 1);
+        assert_eq!(second.join().unwrap().unwrap(), 3);
+
+        let got = store.inner.contents(&watched);
         assert_eq!(&got[0..3], b"AAA");
         assert_eq!(&got[100..103], b"BBB");
         assert_eq!(got.len(), 200);
@@ -1048,14 +1146,18 @@ mod tests {
             watch: vec![],
             rule: vec![],
         };
-        let policy = Arc::new(PolicyEngine::new(
-            &config,
-            Arc::new(PromptClient::new(
-                PathBuf::from("/x.sock"),
-                Duration::from_millis(50),
-                0,
-            )),
-        ));
+        let policy = Arc::new(
+            PolicyEngine::new(
+                &config,
+                Arc::new(PromptClient::new(
+                    PathBuf::from("/x.sock"),
+                    Duration::from_millis(50),
+                    0,
+                )),
+                Arc::new(MemoryRuleStore::new()),
+            )
+            .unwrap(),
+        );
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
         let err = CredentialFs::new(
             PathBuf::from("/credential"),

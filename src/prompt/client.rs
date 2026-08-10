@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::config::DefaultAction;
@@ -15,6 +14,7 @@ use crate::policy::rule::Access;
 use crate::process::identify::ProcessInfo;
 use crate::prompt::protocol::{
     AgentRequest, AgentResponse, PROTOCOL_VERSION, ParentDesc, ProcessDesc, PromptOutcome,
+    read_json_line, write_json_line,
 };
 use crate::prompt::types::{UserChoice, default_choice};
 
@@ -113,18 +113,8 @@ impl PromptClient {
             }
 
             let (read_half, mut write_half) = stream.into_split();
-            let mut line = serde_json::to_vec(&req)?;
-            line.push(b'\n');
-            write_half.write_all(&line).await?;
-            write_half.flush().await?;
-
-            let mut reader = BufReader::new(read_half);
-            let mut buf = String::new();
-            reader.read_line(&mut buf).await?;
-            if buf.is_empty() {
-                anyhow::bail!("agent closed connection without responding");
-            }
-            let resp: AgentResponse = serde_json::from_str(buf.trim())?;
+            write_json_line(&mut write_half, &req).await?;
+            let resp: AgentResponse = read_json_line(read_half).await?;
             if resp.v != PROTOCOL_VERSION {
                 anyhow::bail!("agent protocol version {} != {PROTOCOL_VERSION}", resp.v);
             }

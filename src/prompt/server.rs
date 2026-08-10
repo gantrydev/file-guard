@@ -3,23 +3,59 @@
 //! returns the user's decision. Rendering is serialized so only one dialog is
 //! ever live (fixes concurrent-stdin / popup-storm races).
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::config::PromptMethod;
 use crate::prompt::gui::{self, GuiResult};
-use crate::prompt::protocol::{AgentRequest, AgentResponse, PROTOCOL_VERSION, PromptOutcome};
+use crate::prompt::protocol::{
+    AgentRequest, AgentResponse, PROTOCOL_VERSION, PromptOutcome, read_json_line, write_json_line,
+};
 use crate::prompt::types::UserChoice;
 use crate::prompt::{notification, terminal};
+
+struct RateLimiter {
+    max_per_window: usize,
+    window: Duration,
+    timestamps: tokio::sync::Mutex<VecDeque<Instant>>,
+}
+
+impl RateLimiter {
+    fn new(max_per_window: usize, window: Duration) -> Self {
+        Self {
+            max_per_window,
+            window,
+            timestamps: tokio::sync::Mutex::new(VecDeque::new()),
+        }
+    }
+
+    async fn allow(&self) -> bool {
+        let mut timestamps = self.timestamps.lock().await;
+        let now = Instant::now();
+        let cutoff = now - self.window;
+        while timestamps
+            .front()
+            .is_some_and(|timestamp| *timestamp <= cutoff)
+        {
+            timestamps.pop_front();
+        }
+        if timestamps.len() >= self.max_per_window {
+            return false;
+        }
+        timestamps.push_back(now);
+        true
+    }
+}
 
 pub struct PromptServer {
     method: PromptMethod,
     notify: bool,
     dialog_lock: tokio::sync::Mutex<()>,
+    rate_limiter: RateLimiter,
 }
 
 impl PromptServer {
@@ -28,6 +64,7 @@ impl PromptServer {
             method,
             notify,
             dialog_lock: tokio::sync::Mutex::new(()),
+            rate_limiter: RateLimiter::new(10, Duration::from_secs(60)),
         }
     }
 
@@ -46,7 +83,6 @@ impl PromptServer {
     }
 
     async fn handle_conn(&self, stream: UnixStream) -> anyhow::Result<()> {
-        // Only root (the daemon) or our own uid may ask us to prompt.
         let peer = stream.peer_cred()?.uid();
         let our_uid = unsafe { libc::getuid() };
         if peer != 0 && peer != our_uid {
@@ -54,12 +90,25 @@ impl PromptServer {
         }
 
         let (read_half, mut write_half) = stream.into_split();
-        let mut reader = BufReader::new(read_half);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-        let req: AgentRequest = serde_json::from_str(line.trim())?;
+        let req: AgentRequest =
+            tokio::time::timeout(Duration::from_secs(5), read_json_line(read_half))
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out reading prompt request"))??;
         if req.v != PROTOCOL_VERSION {
             anyhow::bail!("client protocol version {} != {PROTOCOL_VERSION}", req.v);
+        }
+
+        if !self.rate_limiter.allow().await {
+            tracing::warn!("prompt rate limit exceeded; returning no response");
+            return write_json_line(
+                &mut write_half,
+                &AgentResponse {
+                    v: PROTOCOL_VERSION,
+                    id: req.id,
+                    outcome: PromptOutcome::NoResponse,
+                },
+            )
+            .await;
         }
 
         let outcome = {
@@ -72,11 +121,7 @@ impl PromptServer {
             id: req.id,
             outcome,
         };
-        let mut bytes = serde_json::to_vec(&resp)?;
-        bytes.push(b'\n');
-        write_half.write_all(&bytes).await?;
-        write_half.flush().await?;
-        Ok(())
+        write_json_line(&mut write_half, &resp).await
     }
 
     async fn render(&self, req: &AgentRequest) -> PromptOutcome {
@@ -134,7 +179,10 @@ fn build_listener(socket: Option<PathBuf>) -> anyhow::Result<UnixListener> {
         return Ok(UnixListener::from_std(std_listener)?);
     }
 
-    let path = socket.unwrap_or_else(crate::config::agent_socket_path);
+    let path = match socket {
+        Some(path) => path,
+        None => crate::config::agent_socket_path()?,
+    };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -180,4 +228,70 @@ fn systemd_listener() -> anyhow::Result<Option<std::os::unix::net::UnixListener>
     const SD_LISTEN_FDS_START: i32 = 3;
     let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(SD_LISTEN_FDS_START) };
     Ok(Some(listener))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::rule::Access;
+    use crate::prompt::protocol::ProcessDesc;
+
+    fn request(version: u32) -> AgentRequest {
+        AgentRequest {
+            v: version,
+            id: 7,
+            access: Access::Read,
+            file: "/credential".into(),
+            process: ProcessDesc {
+                pid: 1,
+                binary_path: "/usr/bin/tool".into(),
+                binary_name: "tool".into(),
+                script: None,
+                code_signature: None,
+                parents: Vec::new(),
+            },
+            timeout_ms: 60_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn protocol_version_mismatch_returns_a_clear_error() {
+        let server = PromptServer::new(PromptMethod::LogOnly, false);
+        let (client, server_stream) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(async move { server.handle_conn(server_stream).await });
+        let (_, mut write_half) = client.into_split();
+        write_json_line(&mut write_half, &request(PROTOCOL_VERSION + 1))
+            .await
+            .unwrap();
+
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("protocol version"));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_returns_no_response_without_rendering() {
+        let server = PromptServer {
+            method: PromptMethod::LogOnly,
+            notify: false,
+            dialog_lock: tokio::sync::Mutex::new(()),
+            rate_limiter: RateLimiter::new(0, Duration::from_secs(60)),
+        };
+        let (client, server_stream) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(async move { server.handle_conn(server_stream).await });
+        let (read_half, mut write_half) = client.into_split();
+        write_json_line(&mut write_half, &request(PROTOCOL_VERSION))
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_millis(100),
+            read_json_line::<AgentResponse, _>(read_half),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(response.id, 7);
+        assert_eq!(response.outcome, PromptOutcome::NoResponse);
+        task.await.unwrap().unwrap();
+    }
 }

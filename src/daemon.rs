@@ -6,62 +6,93 @@ use crate::interceptor::{self, Interceptor, InterceptorArgs};
 use crate::logging::AccessLogger;
 use crate::policy::engine::PolicyEngine;
 use crate::prompt::PromptClient;
+use crate::rule_store::{RuleLease, RuleStore};
 use crate::store;
 
 pub struct Daemon {
     config: Config,
-    policy: Arc<PolicyEngine>,
+    policy: Option<Arc<PolicyEngine>>,
     logger: Arc<AccessLogger>,
     store: Arc<dyn store::BackingStore>,
     interceptor: Option<Box<dyn Interceptor>>,
+    control: Option<crate::control_api::ControlEndpoint>,
+    control_task: Option<tokio::task::JoinHandle<()>>,
+    guarded_uid: u32,
     rt_handle: tokio::runtime::Handle,
 }
 
 impl Daemon {
-    pub fn new(config: Config) -> anyhow::Result<Self> {
+    pub fn new(config: Config, rule_lease: Arc<RuleLease>) -> anyhow::Result<Self> {
+        let (guarded_uid, guarded_gid) = config::target_identity()?;
+        let control = crate::control_api::bind_listener(guarded_gid)?;
         let logger = Arc::new(AccessLogger::new(&config.settings.log_destination)?);
 
         // The daemon never renders prompts itself (it may have no tty/display);
         // it asks the user-session agent over a unix socket, falling back to
         // `default_action` if the agent is unreachable.
         let prompter = Arc::new(PromptClient::new(
-            config::agent_socket_path(),
+            config::agent_socket_path()?,
             Duration::from_secs(config.settings.prompt_timeout),
-            config::target_uid(),
+            guarded_uid,
         ));
 
-        let policy = Arc::new(PolicyEngine::new(&config, prompter));
+        let rule_store = Arc::new(RuleStore::open(rule_lease)?);
+        let policy = Arc::new(PolicyEngine::new(&config, prompter, rule_store)?);
         let store: Arc<dyn store::BackingStore> = Arc::from(store::create_store()?);
         let rt_handle = tokio::runtime::Handle::current();
 
         Ok(Self {
             config,
-            policy,
+            policy: Some(policy),
             logger,
             store,
             interceptor: None,
+            control: Some(control),
+            control_task: None,
+            guarded_uid,
             rt_handle,
         })
     }
 
     pub async fn start(&mut self) -> anyhow::Result<()> {
-        let watched = self.config.watched_paths();
+        let watched = self.config.watched_paths()?;
+        let control_listener = self
+            .control
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("control endpoint is unavailable"))?
+            .take_listener()?;
 
         let args = InterceptorArgs {
             watched_paths: watched.clone(),
-            policy: Arc::clone(&self.policy),
+            policy: Arc::clone(
+                self.policy
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("policy engine is unavailable"))?,
+            ),
             logger: Arc::clone(&self.logger),
             store: Arc::clone(&self.store),
             rt_handle: self.rt_handle.clone(),
             restore_on_stop: self.config.settings.restore_on_stop,
         };
 
-        let mut interceptor = interceptor::create_interceptor(args)?;
+        let mut interceptor = match interceptor::create_interceptor(args) {
+            Ok(interceptor) => interceptor,
+            Err(error) => return Err(error),
+        };
         if let Err(error) = start_and_publish(interceptor.as_mut(), write_pid_file) {
             remove_pid_file();
             return Err(error);
         }
         self.interceptor = Some(interceptor);
+        let policy = Arc::clone(
+            self.policy
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("policy engine is unavailable"))?,
+        );
+        let guarded_uid = self.guarded_uid;
+        self.control_task = Some(tokio::spawn(async move {
+            crate::control_api::serve(control_listener, policy, guarded_uid).await;
+        }));
         if let Err(e) = publish_config_pointer() {
             // Non-fatal: the daemon still runs; only CLI auto-discovery degrades.
             tracing::warn!("failed to publish config pointer: {e}");
@@ -76,11 +107,19 @@ impl Daemon {
 
     pub async fn stop(&mut self) -> anyhow::Result<()> {
         notify_systemd_stopping();
-        if let Some(mut interceptor) = self.interceptor.take() {
-            interceptor.stop()?;
+        if let Some(task) = self.control_task.take() {
+            task.abort();
+            let _ = task.await;
         }
+        let stop_result = match self.interceptor.take() {
+            Some(mut interceptor) => interceptor.stop(),
+            None => Ok(()),
+        };
+        drop(self.control.take());
+        drop(self.policy.take());
         remove_pid_file();
         remove_config_pointer();
+        stop_result?;
         tracing::info!("file-guard stopped");
 
         Ok(())
@@ -105,7 +144,7 @@ fn start_and_publish(
 
 /// Record this process's PID so `file-guard stop`/`status` can find it.
 fn write_pid_file() -> anyhow::Result<()> {
-    let path = config::pid_file_path();
+    let path = config::pid_file_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -116,7 +155,13 @@ fn write_pid_file() -> anyhow::Result<()> {
 }
 
 fn remove_pid_file() {
-    let path = config::pid_file_path();
+    let path = match config::pid_file_path() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!("cannot resolve PID file for cleanup: {error}");
+            return;
+        }
+    };
     if let Err(e) = std::fs::remove_file(&path)
         && e.kind() != std::io::ErrorKind::NotFound
     {
@@ -131,9 +176,7 @@ fn publish_config_pointer() -> anyhow::Result<()> {
     if let Some(parent) = pointer.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&pointer, format!("{}\n", config::config_path().display()))?;
-    // World-readable: it holds only a path, and the guarded (non-root) user
-    // must read it to locate the daemon's config.
+    std::fs::write(&pointer, format!("{}\n", config::config_path()?.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -168,6 +211,22 @@ fn send_systemd_notification(state: &[u8]) {
     let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") else {
         return;
     };
+
+    if socket_path.contains('\0') {
+        tracing::warn!("NOTIFY_SOCKET contains NUL byte, ignoring");
+        return;
+    }
+    if !socket_path.starts_with('/') && !socket_path.starts_with('@') {
+        tracing::warn!(
+            "NOTIFY_SOCKET must be absolute or abstract, ignoring: {}",
+            socket_path
+        );
+        return;
+    }
+    if socket_path.len() > 256 {
+        tracing::warn!("NOTIFY_SOCKET path is too long, ignoring");
+        return;
+    }
 
     if let Err(error) = send_systemd_notification_to(&socket_path, state) {
         tracing::warn!("systemd notification failed: {error}");
