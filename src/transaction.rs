@@ -1,3 +1,34 @@
+//! Crash-safe transactional state machine for credential file lifecycle.
+//!
+//! Every guarded file passes through a 14-phase state machine tracked in the
+//! SQLite backing store. Each phase is a [`TransitionPoint`] variant; progress
+//! is recorded via compare-and-swap commits so a crash at any point can be
+//! recovered on the next daemon start.
+//!
+//! # Phases (high-level)
+//!
+//! ```text
+//! Captured ──▶ InstallIntent ──▶ Installed ──▶ MountIntent ──▶ (mounted)
+//!                                                     │
+//!                  ┌──────────────────────────────────┘
+//!                  ▼
+//!            UnmountIntent ──▶ (unmounted, file restored or left installed)
+//!                  │
+//!     ┌────────────┼────────────┐
+//!     ▼            ▼            ▼
+//!  StoreIntent  RestoreIntent DeleteIntent
+//!     │            │            │
+//!     ▼            ▼            ▼
+//!   Stored      Restored     (deleted)
+//! ```
+//!
+//! See [`docs/storage-v2.md`] for the design rationale and the full phase
+//! table with invariants.
+//!
+//! [`TransactionManager`] is the public API: it loads the current lifecycle
+//! state, applies transitions via the provided methods, and commits each step
+//! atomically through the [`BackingStore`].
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

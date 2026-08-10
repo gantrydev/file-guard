@@ -1,8 +1,5 @@
 use std::path::PathBuf;
 
-#[cfg(target_os = "macos")]
-use super::macos as platform;
-
 #[cfg(target_os = "linux")]
 use super::linux as platform;
 
@@ -20,7 +17,6 @@ pub struct ProcessInfo {
     /// and argv-derived (forgeable), so it is defense-in-depth, not a boundary.
     pub script: Option<PathBuf>,
     pub parent_chain: Vec<ParentProcess>,
-    pub code_signature: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,20 +34,17 @@ pub fn identify(pid: u32) -> anyhow::Result<ProcessInfo> {
         .unwrap_or_else(|| format!("pid:{pid}"));
     let start_time = platform::start_time(pid)?;
     let script = interpreter_script(pid, &binary_name);
-    let code_signature = platform::code_signature(pid);
-
     Ok(ProcessInfo {
         pid,
         start_time,
         binary_path,
         binary_name,
         script,
-        // Left empty on the access hot path: walking the parent chain scans the
-        // whole process table (`sysinfo::System::new_all`) and is only needed to
-        // *display* a prompt, so it's filled lazily by the prompt client (see
-        // `PromptClient`) rather than on every open a rule already decides.
+        // Left empty on the access hot path: walking the parent chain reads
+        // /proc per hop and is only needed to *display* a prompt, so it's
+        // filled lazily by the prompt client (see `PromptClient`) rather than
+        // on every open a rule already decides.
         parent_chain: Vec::new(),
-        code_signature,
     })
 }
 
@@ -122,30 +115,20 @@ fn canonical_file(path: &str) -> Option<PathBuf> {
     }
 }
 
-/// Walk the parent PID chain up to launchd.
+/// Walk the parent PID chain (up to 16 hops) by reading `/proc/<pid>/stat`
+/// and `/proc/<pid>/exe` per hop, avoiding a full process-table scan.
 pub fn parent_chain(pid: u32) -> Vec<ParentProcess> {
-    let sys = sysinfo::System::new_all();
     let mut chain = Vec::new();
-    let mut current = sysinfo::Pid::from_u32(pid);
+    let mut current = pid;
 
     for _ in 0..16 {
-        let Some(proc_info) = sys.process(current) else {
+        let Some((ppid, name, binary_path)) = platform::parent_info(current) else {
             break;
         };
-        let Some(ppid) = proc_info.parent() else {
-            break;
-        };
-        if ppid.as_u32() == 0 {
-            break;
-        }
-
-        let parent = sys.process(ppid);
         chain.push(ParentProcess {
-            pid: ppid.as_u32(),
-            name: parent
-                .map(|p| p.name().to_string_lossy().to_string())
-                .unwrap_or_default(),
-            binary_path: parent.and_then(|p| p.exe().map(|e| e.to_path_buf())),
+            pid: ppid,
+            name,
+            binary_path,
         });
         current = ppid;
     }

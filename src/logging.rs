@@ -111,7 +111,6 @@ impl AccessLogger {
 /// Append one NDJSON entry under an exclusive lock so concurrent daemon threads
 /// don't interleave partial lines.
 fn append_entry(path: &Path, entry: &AccessLogEntry) -> anyhow::Result<()> {
-    use fs2::FileExt;
     use std::io::Write;
 
     let line = serde_json::to_string(entry)?;
@@ -119,12 +118,12 @@ fn append_entry(path: &Path, entry: &AccessLogEntry) -> anyhow::Result<()> {
         .create(true)
         .append(true)
         .open(path)?;
-    file.lock_exclusive()?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)?;
     let mut writer = std::io::BufWriter::new(&file);
     writeln!(writer, "{line}")?;
     writer.flush()?;
     drop(writer);
-    file.unlock()?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock)?;
     Ok(())
 }
 

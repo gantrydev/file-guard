@@ -1,6 +1,6 @@
 [package]
 name = "file-guard"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2024"
 description = "Per-process credential access control daemon for Linux (FUSE)"
 license = "MIT"
@@ -66,9 +66,6 @@ chrono = { version = "0.4", features = ["serde"] }
 # Path expansion
 dirs = "6.0"
 
-# Process info
-sysinfo = "0.39"
-
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
@@ -76,11 +73,10 @@ thiserror = "2.0"
 # Log serialization
 serde_json = "1.0"
 
-# File locking for config append
-fs2 = "0.4"
-
 # Platform FFI
 libc = "0.2"
+
+# File locking (config, log) via rustix::fs::flock
 rustix = { version = "1.1.4", features = ["event", "fs", "process"] }
 
 # Atomic snapshot journal
@@ -95,3 +91,5 @@ toml_edit = "0.25"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = "0.17"
+# /proc filesystem reader (process info without whole-table scan)
+procfs = "0.17"

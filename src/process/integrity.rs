@@ -3,14 +3,24 @@
 //! Persistent "always" rules pin the calling binary's sha256 so a replaced
 //! binary re-prompts instead of inheriting a prior grant. Hashing sits on the
 //! access hot path, so results are cached.
+//!
+//! The cache is bounded: once it reaches `MAX_CACHE_ENTRIES` the entire cache
+//! is flushed. On a long-running daemon with Nix or similar (where every
+//! package upgrade produces a new /nix/store path), this prevents unbounded
+//! growth. Session grants are lost on restart anyway, so re-hashing is
+//! acceptable.
 
 use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
+
+/// Maximum number of cached hashes before the entire cache is flushed. See
+/// module-level docs for rationale.
+const MAX_CACHE_ENTRIES: usize = 1000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Stamp {
@@ -50,7 +60,8 @@ impl Stamp {
 }
 
 fn cache() -> &'static Mutex<HashMap<PathBuf, (Stamp, String)>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (Stamp, String)>>> = OnceLock::new();
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<PathBuf, (Stamp, String)>>> =
+        std::sync::OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -83,6 +94,9 @@ pub fn hash_file(path: &Path) -> anyhow::Result<String> {
     }
     let mut cache = cache().lock().unwrap();
     if after.cacheable() {
+        if cache.len() >= MAX_CACHE_ENTRIES {
+            cache.clear();
+        }
         cache.insert(path.to_path_buf(), (after, hash.clone()));
     } else {
         cache.remove(path);

@@ -9,16 +9,15 @@ mod process;
 mod prompt;
 mod secure_file;
 mod store;
+#[cfg(test)]
+mod testing;
 mod transaction;
-
-#[cfg(target_os = "macos")]
-mod es;
 
 #[cfg(target_os = "linux")]
 mod fuse_fs;
 
 use clap::Parser;
-use cli::{Cli, Command, RulesAction};
+use cli::{Cli, Command, RuleAction, RulesAction};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -52,17 +51,19 @@ async fn main() -> anyhow::Result<()> {
 
             d.stop().await?;
         }
-        Command::Agent { socket, method } => {
+        Command::Agent {
+            socket,
+            method,
+            notify,
+        } => {
             // CLI flag wins; else the config's prompt_method; else GUI.
+            let config = config::Config::load().ok();
             let method = method
-                .or_else(|| {
-                    config::Config::load()
-                        .ok()
-                        .map(|c| c.settings.prompt_method)
-                })
+                .or_else(|| config.as_ref().map(|c| c.settings.prompt_method))
                 .unwrap_or(config::PromptMethod::Gui);
+            let notify = notify || config.as_ref().map(|c| c.settings.notify).unwrap_or(false);
             tracing::info!("starting file-guard agent");
-            prompt::run_agent(method, socket).await?;
+            prompt::run_agent(method, notify, socket).await?;
         }
         Command::Stop => {
             control::stop()?;
@@ -127,12 +128,86 @@ async fn main() -> anyhow::Result<()> {
                     script: None,
                     script_sha256: None,
                 };
-                config::Config::append_rule(&entry)?;
-                println!("added rule: {} → {}", binary.display(), file);
+                if config::Config::append_rule(&entry)? {
+                    println!("added rule: {} → {}", binary.display(), file);
+                } else {
+                    println!("rule already exists: {} → {}", binary.display(), file);
+                }
             }
             Some(RulesAction::Remove { index }) => {
                 let (binary, file) = config::Config::remove_rule_at(index)?;
                 println!("removed rule {index}: {binary} → {file}");
+            }
+            Some(RulesAction::Edit {
+                index,
+                action,
+                access,
+                repin,
+                no_pin,
+            }) => {
+                let (binary, file) = config::Config::edit_rule_at(
+                    index,
+                    action.map(|a| match a {
+                        RuleAction::Allow => config::RuleAction::Allow,
+                        RuleAction::Deny => config::RuleAction::Deny,
+                    }),
+                    access,
+                    repin,
+                    no_pin,
+                )?;
+                println!("edited rule {index}: {binary} → {file}");
+            }
+            Some(RulesAction::Find {
+                file,
+                binary,
+                action,
+            }) => {
+                let config = config::Config::load()?;
+                for (i, rule) in config.rule.iter().enumerate() {
+                    let matches_file = file.as_ref().is_none_or(|f| rule.file.contains(f));
+                    let matches_binary = binary.as_ref().is_none_or(|b| rule.binary.contains(b));
+                    let matches_action = action.is_none_or(|a| {
+                        let want = match a {
+                            RuleAction::Allow => config::RuleAction::Allow,
+                            RuleAction::Deny => config::RuleAction::Deny,
+                        };
+                        rule.action == want
+                    });
+                    if matches_file && matches_binary && matches_action {
+                        let pinned = if rule.sha256.is_some() || rule.script_sha256.is_some() {
+                            " (pinned)"
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "{i:>3}  {action:>5} {access:<6} {binary}  →  {file}{pinned}",
+                            action = match rule.action {
+                                config::RuleAction::Allow => "allow",
+                                config::RuleAction::Deny => "deny",
+                            },
+                            access = rule.access.verb(),
+                            binary = rule.binary,
+                            file = rule.file,
+                        );
+                    }
+                }
+            }
+            Some(RulesAction::Export) => {
+                let rules_toml = config::Config::export_rules()?;
+                if rules_toml.is_empty() {
+                    println!("# no rules configured");
+                } else {
+                    print!("{rules_toml}");
+                }
+            }
+            Some(RulesAction::Import) => {
+                use std::io::Read;
+                let mut stdin = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut stdin)
+                    .map_err(|e| anyhow::anyhow!("reading stdin: {e}"))?;
+                let added = config::Config::import_rules(&stdin)?;
+                println!("imported {added} rule(s)");
             }
         },
         Command::Store { file } => {

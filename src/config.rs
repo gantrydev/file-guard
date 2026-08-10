@@ -1,5 +1,5 @@
 use crate::policy::rule::Access;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -12,7 +12,7 @@ pub struct Config {
     pub rule: Vec<RuleEntry>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct Settings {
     #[serde(default)]
     pub default_action: DefaultAction,
@@ -20,10 +20,64 @@ pub struct Settings {
     pub prompt_timeout: u64,
     #[serde(default)]
     pub prompt_method: PromptMethod,
+    /// Fire a desktop notification alongside every prompt, even for
+    /// `log_only` (which otherwise has no visible feedback). On Linux
+    /// this calls `notify-send` from the user's session agent.
+    pub notify: bool,
     #[serde(default)]
     pub restore_on_stop: bool,
     #[serde(default = "default_log_dest")]
     pub log_destination: String,
+}
+
+#[derive(Deserialize)]
+struct SettingsInput {
+    #[serde(default)]
+    default_action: DefaultAction,
+    #[serde(default = "default_timeout")]
+    prompt_timeout: u64,
+    #[serde(default)]
+    prompt_method: PromptMethodInput,
+    #[serde(default)]
+    notify: Option<bool>,
+    #[serde(default)]
+    restore_on_stop: bool,
+    #[serde(default = "default_log_dest")]
+    log_destination: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PromptMethodInput {
+    #[default]
+    Terminal,
+    Gui,
+    LogOnly,
+    Notification,
+}
+
+impl<'de> Deserialize<'de> for Settings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let input = SettingsInput::deserialize(deserializer)?;
+        let legacy_notification = matches!(input.prompt_method, PromptMethodInput::Notification);
+        let prompt_method = match input.prompt_method {
+            PromptMethodInput::Terminal => PromptMethod::Terminal,
+            PromptMethodInput::Gui => PromptMethod::Gui,
+            PromptMethodInput::LogOnly | PromptMethodInput::Notification => PromptMethod::LogOnly,
+        };
+
+        Ok(Self {
+            default_action: input.default_action,
+            prompt_timeout: input.prompt_timeout,
+            prompt_method,
+            notify: input.notify.unwrap_or(legacy_notification),
+            restore_on_stop: input.restore_on_stop,
+            log_destination: input.log_destination,
+        })
+    }
 }
 
 fn default_timeout() -> u64 {
@@ -43,12 +97,15 @@ pub enum DefaultAction {
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum PromptMethod {
     #[default]
     Terminal,
     Gui,
-    Notification,
+    /// Log-only: no interactive prompt. Falls back to `default_action` after
+    /// the configured prompt timeout. If `notify` is set, a desktop
+    /// notification is also fired.
+    LogOnly,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -60,7 +117,7 @@ pub struct WatchEntry {
     pub default_action: Option<DefaultAction>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct RuleEntry {
     pub file: String,
     pub binary: String,
@@ -72,7 +129,8 @@ pub struct RuleEntry {
     /// sha256 of the binary when the rule was captured (binary-identity pin).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
-    /// macOS code-signing identity captured with the rule.
+    /// Legacy field retained so older rule files continue to round-trip.
+    /// Ignored by the Linux policy engine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     /// For interpreter rules, the pinned script path (narrows the interpreter
@@ -94,6 +152,12 @@ fn access_is_read(access: &Access) -> bool {
 pub enum RuleAction {
     Allow,
     Deny,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RulesDocument {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rule: Vec<RuleEntry>,
 }
 
 impl Config {
@@ -119,37 +183,70 @@ impl Config {
         Ok(config)
     }
 
-    /// Append a new rule to the config file on disk.
-    pub fn append_rule(entry: &RuleEntry) -> anyhow::Result<()> {
-        use fs2::FileExt;
-        use std::io::Write;
-
-        let path = config_path();
-        let file = std::fs::OpenOptions::new().append(true).open(&path)?;
-        file.lock_exclusive()?;
-
-        let rule_toml = toml::to_string(entry)?;
-        let mut writer = std::io::BufWriter::new(&file);
-        writeln!(writer, "\n[[rule]]")?;
-        write!(writer, "{rule_toml}")?;
-
-        file.unlock()?;
-        Ok(())
+    /// Append a new rule to the config file on disk. Returns `false` when the
+    /// complete rule, including all identity pins, already exists.
+    pub fn append_rule(entry: &RuleEntry) -> anyhow::Result<bool> {
+        Self::append_rule_to(&config_path(), entry)
     }
 
-    /// Remove the `[[rule]]` at `index` (0-based, matching `rule` order) from the
-    /// config file, preserving the rest of the file's comments and formatting.
-    /// Returns the removed entry's `(binary, file)` for reporting.
-    pub fn remove_rule_at(index: usize) -> anyhow::Result<(String, String)> {
-        use fs2::FileExt;
+    fn append_rule_to(path: &Path, entry: &RuleEntry) -> anyhow::Result<bool> {
+        use std::io::{Read, Write};
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(path)?;
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)?;
+
+        let mut current = String::new();
+        file.read_to_string(&mut current)?;
+        let config = parse_live_config(&current)
+            .map_err(|e| anyhow::anyhow!("config at {} is invalid: {e}", path.display()))?;
+        if config.rule.iter().any(|rule| rule == entry) {
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock)?;
+            return Ok(false);
+        }
+
+        let rule_toml = toml::to_string(entry)?;
+        let block = format!("\n[[rule]]\n{rule_toml}");
+        file.write_all(block.as_bytes())?;
+        file.flush()?;
+
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock)?;
+        Ok(true)
+    }
+
+    /// Edit the rule at `index` in-place, preserving comments and formatting.
+    /// Only the provided fields are changed; others keep their current values.
+    pub fn edit_rule_at(
+        index: usize,
+        action: Option<RuleAction>,
+        access: Option<crate::policy::rule::Access>,
+        repin: bool,
+        no_pin: bool,
+    ) -> anyhow::Result<(String, String)> {
+        Self::edit_rule_at_path(&config_path(), index, action, access, repin, no_pin)
+    }
+
+    fn edit_rule_at_path(
+        path: &Path,
+        index: usize,
+        action: Option<RuleAction>,
+        access: Option<Access>,
+        repin: bool,
+        no_pin: bool,
+    ) -> anyhow::Result<(String, String)> {
         use std::io::{Seek, Write};
 
-        let path = config_path();
+        if repin && no_pin {
+            anyhow::bail!("--repin conflicts with --no-pin");
+        }
+
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&path)?;
-        file.lock_exclusive()?;
+            .open(path)?;
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)?;
 
         let mut contents = String::new();
         std::io::Read::read_to_string(&mut file, &mut contents)?;
@@ -168,7 +265,111 @@ impl Config {
             );
         }
 
-        let removed = rules.get(index).unwrap();
+        let rule = rules
+            .get_mut(index)
+            .expect("rule must exist after bounds check");
+        let report = (
+            rule.get("binary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string(),
+            rule.get("file")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string(),
+        );
+
+        if let Some(a) = action {
+            let val = match a {
+                RuleAction::Allow => "allow",
+                RuleAction::Deny => "deny",
+            };
+            rule.insert("action", toml_edit::value(val));
+        }
+        if let Some(a) = access {
+            let value = match a {
+                Access::Read => "read",
+                Access::Write => "write",
+                Access::Any => "any",
+            };
+            rule.insert("access", toml_edit::value(value));
+        }
+        if no_pin {
+            rule.remove("sha256");
+            rule.remove("script_sha256");
+        }
+        if repin {
+            let binary = PathBuf::from(&report.0);
+            let hash = crate::process::integrity::hash_file(&binary)
+                .map_err(|e| anyhow::anyhow!("cannot re-pin {}: {e}", binary.display()))?;
+            rule.insert("sha256", toml_edit::value(hash));
+        }
+
+        let rendered = doc.to_string();
+        file.set_len(0)?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        file.write_all(rendered.as_bytes())?;
+
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock)?;
+        Ok(report)
+    }
+
+    /// Export all `[[rule]]` entries as TOML to stdout.
+    pub fn export_rules() -> anyhow::Result<String> {
+        let config = Config::load()?;
+        Ok(toml::to_string(&RulesDocument { rule: config.rule })?)
+    }
+
+    /// Import `[[rule]]` entries from a TOML string, skipping any that already
+    /// exist. Returns the count of newly added rules.
+    pub fn import_rules(toml_str: &str) -> anyhow::Result<usize> {
+        Self::import_rules_to(&config_path(), toml_str)
+    }
+
+    fn import_rules_to(path: &Path, toml_str: &str) -> anyhow::Result<usize> {
+        let incoming: RulesDocument = toml::from_str(toml_str)?;
+        let mut added = 0usize;
+        for rule in &incoming.rule {
+            if Config::append_rule_to(path, rule)? {
+                added += 1;
+            }
+        }
+        Ok(added)
+    }
+
+    /// Remove the `[[rule]]` at `index` (0-based, matching `rule` order) from the
+    /// config file, preserving the rest of the file's comments and formatting.
+    /// Returns the removed entry's `(binary, file)` for reporting.
+    pub fn remove_rule_at(index: usize) -> anyhow::Result<(String, String)> {
+        use std::io::{Seek, Write};
+
+        let path = config_path();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)?;
+
+        let mut contents = String::new();
+        std::io::Read::read_to_string(&mut file, &mut contents)?;
+        let mut doc = contents.parse::<toml_edit::DocumentMut>()?;
+
+        let rules = doc
+            .get_mut("rule")
+            .and_then(|i| i.as_array_of_tables_mut())
+            .ok_or_else(|| anyhow::anyhow!("no [[rule]] entries in {}", path.display()))?;
+
+        if index >= rules.len() {
+            anyhow::bail!(
+                "rule index {} out of range (have {} rule(s))",
+                index,
+                rules.len()
+            );
+        }
+
+        let removed = rules
+            .get(index)
+            .expect("rule must exist after bounds check");
         let report = (
             removed
                 .get("binary")
@@ -188,7 +389,7 @@ impl Config {
         file.seek(std::io::SeekFrom::Start(0))?;
         file.write_all(rendered.as_bytes())?;
 
-        file.unlock()?;
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock)?;
         Ok(report)
     }
 
@@ -477,6 +678,29 @@ pub fn agent_socket_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_config() -> PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        std::env::temp_dir().join(format!(
+            "file-guard-config-{}-{}.toml",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn pinned_rule(hash: &str) -> RuleEntry {
+        RuleEntry {
+            file: "/home/a/.config/x".into(),
+            binary: "/usr/bin/x".into(),
+            action: RuleAction::Allow,
+            access: Access::Any,
+            sha256: Some(hash.into()),
+            signature: None,
+            script: None,
+            script_sha256: None,
+        }
+    }
 
     #[test]
     fn parses_settings_watch_rule() {
@@ -512,6 +736,38 @@ default_action = "deny"
 
         assert!(config.watch.is_empty());
         assert!(config.rule.is_empty());
+    }
+
+    #[test]
+    fn legacy_notification_method_keeps_notifications_enabled() {
+        let config: Config = toml::from_str(
+            r#"
+[settings]
+prompt_method = "notification"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.settings.prompt_method, PromptMethod::LogOnly);
+        assert!(config.settings.notify);
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("prompt_method = \"log_only\""));
+        assert!(serialized.contains("notify = true"));
+    }
+
+    #[test]
+    fn log_only_defaults_to_no_desktop_notification() {
+        let config: Config = toml::from_str(
+            r#"
+[settings]
+prompt_method = "log_only"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.settings.prompt_method, PromptMethod::LogOnly);
+        assert!(!config.settings.notify);
     }
 
     #[test]
@@ -567,6 +823,7 @@ default_action = "deny"
                 default_action: DefaultAction::Deny,
                 prompt_timeout: default_timeout(),
                 prompt_method: PromptMethod::Gui,
+                notify: false,
                 restore_on_stop: true,
                 log_destination: default_log_dest(),
             },
@@ -662,5 +919,83 @@ action = "allow"
         let back: RuleEntry = toml::from_str(&serialized).unwrap();
         assert_eq!(back.access, Access::Write);
         assert_eq!(back.sha256.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn append_rule_deduplicates_complete_identity_only() {
+        let path = temp_config();
+        std::fs::write(&path, "[settings]\n").unwrap();
+        let first = pinned_rule("first");
+        let replacement = pinned_rule("replacement");
+
+        assert!(Config::append_rule_to(&path, &first).unwrap());
+        assert!(!Config::append_rule_to(&path, &first).unwrap());
+        assert!(Config::append_rule_to(&path, &replacement).unwrap());
+
+        let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.rule, vec![first, replacement]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn exported_rules_import_without_settings() {
+        let path = temp_config();
+        std::fs::write(&path, "[settings]\n").unwrap();
+        let rule = pinned_rule("hash");
+        let exported = toml::to_string(&RulesDocument {
+            rule: vec![rule.clone()],
+        })
+        .unwrap();
+
+        assert!(!exported.contains("[settings]"));
+        assert_eq!(Config::import_rules_to(&path, &exported).unwrap(), 1);
+        assert_eq!(Config::import_rules_to(&path, &exported).unwrap(), 0);
+
+        let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.rule, vec![rule]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn edit_rule_serializes_any_access() {
+        let path = temp_config();
+        std::fs::write(
+            &path,
+            "[settings]\n[[rule]]\nfile = \"/tmp/credential\"\n\
+             binary = \"/usr/bin/tool\"\naction = \"allow\"\n",
+        )
+        .unwrap();
+
+        Config::edit_rule_at_path(&path, 0, None, Some(Access::Any), false, false).unwrap();
+
+        let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.rule[0].access, Access::Any);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn edit_rule_repins_selected_binary_under_lock() {
+        let path = temp_config();
+        let binary = path.with_extension("bin");
+        std::fs::write(&binary, b"binary contents").unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "[settings]\n[[rule]]\nfile = \"/tmp/credential\"\n\
+                 binary = \"{}\"\naction = \"allow\"\n",
+                binary.display()
+            ),
+        )
+        .unwrap();
+
+        Config::edit_rule_at_path(&path, 0, None, None, true, false).unwrap();
+
+        let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            config.rule[0].sha256,
+            Some(crate::process::integrity::hash_file(&binary).unwrap())
+        );
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(binary).unwrap();
     }
 }

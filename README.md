@@ -17,8 +17,7 @@ processes **you've authorized** read *and write* them; everything else is denied
 (or prompted).
 
 > [!WARNING]
-> **Status: early / Linux-only.** The macOS Endpoint Security backend is not
-> built (see [macOS](#macos)), and the Linux protection only holds in the
+> **Status: early / Linux-only.** The protection only holds in the
 > **privileged (root) deployment** described below. Read
 > [Security model & limitations](#security-model--limitations) before relying on
 > it.
@@ -43,16 +42,13 @@ contents; authorized writes are buffered and persisted back to the store on
 close. Consuming tools need no reconfiguration: the path they read/write is
 unchanged.
 
-(A macOS Endpoint Security backend exists in-tree but is not built - see
-[macOS](#macos).)
-
 ### Identity: pinned by content hash
 
 A transient grant ("allow once / this session") is bound to the **exact process
 instance** (pid + start time), so a recycled PID can't inherit it. A permanent
-"allow always" rule **pins the binary's sha256** (and, on macOS, its code
-signature); for an interpreter it also pins the **entry script's path and
-content hash**, so "python running gcloud" doesn't bless other scripts and an
+"allow always" rule **pins the binary's sha256**; for an interpreter it also
+pins the **entry script's path and content hash**, so "python running gcloud"
+doesn't bless other scripts and an
 in-place edit of the script re-prompts. If a pinned binary or script later
 changes - a package upgrade, or malware swapped in its place - the pin no longer
 matches and file-guard **re-prompts** rather than silently honoring the old
@@ -64,7 +60,8 @@ just re-authorizes.)
 The root daemon has no terminal or display, so it doesn't draw prompts itself -
 it asks a small **session agent** (`file-guard agent`) running as you, over a
 unix socket. The agent renders the prompt (GUI via `zenity`/`kdialog`, a terminal
-fallback, or a desktop notification) and returns your choice. If the agent is
+fallback) and returns your choice. It can also send a desktop notification
+alongside any prompt. If the agent is
 unreachable, the daemon applies `default_action` (deny by default) - it never
 blocks. See [the agent socket note](#security-model--limitations) for why the
 socket is root-anchored.
@@ -182,6 +179,7 @@ services.file-guard = {
   user = "alice";
   configFile = "/etc/file-guard/config.toml";
   promptMethod = "gui";                       # default: "gui"
+  notify = true;                               # optional desktop heads-up
   agentEnvironment = {                        # so dialogs reach alice's display
     DISPLAY = ":0";
     XAUTHORITY = "/home/alice/.Xauthority";
@@ -192,9 +190,10 @@ services.file-guard = {
 
 The agent's socket is created by **root** (systemd socket activation) in a
 root-owned directory, so a same-uid attacker can neither hijack the socket name
-nor connect to it. With `promptMethod = "notification"`, prompts are
-informational only and unknown accesses deny on timeout - define explicit
-`[[rule]]`s for that mode.
+nor connect to it. With `promptMethod = "log-only"`, prompts are non-interactive
+and unknown accesses use `default_action` on timeout. Set `notify = true` for an
+informational desktop notification in that mode. The old `"notification"`
+value remains a compatibility alias for this combination.
 
 To try the GUI prompt path by hand, run the agent in your graphical session and
 point the root development daemon at the same socket and private store:
@@ -264,8 +263,7 @@ Known limitations - read before relying on this:
   directory (mode `0755`); the socket itself is mode `0600`. The only unhardened path is the dev-only
   `file-guard agent` self-bind in `$XDG_RUNTIME_DIR`, which warns loudly and is
   for testing, not protection.
-- **Linux only.** The macOS Endpoint Security path is not built - see
-  [macOS](#macos).
+- **Linux only.** FUSE and `/proc` are required.
 - **Identity = binary hash (+ script path & content hash for interpreters); a
   trusted tool's own deps are still inside the boundary.** A rule pins the
   caller's binary sha256, and for interpreters (python/node/…) also the **script
@@ -284,7 +282,8 @@ Known limitations - read before relying on this:
   clobbered; point the watch at the real file.
 - **GUI needs a session.** Under systemd, GUI prompts only appear if the agent is
   given the user's display env (`agentEnvironment`); otherwise it falls back to
-  notification/terminal and unknown accesses deny on timeout.
+  the terminal and unknown accesses deny on timeout. Optional notifications also
+  require a working desktop session bus.
 - **Writes are last-writer-wins.** Concurrent write handles to the same file
   don't merge; the last one to close persists its buffer. Fine for the
   single-writer credential-file case.
@@ -321,16 +320,6 @@ cargo test
 ```
 
 CI runs the above on Linux for every push/PR.
-
-## macOS
-
-A macOS Endpoint Security backend exists in the tree (`src/es.rs`,
-`src/process/macos.rs`) but is not built: it is excluded from the flake/CI and is
-not wired to the current policy/agent. Finishing it needs the `es_message_t`
-layout fix and the `start_time` offset fix, and - to run at all - an Endpoint
-Security entitlement from Apple plus a signed, notarized binary running as root.
-The policy, rules, identity pinning, and prompt agent are already
-cross-platform, so the macOS work is wiring up enforcement, not a rewrite.
 
 ## License
 

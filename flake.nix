@@ -1,5 +1,5 @@
 {
-  description = "file-guard - per-process credential access control (macOS Endpoint Security / Linux FUSE)";
+  description = "file-guard - per-process credential access control for Linux";
 
   # Single input on purpose: a credential-guarding tool should keep its own
   # supply chain minimal.
@@ -8,17 +8,12 @@
   outputs = { self, nixpkgs }:
     let
       lib = nixpkgs.lib;
-      # Linux only. The macOS (Endpoint Security) backend is not built - see
-      # README "macOS".
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = f: lib.genAttrs systems (system: f system (import nixpkgs { inherit system; }));
       version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
     in
     {
       # ── Package (Linux) ───────────────────────────────────────────────────
-      # macOS needs the EndpointSecurity entitlement + a signed binary + root,
-      # which can't be produced in the Nix sandbox - build it manually there
-      # (see README). The flake ships the Linux/FUSE build.
       packages = forAllSystems (system: pkgs:
         lib.optionalAttrs pkgs.stdenv.isLinux (
           let
@@ -72,6 +67,8 @@
           inherit (lib) mkEnableOption mkOption mkIf types mapAttrsToList;
           cfg = config.services.file-guard;
           socketPath = "/run/file-guard/agent.sock";
+          agentMethod = if cfg.promptMethod == "notification" then "log-only" else cfg.promptMethod;
+          agentNotify = cfg.notify || cfg.promptMethod == "notification";
         in
         {
           options.services.file-guard = {
@@ -131,14 +128,24 @@
             };
 
             promptMethod = mkOption {
-              type = types.enum [ "terminal" "gui" "notification" ];
+              type = types.enum [ "terminal" "gui" "log-only" "notification" ];
               default = "gui";
               description = ''
                 How the session agent renders prompts. `gui` works out of the
                 box on a single-user graphical session (zenity is bundled via
-                `guiPackages` and the session env is filled from `uid`). If no
-                display is reachable it falls back and unknown accesses deny on
-                timeout, so `default_action = "deny"` stays safe headless.
+                `guiPackages` and the session env is filled from `uid`).
+                `log-only` skips interaction and applies `default_action` after
+                the timeout. `notification` is retained as a compatibility
+                alias for `log-only` with `notify = true`.
+              '';
+            };
+
+            notify = mkOption {
+              type = types.bool;
+              default = false;
+              description = ''
+                Send a desktop notification alongside every prompt, including
+                `log-only` requests.
               '';
             };
 
@@ -208,7 +215,7 @@
               # zenity / notify-send on PATH so GUI prompts work out of the box.
               path = cfg.guiPackages;
               serviceConfig = {
-                ExecStart = "${cfg.package}/bin/file-guard agent --method ${cfg.promptMethod}";
+                ExecStart = "${cfg.package}/bin/file-guard agent --method ${agentMethod}${lib.optionalString agentNotify " --notify"}";
                 User = cfg.user;
                 Environment = mapAttrsToList (k: v: "${k}=${v}") cfg.agentEnvironment;
               };
@@ -228,7 +235,7 @@
                 Restart = "on-failure";
                 RestartSec = 2;
                 # `start` runs in the foreground and handles SIGTERM by unmounting.
-                Type = "exec";
+                Type = "notify";
                 KillSignal = "SIGTERM";
                 TimeoutStopSec = 15;
                 # root:root 0700 store, unreadable by the guarded user.

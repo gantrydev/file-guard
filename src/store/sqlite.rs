@@ -1,3 +1,28 @@
+//! SQLite-backed implementation of the [`crate::store::BackingStore`] trait.
+//!
+//! Each guarded file gets one row in the `snapshot` table, storing the
+//! serialized [`SnapshotRecord`] and its content blob. Writes use
+//! compare-and-swap (`WHERE generation = ? AND revision = ?`) so concurrent
+//! daemon access is detected at the database layer.
+//!
+//! # Storage layout
+//!
+//! The database lives at `$FILE_GUARD_RUNTIME_DIR/snapshot.db` (default:
+//! `/var/lib/file-guard/` for the root daemon, `$XDG_RUNTIME_DIR/file-guard/`
+//! for a user-mode daemon). The directory is created with mode `0700` and the
+//! database file is protected with `flock`-based exclusive locking on open,
+//! so only one daemon process can hold it at a time.
+//!
+//! # Crash safety
+//!
+//! - **Commit**: writes the new record in a single transaction. If the write
+//!   hits the disk but the caller crashes before seeing the result, the next
+//!   load sees the committed state — the caller is responsible for reloading
+//!   on indeterminate errors (see [`crate::transaction::TransactionManager`]).
+//! - **Finalization**: two-phase: insert a marker row, then delete it after the
+//!   filesystem rename. A marker found at startup means a finalization was
+//!   interrupted and can be completed or rolled back.
+
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
@@ -5,7 +30,6 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 use super::{
@@ -84,13 +108,12 @@ impl SqliteStore {
     fn open_with_hook(root: PathBuf, hook: Arc<dyn StoreHook>) -> StoreResult<Self> {
         let root = prepare_private_root(&absolute_lexical(&root)?)?;
         let lock = open_private_file(&root, LOCK_NAME)?;
-        lock.try_lock_exclusive().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                StoreError::Locked
-            } else {
-                StoreError::Io(error)
-            }
-        })?;
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+            |e| match e {
+                rustix::io::Errno::AGAIN => StoreError::Locked,
+                _ => StoreError::Io(e.into()),
+            },
+        )?;
 
         let database_path = root.join(DATABASE_NAME);
         let database_file = open_private_file(&root, DATABASE_NAME)?;
