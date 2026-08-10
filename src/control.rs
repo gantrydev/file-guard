@@ -7,76 +7,237 @@ use crate::logging;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaemonIdentity {
+    pid: u32,
+    start_time: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonProcess {
+    Verified(DaemonIdentity),
+    Unverified(DaemonIdentity),
+}
+
+impl DaemonProcess {
+    fn identity(self) -> DaemonIdentity {
+        match self {
+            Self::Verified(identity) | Self::Unverified(identity) => identity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityState {
+    Verified,
+    Unverified,
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessProbe {
+    Alive,
+    Missing,
+    Unknown,
+}
+
 /// PID of the running daemon, or `None` if none is running. Checks this
 /// context's PID path first, then the system daemon's well-known location, so a
 /// guarded (non-root) user - whose context resolves to its own runtime dir -
 /// still sees the root daemon at `/run/file-guard/daemon.pid`.
 pub fn running_pid() -> Option<u32> {
+    running_process().map(|process| process.identity().pid)
+}
+
+fn running_process() -> Option<DaemonProcess> {
     let primary = config::pid_file_path();
-    if let Some(pid) = pid_from(&primary) {
-        return Some(pid);
+    if let Some(process) = process_from(&primary) {
+        return Some(process);
     }
     let system = PathBuf::from("/run/file-guard/daemon.pid");
     if system != primary {
-        return pid_from(&system);
+        return process_from(&system);
     }
     None
 }
 
-/// Read and validate the PID in `path`. A stale file (process gone) is cleaned
-/// up when we have permission; otherwise the removal is ignored.
-fn pid_from(path: &Path) -> Option<u32> {
-    let pid: u32 = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
-    if pid_alive(pid) {
-        Some(pid)
-    } else {
-        let _ = std::fs::remove_file(path);
-        None
+fn process_from(path: &Path) -> Option<DaemonProcess> {
+    let identity = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| parse_daemon_identity(&contents))?;
+    match classify_identity(identity) {
+        IdentityState::Verified => Some(DaemonProcess::Verified(identity)),
+        IdentityState::Unverified => Some(DaemonProcess::Unverified(identity)),
+        IdentityState::Stale => {
+            let _ = std::fs::remove_file(path);
+            None
+        }
     }
 }
 
-/// Whether `pid` is a live process (signal 0 probes existence without delivery).
-/// `EPERM` counts as alive: the process exists but is owned by another user
-/// (e.g. the root daemon probed by the guarded user), which is exactly the
-/// cross-user case `status` must report correctly.
-fn pid_alive(pid: u32) -> bool {
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
-        return true;
+fn parse_daemon_identity(contents: &str) -> Option<DaemonIdentity> {
+    let mut fields = contents.split_whitespace();
+    let identity = DaemonIdentity {
+        pid: fields.next()?.parse().ok()?,
+        start_time: fields.next()?.parse().ok()?,
+    };
+    if fields.next().is_some() || identity.pid == 0 || i32::try_from(identity.pid).is_err() {
+        return None;
     }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    Some(identity)
+}
+
+fn identity_alive(identity: DaemonIdentity) -> bool {
+    crate::process::start_time(identity.pid).ok() == Some(identity.start_time)
+}
+
+fn classify_identity(identity: DaemonIdentity) -> IdentityState {
+    match crate::process::start_time(identity.pid) {
+        Ok(start_time) if start_time == identity.start_time => IdentityState::Verified,
+        Ok(_) => IdentityState::Stale,
+        Err(_) => classify_unreadable_identity(probe_process(identity.pid)),
+    }
+}
+
+fn classify_unreadable_identity(probe: ProcessProbe) -> IdentityState {
+    match probe {
+        ProcessProbe::Missing => IdentityState::Stale,
+        ProcessProbe::Alive | ProcessProbe::Unknown => IdentityState::Unverified,
+    }
+}
+
+fn probe_process(pid: u32) -> ProcessProbe {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return ProcessProbe::Missing;
+    };
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return ProcessProbe::Alive;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EPERM) => ProcessProbe::Alive,
+        Some(libc::ESRCH) => ProcessProbe::Missing,
+        _ => ProcessProbe::Unknown,
+    }
 }
 
 /// Send SIGTERM to the running daemon and wait for it to exit (and run its
 /// unmount path). Errors if no daemon is running.
 pub fn stop() -> anyhow::Result<()> {
-    let Some(pid) = running_pid() else {
+    let Some(process) = running_process() else {
         anyhow::bail!(
-            "no running daemon found (no live PID file at {}). \
+            "no running daemon found (no matching process identity at {}). \
              Under systemd use `systemctl stop file-guard`.",
             config::pid_file_path().display()
         );
     };
+    let identity = match process {
+        DaemonProcess::Verified(identity) => identity,
+        DaemonProcess::Unverified(identity) => anyhow::bail!(
+            "daemon pid {} exists, but its process identity is hidden; \
+             re-run with sufficient privilege or use `sudo systemctl stop file-guard`",
+            identity.pid
+        ),
+    };
+    let pid = identity.pid;
 
-    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::PermissionDenied {
-            anyhow::bail!(
-                "cannot signal daemon (pid {pid}): it runs as another user. \
-                 Use `sudo systemctl stop file-guard`."
-            );
-        }
-        return Err(err).map_err(|e| anyhow::anyhow!("failed to signal daemon (pid {pid}): {e}"));
-    }
+    #[cfg(target_os = "linux")]
+    let process = signal_linux_daemon(identity)?;
+    #[cfg(not(target_os = "linux"))]
+    signal_daemon(identity)?;
+
     println!("sent SIGTERM to file-guard (pid {pid}); waiting for unmount…");
 
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+        let timeout = Timespec {
+            tv_sec: 0,
+            tv_nsec: 100_000_000,
+        };
+        let mut descriptor = [PollFd::new(&process, PollFlags::IN)];
+        for _ in 0..150 {
+            match poll(&mut descriptor, Some(&timeout)) {
+                Ok(0) => {}
+                Ok(_) => {
+                    println!("stopped");
+                    return Ok(());
+                }
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "failed waiting for daemon (pid {pid}): {error}"
+                    ));
+                }
+            }
+        }
+        anyhow::bail!("daemon (pid {pid}) did not exit within 15s")
+    }
+
+    #[cfg(not(target_os = "linux"))]
     for _ in 0..150 {
-        if !pid_alive(pid) {
+        if !identity_alive(identity) {
             println!("stopped");
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+
+    #[cfg(not(target_os = "linux"))]
     anyhow::bail!("daemon (pid {pid}) did not exit within 15s");
+}
+
+#[cfg(target_os = "linux")]
+fn signal_linux_daemon(identity: DaemonIdentity) -> anyhow::Result<rustix::fd::OwnedFd> {
+    use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
+
+    let raw_pid = i32::try_from(identity.pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| anyhow::anyhow!("invalid daemon pid {}", identity.pid))?;
+    let process = pidfd_open(raw_pid, PidfdFlags::empty())
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+    if !identity_alive(identity) {
+        anyhow::bail!(
+            "daemon pid {} was recycled before it could be signaled",
+            identity.pid
+        )
+    }
+    pidfd_send_signal(&process, Signal::TERM).map_err(|error| {
+        let error = std::io::Error::from_raw_os_error(error.raw_os_error());
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            anyhow::anyhow!(
+                "cannot signal daemon (pid {}): it runs as another user. \
+                 Use `sudo systemctl stop file-guard`.",
+                identity.pid
+            )
+        } else {
+            anyhow::anyhow!("failed to signal daemon (pid {}): {error}", identity.pid)
+        }
+    })?;
+    Ok(process)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn signal_daemon(identity: DaemonIdentity) -> anyhow::Result<()> {
+    if !identity_alive(identity) {
+        anyhow::bail!("daemon pid {} was recycled", identity.pid)
+    }
+    if unsafe { libc::kill(identity.pid as libc::pid_t, libc::SIGTERM) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        anyhow::bail!(
+            "cannot signal daemon (pid {}): it runs as another user. \
+             Use `sudo systemctl stop file-guard`.",
+            identity.pid
+        );
+    }
+    Err(anyhow::anyhow!(
+        "failed to signal daemon (pid {}): {error}",
+        identity.pid
+    ))
 }
 
 /// Print daemon state, each watched file's mount status, and recent accesses.
@@ -197,7 +358,11 @@ fn parse_mountinfo_line(line: &str) -> Option<PathBuf> {
     let mut right_fields = right.split(' ');
     let fstype = right_fields.next()?;
     let source = right_fields.next()?;
-    if fstype.starts_with("fuse") && source == "file-guard" {
+    let file_guard_source = source == "file-guard"
+        || source.strip_prefix("file-guard:").is_some_and(|token| {
+            token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    if fstype.starts_with("fuse") && file_guard_source {
         Some(PathBuf::from(unescape_mountinfo(mountpoint)))
     } else {
         None
@@ -217,9 +382,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pid_record_requires_pid_and_start_time() {
+        assert_eq!(
+            parse_daemon_identity("123 456\n"),
+            Some(DaemonIdentity {
+                pid: 123,
+                start_time: 456,
+            })
+        );
+        assert_eq!(parse_daemon_identity("123\n"), None);
+        assert_eq!(parse_daemon_identity("0 456\n"), None);
+        assert_eq!(parse_daemon_identity("123 456 extra\n"), None);
+        assert_eq!(parse_daemon_identity("4294967295 456\n"), None);
+    }
+
+    #[test]
+    fn inaccessible_live_identity_is_reported_without_becoming_signalable() {
+        assert_eq!(
+            classify_unreadable_identity(ProcessProbe::Alive),
+            IdentityState::Unverified
+        );
+        assert_eq!(
+            classify_unreadable_identity(ProcessProbe::Unknown),
+            IdentityState::Unverified
+        );
+        assert_eq!(
+            classify_unreadable_identity(ProcessProbe::Missing),
+            IdentityState::Stale
+        );
+    }
+
+    #[test]
+    fn process_identity_rejects_a_recycled_start_time() {
+        let pid = std::process::id();
+        let start_time = crate::process::start_time(pid).unwrap();
+        assert!(identity_alive(DaemonIdentity { pid, start_time }));
+        assert!(!identity_alive(DaemonIdentity {
+            pid,
+            start_time: start_time.wrapping_add(1),
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_refuses_a_mismatched_process_identity() {
+        let pid = std::process::id();
+        let start_time = crate::process::start_time(pid).unwrap().wrapping_add(1);
+        let error = signal_linux_daemon(DaemonIdentity { pid, start_time }).unwrap_err();
+        assert!(error.to_string().contains("recycled"));
+    }
+
+    #[test]
     fn detects_file_guard_fuse_mount() {
         let line = "40 35 0:44 / /home/a/.aws/credentials rw,nosuid,nodev,relatime \
                     shared:1 - fuse file-guard rw,user_id=0,group_id=0";
+        assert_eq!(
+            parse_mountinfo_line(line),
+            Some(PathBuf::from("/home/a/.aws/credentials"))
+        );
+    }
+
+    #[test]
+    fn detects_tokenized_file_guard_fuse_mount() {
+        let line = "40 35 0:44 / /home/a/.aws/credentials rw,nosuid,nodev,relatime \
+                    shared:1 - fuse file-guard:00112233445566778899aabbccddeeff rw,user_id=0";
         assert_eq!(
             parse_mountinfo_line(line),
             Some(PathBuf::from("/home/a/.aws/credentials"))

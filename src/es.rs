@@ -382,6 +382,10 @@ impl Interceptor for EsInterceptor {
         Ok(())
     }
 
+    fn abort_start(&mut self) -> anyhow::Result<()> {
+        self.stop()
+    }
+
     fn stop(&mut self) -> anyhow::Result<()> {
         self.client.take();
 

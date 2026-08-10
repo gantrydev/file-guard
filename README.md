@@ -25,8 +25,8 @@ processes **you've authorized** read *and write* them; everything else is denied
 
 ## How it works
 
-For each watched file, file-guard moves the real contents into a backing store
-and serves the original path through an interception layer. On every `open()` it
+For each watched file, file-guard commits a complete snapshot to a private
+SQLite database before replacing the path with a FUSE endpoint. On every `open()` it
 resolves the **calling process** and consults your policy, in the **direction**
 of the access (read vs write):
 
@@ -117,15 +117,20 @@ blocks from [`configs/`](configs/):
   | sudo tee /etc/file-guard/config.toml
 ```
 
-### 2a. Development (your own user - NOT secure, see limitations)
+### 2a. Development
 
 ```sh
-FILE_GUARD_CONFIG=~/.config/file-guard/config.toml file-guard start
+sudo install -d -m 0700 /var/lib/file-guard-dev
+sudo env \
+  FILE_GUARD_CONFIG="$HOME/.config/file-guard/config.toml" \
+  FILE_GUARD_STORE_DIR=/var/lib/file-guard-dev/store \
+  target/debug/file-guard start
 ```
 
-Runs in the foreground; unknown accesses prompt you in the terminal. Useful to
-see what touches your secrets, but the backing store is readable by your own user
-(so same-uid malware can bypass it). For real protection use 2b.
+Storage v2 deliberately refuses to run the credential store as the guarded
+user. Development runs in the foreground as root with a separate root-owned
+store; unknown accesses can still prompt in the terminal. Use 2b for a managed
+deployment.
 
 ### 2b. Privileged daemon (the secure deployment)
 
@@ -176,7 +181,7 @@ services.file-guard = {
   enable = true;
   user = "alice";
   configFile = "/etc/file-guard/config.toml";
-  promptMethod = "gui";                       # default: "notification"
+  promptMethod = "gui";                       # default: "gui"
   agentEnvironment = {                        # so dialogs reach alice's display
     DISPLAY = ":0";
     XAUTHORITY = "/home/alice/.Xauthority";
@@ -187,16 +192,21 @@ services.file-guard = {
 
 The agent's socket is created by **root** (systemd socket activation) in a
 root-owned directory, so a same-uid attacker can neither hijack the socket name
-nor connect to it. With `promptMethod = "notification"` (the default) prompts are
+nor connect to it. With `promptMethod = "notification"`, prompts are
 informational only and unknown accesses deny on timeout - define explicit
 `[[rule]]`s for that mode.
 
-To try the GUI prompt path by hand (dev), run the agent in your graphical session
-and the daemon alongside it (both as the same user resolve the same socket):
+To try the GUI prompt path by hand, run the agent in your graphical session and
+point the root development daemon at the same socket and private store:
 
 ```sh
-file-guard agent --method gui &                 # renders prompts in your session
-FILE_GUARD_CONFIG=~/.config/file-guard/config.toml file-guard start
+file-guard agent --method gui &
+sudo install -d -m 0700 /var/lib/file-guard-dev
+sudo env \
+  FILE_GUARD_CONFIG="$HOME/.config/file-guard/config.toml" \
+  FILE_GUARD_STORE_DIR=/var/lib/file-guard-dev/store \
+  FILE_GUARD_AGENT_SOCKET="$XDG_RUNTIME_DIR/file-guard-agent.sock" \
+  target/debug/file-guard start
 ```
 
 ## Configuration
@@ -221,8 +231,8 @@ file-guard log [-n N] [-f]             # print/follow the audit log (needs a fil
 file-guard rules                       # list rules (with indices)
 file-guard rules add --file F --binary B --action allow|deny [--access read|write|any] [--no-pin]
 file-guard rules remove <index>        # remove the rule at INDEX (preserves comments)
-file-guard store <f>                   # move a file into the backing store
-file-guard restore <f>                 # restore a file from the backing store
+file-guard store <f>                   # snapshot and remove a file for offline storage
+file-guard restore <f>                 # restore a file from its snapshot
 ```
 
 The audit log is NDJSON (one object per access) when `log_destination` is a file
@@ -230,6 +240,9 @@ path, so it's both human-readable via `file-guard log` and machine-queryable
 (e.g. `jq` over the file).
 
 ## Security model & limitations
+
+The crash/recovery states and exact durability ordering are documented in
+[`docs/storage-v2.md`](docs/storage-v2.md).
 
 **Threat model:** non-root malware running as *you* (a poisoned dependency),
 trying to read or write credential files. **Not** in scope: a root attacker (root
@@ -241,14 +254,14 @@ Known limitations - read before relying on this:
 - **Run it privileged, or it does nothing on Linux.** The backing store must be
   owned by a *different* uid than the guarded user; otherwise the same malware
   just reads the store directly. Both the Debian package and the NixOS module run
-  the daemon as root for this reason. Running as your own user is
-  development-only.
+  the daemon as root for this reason. Storage v2 refuses to open the production
+  credential store as a non-root user.
 - **The prompt agent must be root-anchored to be trustworthy** - and both
   packaged deployments make it so by default. If same-uid malware could occupy
   the agent's socket, it would auto-approve its own prompts; the NixOS module and
   the Debian package both prevent this by having **root** create the socket
   (systemd socket activation) at `/run/file-guard/agent.sock` in a root-owned
-  directory (mode `0600`). The only unhardened path is the dev-only
+  directory (mode `0755`); the socket itself is mode `0600`. The only unhardened path is the dev-only
   `file-guard agent` self-bind in `$XDG_RUNTIME_DIR`, which warns loudly and is
   for testing, not protection.
 - **Linux only.** The macOS Endpoint Security path is not built - see

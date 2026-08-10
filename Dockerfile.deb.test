@@ -1,0 +1,36 @@
+FROM rust:1.95-bookworm AS deb-builder
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        dpkg-dev \
+        libfuse3-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN cargo install cargo-deb --locked
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock README.md LICENSE build.rs ./
+COPY configs ./configs
+COPY docs ./docs
+COPY packaging ./packaging
+COPY src ./src
+RUN cargo deb
+
+FROM scratch AS deb-package
+COPY --from=deb-builder /src/target/debian/*.deb /
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        systemd \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/deb-package-container-test.sh /usr/local/bin/file-guard-deb-package-test
+RUN chmod 0755 /usr/local/bin/file-guard-deb-package-test
+
+ENTRYPOINT ["/usr/local/bin/file-guard-deb-package-test"]

@@ -15,7 +15,8 @@ use crate::logging::AccessLogger;
 use crate::policy::engine::PolicyEngine;
 use crate::policy::rule::{Access, Decision};
 use crate::process::identify::ProcessInfo;
-use crate::store::BackingStore;
+use crate::store::{BackingStore, Entry, Lifecycle, RestoreMetadata, SnapshotRecord};
+use crate::transaction::TransactionManager;
 
 /// Upper bound on the in-memory content of a guarded file. Credential files are
 /// tiny; this cap turns a malicious or buggy write/truncate at a huge offset
@@ -31,7 +32,7 @@ fn default_ttl() -> Duration {
     Duration::ZERO
 }
 
-fn build_file_attr(file_size: u64) -> FileAttr {
+fn build_file_attr(file_size: u64, metadata: &RestoreMetadata) -> FileAttr {
     let now = SystemTime::now();
 
     FileAttr {
@@ -43,12 +44,10 @@ fn build_file_attr(file_size: u64) -> FileAttr {
         ctime: now,
         crtime: now,
         kind: FileType::RegularFile,
-        // Writable: the mount now accepts gated writes (each write-open is
-        // authorized like a read).
-        perm: 0o644,
+        perm: (metadata.mode & 0o7777) as u16,
         nlink: 1,
-        uid: 0,
-        gid: 0,
+        uid: metadata.uid,
+        gid: metadata.gid,
         rdev: 0,
         blksize: 512,
         flags: 0,
@@ -85,8 +84,13 @@ fn checked_write_end(offset: u64, len: usize) -> Result<usize, Errno> {
 /// other's edits and a truncate can't be reverted by a stale handle buffer.
 struct Content {
     bytes: Vec<u8>,
-    /// Differs from the backing store and must be persisted on flush/release.
-    dirty: bool,
+    record: SnapshotRecord,
+}
+
+#[derive(Debug)]
+enum MutationError {
+    Invalid(Errno),
+    Commit(anyhow::Error),
 }
 
 /// Per-open-handle bookkeeping. The buffer lives in `Content`, shared across
@@ -117,46 +121,56 @@ impl Shared {
         fh
     }
 
-    /// Apply a write into the shared content at `offset`, growing (and
-    /// zero-filling any gap) as needed. Rejects an unknown/non-write handle
-    /// (`EACCES`) and an out-of-bounds extent (`EFBIG`).
-    fn apply_write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, Errno> {
+    fn apply_write(
+        &self,
+        manager: &TransactionManager,
+        fh: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u32, MutationError> {
         match self.handles.lock().unwrap().get(&fh) {
             Some(h) if h.access == Access::Write => {}
-            Some(_) | None => return Err(Errno::EACCES),
+            Some(_) | None => return Err(MutationError::Invalid(Errno::EACCES)),
         }
 
-        let end = checked_write_end(offset, data.len())?;
+        let end = checked_write_end(offset, data.len()).map_err(MutationError::Invalid)?;
         let start = offset as usize;
 
         let mut content = self.content.lock().unwrap();
-        if content.bytes.len() < end {
-            content.bytes.resize(end, 0); // sparse gap zero-filled
+        let mut candidate = content.bytes.clone();
+        if candidate.len() < end {
+            candidate.resize(end, 0);
         }
-        content.bytes[start..end].copy_from_slice(data);
-        content.dirty = true;
+        candidate[start..end].copy_from_slice(data);
+        let next = manager
+            .update_contents(&content.record, candidate.clone())
+            .map_err(MutationError::Commit)?;
+        content.bytes = candidate;
+        content.record = next;
         Ok(data.len() as u32)
     }
 
-    /// Resize the shared content to `new_size` (zero-filling on grow), rejecting
-    /// an oversized truncate. Acts on the single shared buffer, so no open
-    /// handle can later resurrect the dropped tail.
-    fn apply_truncate(&self, new_size: u64) -> Result<(), Errno> {
+    fn apply_truncate(
+        &self,
+        manager: &TransactionManager,
+        new_size: u64,
+    ) -> Result<(), MutationError> {
         if new_size > MAX_CONTENT_LEN {
-            return Err(Errno::EFBIG);
+            return Err(MutationError::Invalid(Errno::EFBIG));
         }
         let mut content = self.content.lock().unwrap();
-        content.bytes.resize(new_size as usize, 0);
-        content.dirty = true;
+        let mut candidate = content.bytes.clone();
+        candidate.resize(new_size as usize, 0);
+        let next = manager
+            .update_contents(&content.record, candidate.clone())
+            .map_err(MutationError::Commit)?;
+        content.bytes = candidate;
+        content.record = next;
         Ok(())
     }
 
-    /// Empty the shared content (an `O_TRUNC` open), marking it dirty so the
-    /// truncation persists even if the handle is closed without a write.
-    fn truncate_on_open(&self) {
-        let mut content = self.content.lock().unwrap();
-        content.bytes.clear();
-        content.dirty = true;
+    fn truncate_on_open(&self, manager: &TransactionManager) -> Result<(), MutationError> {
+        self.apply_truncate(manager, 0)
     }
 
     fn current_size(&self) -> u64 {
@@ -166,14 +180,15 @@ impl Shared {
 
 pub struct CredentialFs {
     watched_path: PathBuf,
-    store: Arc<dyn BackingStore>,
+    manager: TransactionManager,
     policy: Arc<PolicyEngine>,
     logger: Arc<AccessLogger>,
     rt_handle: tokio::runtime::Handle,
     /// Expected requester uid (the owner of the guarded file's directory). When
     /// set, only that uid — or root — may access the mount, even though
     /// `allow_other` makes it reachable by any local user.
-    owner_uid: Option<u32>,
+    owner_uid: u32,
+    presentation: RestoreMetadata,
     shared: Arc<Shared>,
 }
 
@@ -184,29 +199,38 @@ impl CredentialFs {
         policy: Arc<PolicyEngine>,
         logger: Arc<AccessLogger>,
         rt_handle: tokio::runtime::Handle,
-        owner_uid: Option<u32>,
     ) -> anyhow::Result<Self> {
-        // Load the authoritative content once. `exists()` distinguishes "not
-        // stored yet" (serve empty) from a genuine read failure on an existing
-        // entry, which must surface rather than masquerade as an empty file.
-        let bytes = if store.exists(&watched_path) {
-            store.read(&watched_path)?
-        } else {
-            Vec::new()
+        let manager = TransactionManager::new(store);
+        let Entry::Present(record) = manager.load(&watched_path)? else {
+            anyhow::bail!("no installed v2 record for {}", watched_path.display())
         };
+        let record = *record;
+        if let Some(reason) = &record.header.blocked_reason {
+            anyhow::bail!(
+                "v2 record for {} requires manual recovery: {reason}",
+                watched_path.display()
+            )
+        }
+        if !matches!(record.header.lifecycle, Lifecycle::MountIntent { .. }) {
+            anyhow::bail!(
+                "v2 record for {} is not awaiting its mount",
+                watched_path.display()
+            )
+        }
+        let bytes = record.contents.clone();
+        let presentation = record.header.original.metadata().clone();
+        let owner_uid = record.header.parent.uid;
 
         Ok(Self {
             watched_path,
-            store,
+            manager,
             policy,
             logger,
             rt_handle,
             owner_uid,
+            presentation,
             shared: Arc::new(Shared {
-                content: Mutex::new(Content {
-                    bytes,
-                    dirty: false,
-                }),
+                content: Mutex::new(Content { bytes, record }),
                 handles: Mutex::new(HashMap::new()),
                 next_fh: AtomicU64::new(1),
             }),
@@ -218,10 +242,7 @@ impl CredentialFs {
     /// may touch another user's credential — enforced on every entry point, not
     /// just `open`, so a foreign user can't even `stat` it to learn its size.
     fn uid_permitted(&self, uid: u32) -> bool {
-        match self.owner_uid {
-            Some(owner) => uid == owner || uid == 0,
-            None => true,
-        }
+        uid == self.owner_uid || uid == 0
     }
 
     /// Identify the calling process, evaluate policy for a single `access`
@@ -264,26 +285,12 @@ impl CredentialFs {
         decision.is_allowed().then_some(info)
     }
 
-    fn apply_write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, Errno> {
-        self.shared.apply_write(fh, offset, data)
+    fn apply_write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, MutationError> {
+        self.shared.apply_write(&self.manager, fh, offset, data)
     }
 
-    fn apply_truncate(&self, new_size: u64) -> Result<(), Errno> {
-        self.shared.apply_truncate(new_size)
-    }
-
-    /// Persist the shared content to the store if dirty. The content lock is
-    /// held across the store write so a concurrent write/truncate can neither
-    /// interleave into a half-persisted state nor have its dirty flag cleared
-    /// without being written; on failure `dirty` stays set for a later retry.
-    fn persist(&self) -> anyhow::Result<()> {
-        let mut content = self.shared.content.lock().unwrap();
-        if !content.dirty {
-            return Ok(());
-        }
-        self.store.store(&self.watched_path, &content.bytes)?;
-        content.dirty = false;
-        Ok(())
+    fn apply_truncate(&self, new_size: u64) -> Result<(), MutationError> {
+        self.shared.apply_truncate(&self.manager, new_size)
     }
 
     fn current_size(&self) -> u64 {
@@ -301,7 +308,7 @@ async fn decide_open(
     policy: &PolicyEngine,
     logger: &AccessLogger,
     watched: &std::path::Path,
-    owner_uid: Option<u32>,
+    owner_uid: u32,
     uid: u32,
     pid: u32,
     needs_read: bool,
@@ -328,12 +335,9 @@ async fn decide_open(
         _ => Access::Read,
     };
 
-    if let Some(owner) = owner_uid
-        && uid != owner
-        && uid != 0
-    {
+    if uid != owner_uid && uid != 0 {
         tracing::warn!(
-            "denying uid {uid} access to {} (owner uid {owner})",
+            "denying uid {uid} access to {} (owner uid {owner_uid})",
             watched.display()
         );
         logger.log(&info, watched, log_access, &Decision::DenyOnce, None);
@@ -359,7 +363,10 @@ impl Filesystem for CredentialFs {
             reply.error(Errno::EACCES);
             return;
         }
-        reply.attr(&default_ttl(), &build_file_attr(self.current_size()));
+        reply.attr(
+            &default_ttl(),
+            &build_file_attr(self.current_size(), &self.presentation),
+        );
     }
 
     fn lookup(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEntry) {
@@ -415,6 +422,7 @@ impl Filesystem for CredentialFs {
         let policy = self.policy.clone();
         let logger = self.logger.clone();
         let shared = self.shared.clone();
+        let manager = self.manager.clone();
         let watched = self.watched_path.clone();
         let owner_uid = self.owner_uid;
         let uid = req.uid();
@@ -437,7 +445,21 @@ impl Filesystem for CredentialFs {
                     // O_TRUNC empties the shared file immediately, even if the
                     // handle is closed without a subsequent write.
                     if truncate_on_open {
-                        shared.truncate_on_open();
+                        match shared.truncate_on_open(&manager) {
+                            Ok(()) => {}
+                            Err(MutationError::Invalid(error)) => {
+                                reply.error(error);
+                                return;
+                            }
+                            Err(MutationError::Commit(error)) => {
+                                tracing::error!(
+                                    "truncate-on-open of {} failed: {error}",
+                                    watched.display()
+                                );
+                                reply.error(Errno::EIO);
+                                return;
+                            }
+                        }
                     }
                     let access = if needs_write {
                         Access::Write
@@ -503,7 +525,14 @@ impl Filesystem for CredentialFs {
 
         match self.apply_write(fh.0, offset, data) {
             Ok(written) => reply.written(written),
-            Err(e) => reply.error(e),
+            Err(MutationError::Invalid(error)) => reply.error(error),
+            Err(MutationError::Commit(error)) => {
+                tracing::error!(
+                    "write of {} failed to commit: {error}",
+                    self.watched_path.display()
+                );
+                reply.error(Errno::EIO);
+            }
         }
     }
 
@@ -511,59 +540,79 @@ impl Filesystem for CredentialFs {
         &self,
         req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
-        _ctime: Option<SystemTime>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        ctime: Option<SystemTime>,
         fh: Option<FileHandle>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
-        _flags: Option<BsdFileFlags>,
+        crtime: Option<SystemTime>,
+        chgtime: Option<SystemTime>,
+        bkuptime: Option<SystemTime>,
+        flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
         if ino != INodeNo::ROOT {
             reply.error(Errno::ENOENT);
             return;
         }
+        if !self.uid_permitted(req.uid()) {
+            reply.error(Errno::EACCES);
+            return;
+        }
+        if mode.is_some()
+            || uid.is_some()
+            || gid.is_some()
+            || atime.is_some()
+            || mtime.is_some()
+            || ctime.is_some()
+            || crtime.is_some()
+            || chgtime.is_some()
+            || bkuptime.is_some()
+            || flags.is_some()
+        {
+            reply.error(Errno::EOPNOTSUPP);
+            return;
+        }
 
-        // The only attribute we enforce is size (truncate) — it is a write and
-        // the easiest write-bypass to miss. An already-authorized write handle
-        // passes; a handle-less truncate is gated against the calling process.
         if let Some(new_size) = size {
-            let authorized = match fh.and_then(|h| {
-                self.shared
+            let authorized = match fh {
+                Some(handle) => self
+                    .shared
                     .handles
                     .lock()
                     .unwrap()
-                    .get(&h.0)
-                    .map(|s| s.access == Access::Write)
-            }) {
-                Some(true) => true,
-                Some(false) => false, // a read handle may not resize
+                    .get(&handle.0)
+                    .is_some_and(|state| state.access == Access::Write),
                 None => self.authorize(req, Access::Write).is_some(),
             };
             if !authorized {
                 reply.error(Errno::EACCES);
                 return;
             }
-            if let Err(e) = self.apply_truncate(new_size) {
-                reply.error(e);
-                return;
-            }
-            // A truncate is a durable operation on its own (a handle-less
-            // truncate(2) has no later flush/release), so persist immediately.
-            if let Err(e) = self.persist() {
-                tracing::error!("truncate of {} failed: {e}", self.watched_path.display());
-                reply.error(Errno::EIO);
-                return;
+            match self.apply_truncate(new_size) {
+                Ok(()) => {}
+                Err(MutationError::Invalid(error)) => {
+                    reply.error(error);
+                    return;
+                }
+                Err(MutationError::Commit(error)) => {
+                    tracing::error!(
+                        "truncate of {} failed: {error}",
+                        self.watched_path.display()
+                    );
+                    reply.error(Errno::EIO);
+                    return;
+                }
             }
         }
 
-        reply.attr(&default_ttl(), &build_file_attr(self.current_size()));
+        reply.attr(
+            &default_ttl(),
+            &build_file_attr(self.current_size(), &self.presentation),
+        );
     }
 
     fn flush(
@@ -578,13 +627,7 @@ impl Filesystem for CredentialFs {
             reply.error(Errno::ENOENT);
             return;
         }
-        match self.persist() {
-            Ok(()) => reply.ok(),
-            Err(e) => {
-                tracing::error!("flush of {} failed: {e}", self.watched_path.display());
-                reply.error(Errno::EIO);
-            }
-        }
+        reply.ok();
     }
 
     fn fsync(
@@ -599,13 +642,7 @@ impl Filesystem for CredentialFs {
             reply.error(Errno::ENOENT);
             return;
         }
-        match self.persist() {
-            Ok(()) => reply.ok(),
-            Err(e) => {
-                tracing::error!("fsync of {} failed: {e}", self.watched_path.display());
-                reply.error(Errno::EIO);
-            }
-        }
+        reply.ok();
     }
 
     fn release(
@@ -623,19 +660,8 @@ impl Filesystem for CredentialFs {
             return;
         }
 
-        let persisted = self.persist();
         self.shared.handles.lock().unwrap().remove(&fh.0);
-
-        match persisted {
-            Ok(()) => reply.ok(),
-            Err(e) => {
-                tracing::error!(
-                    "release persist of {} failed: {e}",
-                    self.watched_path.display()
-                );
-                reply.error(Errno::EIO);
-            }
-        }
+        reply.ok();
     }
 }
 
@@ -646,9 +672,10 @@ mod tests {
     use crate::logging::AccessLogger;
     use crate::policy::engine::PolicyEngine;
     use crate::prompt::PromptClient;
-    use std::collections::HashMap as StdHashMap;
+    use crate::store::testing::{MemoryStore, mount_intent_record};
+    use crate::store::{FinalizationRecord, RecordVersion, StoreError, StoreResult};
     use std::path::Path;
-    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn slice_content_bounds() {
@@ -663,6 +690,13 @@ mod tests {
     /// `fuser::Errno` has no `PartialEq`; compare via its libc code instead.
     fn code<T>(r: Result<T, Errno>) -> Result<T, i32> {
         r.map_err(|e| e.code())
+    }
+
+    fn mutation_code<T>(result: Result<T, MutationError>) -> Result<T, i32> {
+        result.map_err(|error| match error {
+            MutationError::Invalid(errno) => errno.code(),
+            MutationError::Commit(error) => panic!("unexpected commit error: {error}"),
+        })
     }
 
     #[test]
@@ -680,51 +714,11 @@ mod tests {
         assert_eq!(code(checked_write_end(1 << 50, 0)), Err(libc::EFBIG)); // huge sparse offset
     }
 
-    struct MemStore(StdMutex<StdHashMap<PathBuf, Vec<u8>>>);
-
-    impl BackingStore for MemStore {
-        fn read(&self, id: &Path) -> anyhow::Result<Vec<u8>> {
-            self.0
-                .lock()
-                .unwrap()
-                .get(id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("not stored"))
-        }
-        fn store(&self, id: &Path, contents: &[u8]) -> anyhow::Result<()> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert(id.to_path_buf(), contents.to_vec());
-            Ok(())
-        }
-        fn delete(&self, id: &Path) -> anyhow::Result<()> {
-            self.0.lock().unwrap().remove(id);
-            Ok(())
-        }
-        fn list(&self) -> anyhow::Result<Vec<PathBuf>> {
-            Ok(self.0.lock().unwrap().keys().cloned().collect())
-        }
-        fn exists(&self, id: &Path) -> bool {
-            self.0.lock().unwrap().contains_key(id)
-        }
-    }
-
-    /// A `CredentialFs` over an in-memory store seeded with `initial`. The
-    /// policy/logger are never exercised by the content-level methods under test.
-    fn fixture(
-        initial: &[u8],
-    ) -> (
-        CredentialFs,
-        PathBuf,
-        Arc<MemStore>,
-        tokio::runtime::Runtime,
-    ) {
+    fn credential_fs(
+        watched: PathBuf,
+        store: Arc<dyn BackingStore>,
+    ) -> (CredentialFs, tokio::runtime::Runtime) {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let watched = PathBuf::from("/credential");
-        let store = Arc::new(MemStore(StdMutex::new(
-            [(watched.clone(), initial.to_vec())].into_iter().collect(),
-        )));
         let config = Config {
             settings: toml::from_str::<Settings>("default_action = \"deny\"").unwrap(),
             watch: vec![],
@@ -739,16 +733,91 @@ mod tests {
             )),
         ));
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
-        let fs = CredentialFs::new(
+        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
+        (fs, rt)
+    }
+
+    fn fixture(
+        initial: &[u8],
+    ) -> (
+        CredentialFs,
+        PathBuf,
+        Arc<MemoryStore>,
+        tokio::runtime::Runtime,
+    ) {
+        let watched = PathBuf::from("/credential");
+        let store = Arc::new(MemoryStore::with_record(
             watched.clone(),
-            store.clone() as Arc<dyn BackingStore>,
-            policy,
-            logger,
-            rt.handle().clone(),
-            None,
-        )
-        .unwrap();
+            mount_intent_record(&watched, initial),
+        ));
+        let (fs, rt) = credential_fs(watched.clone(), store.clone());
         (fs, watched, store, rt)
+    }
+
+    struct FaultStore {
+        inner: MemoryStore,
+        fail_before_commit: AtomicBool,
+        fail_after_commit: AtomicBool,
+    }
+
+    impl FaultStore {
+        fn new(path: &Path, contents: &[u8], before: bool, after: bool) -> Self {
+            Self {
+                inner: MemoryStore::with_record(
+                    path.to_path_buf(),
+                    mount_intent_record(path, contents),
+                ),
+                fail_before_commit: AtomicBool::new(before),
+                fail_after_commit: AtomicBool::new(after),
+            }
+        }
+
+        fn contents(&self, path: &Path) -> Vec<u8> {
+            self.inner.contents(path)
+        }
+    }
+
+    impl BackingStore for FaultStore {
+        fn load(&self, file_id: &Path) -> StoreResult<Entry> {
+            self.inner.load(file_id)
+        }
+
+        fn commit(
+            &self,
+            file_id: &Path,
+            expected: Option<&RecordVersion>,
+            next: &SnapshotRecord,
+        ) -> StoreResult<RecordVersion> {
+            if self.fail_before_commit.swap(false, Ordering::SeqCst) {
+                return Err(StoreError::Io(std::io::Error::other(
+                    "injected pre-commit failure",
+                )));
+            }
+            let version = self.inner.commit(file_id, expected, next)?;
+            if self.fail_after_commit.swap(false, Ordering::SeqCst) {
+                return Err(StoreError::Indeterminate(
+                    "injected post-commit failure".to_string(),
+                ));
+            }
+            Ok(version)
+        }
+
+        fn begin_finalization(
+            &self,
+            file_id: &Path,
+            expected: &RecordVersion,
+            marker: &FinalizationRecord,
+        ) -> StoreResult<RecordVersion> {
+            self.inner.begin_finalization(file_id, expected, marker)
+        }
+
+        fn finish_finalization(&self, file_id: &Path, expected: &RecordVersion) -> StoreResult<()> {
+            self.inner.finish_finalization(file_id, expected)
+        }
+
+        fn list(&self) -> StoreResult<Vec<Entry>> {
+            self.inner.list()
+        }
     }
 
     fn write_handle(fs: &CredentialFs) -> u64 {
@@ -769,9 +838,8 @@ mod tests {
 
         fs.apply_write(p1, 0, b"AAA").unwrap();
         fs.apply_write(p2, 100, b"BBB").unwrap();
-        fs.persist().unwrap();
 
-        let got = store.read(&watched).unwrap();
+        let got = store.contents(&watched);
         assert_eq!(&got[0..3], b"AAA");
         assert_eq!(&got[100..103], b"BBB");
         assert_eq!(got.len(), 200);
@@ -782,22 +850,20 @@ mod tests {
     #[test]
     fn truncate_not_reverted_by_sibling_handle() {
         let (fs, watched, store, _rt) = fixture(b"OLD-LONG-SECRET");
-        let sibling = write_handle(&fs); // open, dirty, holds no private copy now
+        let sibling = write_handle(&fs);
         fs.apply_write(sibling, 0, b"OLD-LONG-SECRET").unwrap();
 
         fs.apply_truncate(3).unwrap();
-        fs.persist().unwrap(); // sibling's later persist sees the same 3-byte content
 
-        assert_eq!(store.read(&watched).unwrap(), b"OLD");
+        assert_eq!(store.contents(&watched), b"OLD");
     }
 
     /// O_TRUNC-at-open empties the shared file even with no following write.
     #[test]
     fn otrunc_open_then_close_persists_empty() {
         let (fs, watched, store, _rt) = fixture(b"SECRET");
-        fs.shared.truncate_on_open();
-        fs.persist().unwrap();
-        assert_eq!(store.read(&watched).unwrap(), b"");
+        fs.shared.truncate_on_open(&fs.manager).unwrap();
+        assert_eq!(store.contents(&watched), b"");
     }
 
     /// A write at a huge offset is rejected with EFBIG, not attempted as a
@@ -806,7 +872,10 @@ mod tests {
     fn write_at_huge_offset_is_efbig() {
         let (fs, _watched, _store, _rt) = fixture(b"");
         let fh = write_handle(&fs);
-        assert_eq!(code(fs.apply_write(fh, 1 << 50, b"x")), Err(libc::EFBIG));
+        assert_eq!(
+            mutation_code(fs.apply_write(fh, 1 << 50, b"x")),
+            Err(libc::EFBIG)
+        );
         assert_eq!(fs.current_size(), 0); // nothing allocated/grown
     }
 
@@ -816,20 +885,72 @@ mod tests {
         let (fs, watched, store, _rt) = fixture(b"ab");
         let fh = write_handle(&fs);
         fs.apply_write(fh, 5, b"Z").unwrap();
-        fs.persist().unwrap();
-        assert_eq!(store.read(&watched).unwrap(), b"ab\0\0\0Z");
+        assert_eq!(store.contents(&watched), b"ab\0\0\0Z");
+    }
+
+    #[test]
+    fn failed_write_is_never_published_or_retried() {
+        let watched = PathBuf::from("/credential");
+        let store = Arc::new(FaultStore::new(&watched, b"abc", true, false));
+        let (fs, _rt) = credential_fs(watched.clone(), store.clone());
+        let fh = write_handle(&fs);
+
+        assert!(matches!(
+            fs.apply_write(fh, 0, b"X"),
+            Err(MutationError::Commit(_))
+        ));
+        assert_eq!(fs.shared.content.lock().unwrap().bytes, b"abc");
+        assert_eq!(store.contents(&watched), b"abc");
+
+        fs.apply_write(fh, 1, b"Z").unwrap();
+        assert_eq!(store.contents(&watched), b"aZc");
+    }
+
+    #[test]
+    fn indeterminate_committed_write_is_reloaded_before_publication() {
+        let watched = PathBuf::from("/credential");
+        let store = Arc::new(FaultStore::new(&watched, b"abc", false, true));
+        let (fs, _rt) = credential_fs(watched.clone(), store.clone());
+        let fh = write_handle(&fs);
+
+        assert_eq!(fs.apply_write(fh, 0, b"X").unwrap(), 1);
+        assert_eq!(fs.shared.content.lock().unwrap().bytes, b"Xbc");
+        assert_eq!(store.contents(&watched), b"Xbc");
+    }
+
+    #[test]
+    fn uid_gate_uses_captured_parent_owner() {
+        let watched = PathBuf::from("/credential");
+        let mut record = mount_intent_record(&watched, b"secret");
+        record.header.parent.uid = 1234;
+        if let crate::store::OriginalState::Present { metadata, .. } = &mut record.header.original {
+            metadata.uid = 5678;
+        }
+        let store: Arc<dyn BackingStore> =
+            Arc::new(MemoryStore::with_record(watched.clone(), record));
+        let (fs, _rt) = credential_fs(watched, store);
+
+        assert_eq!(fs.owner_uid, 1234);
+        assert!(fs.uid_permitted(1234));
+        assert!(!fs.uid_permitted(5678));
     }
 
     /// An unknown fh and a non-write handle are both refused by apply_write.
     #[test]
     fn write_rejects_unknown_and_read_handle() {
         let (fs, _watched, _store, _rt) = fixture(b"");
-        assert_eq!(code(fs.apply_write(999, 0, b"x")), Err(libc::EACCES));
+        assert_eq!(
+            mutation_code(fs.apply_write(999, 0, b"x")),
+            Err(libc::EACCES)
+        );
         let read_fh = fs.shared.register_handle(OpenHandle {
             access: Access::Read,
             can_read: true,
         });
-        assert_eq!(code(fs.apply_write(read_fh, 0, b"x")), Err(libc::EACCES));
+        assert_eq!(
+            mutation_code(fs.apply_write(read_fh, 0, b"x")),
+            Err(libc::EACCES)
+        );
     }
 
     /// Construction surfaces a genuine store read error (existing entry that
@@ -838,20 +959,36 @@ mod tests {
     fn new_propagates_store_read_error() {
         struct FailingStore;
         impl BackingStore for FailingStore {
-            fn read(&self, _: &Path) -> anyhow::Result<Vec<u8>> {
-                anyhow::bail!("disk on fire")
+            fn load(&self, _: &Path) -> crate::store::StoreResult<Entry> {
+                Err(crate::store::StoreError::Io(std::io::Error::other(
+                    "disk on fire",
+                )))
             }
-            fn store(&self, _: &Path, _: &[u8]) -> anyhow::Result<()> {
-                Ok(())
+            fn commit(
+                &self,
+                _: &Path,
+                _: Option<&crate::store::RecordVersion>,
+                _: &SnapshotRecord,
+            ) -> crate::store::StoreResult<crate::store::RecordVersion> {
+                unreachable!()
             }
-            fn delete(&self, _: &Path) -> anyhow::Result<()> {
-                Ok(())
+            fn begin_finalization(
+                &self,
+                _: &Path,
+                _: &crate::store::RecordVersion,
+                _: &crate::store::FinalizationRecord,
+            ) -> crate::store::StoreResult<crate::store::RecordVersion> {
+                unreachable!()
             }
-            fn list(&self) -> anyhow::Result<Vec<PathBuf>> {
-                Ok(vec![])
+            fn finish_finalization(
+                &self,
+                _: &Path,
+                _: &crate::store::RecordVersion,
+            ) -> crate::store::StoreResult<()> {
+                unreachable!()
             }
-            fn exists(&self, _: &Path) -> bool {
-                true // entry "exists" but read fails
+            fn list(&self) -> crate::store::StoreResult<Vec<Entry>> {
+                unreachable!()
             }
         }
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -875,7 +1012,6 @@ mod tests {
             policy,
             logger,
             rt.handle().clone(),
-            None,
         );
         assert!(
             err.is_err(),

@@ -6,6 +6,8 @@
 # This default guards NOTHING until you add [[watch]] blocks - installing the
 # package is therefore safe. Captured "allow always" rules are appended here.
 
+watch = []
+
 [settings]
 default_action  = "deny"    # applied when a prompt times out / the agent is unreachable
 prompt_timeout  = 30

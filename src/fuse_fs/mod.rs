@@ -4,9 +4,8 @@ mod fuse_interceptor;
 pub use fuse_interceptor::FuseInterceptor;
 
 /// End-to-end tests that mount a real FUSE file and exercise the policy path
-/// through an actual `open()`/`read()`. Skipped (not failed) when the host has
-/// no usable `/dev/fuse`, so they run on dev machines and CI runners that
-/// provide FUSE but don't break sandboxes that don't.
+/// through actual filesystem operations. They are explicitly ignored by the
+/// ordinary test suite and run as a required CI step on a FUSE-capable runner.
 #[cfg(test)]
 mod integration_tests {
     use super::credential_fs::CredentialFs;
@@ -15,45 +14,16 @@ mod integration_tests {
     use crate::policy::engine::PolicyEngine;
     use crate::policy::rule::Access;
     use crate::prompt::PromptClient;
-    use crate::store::BackingStore;
+    use crate::store::testing::{MemoryStore, mount_intent_record};
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
-    /// Minimal in-memory backing store so the test doesn't touch the real
-    /// store dir or its process-global `FILE_GUARD_STORE_DIR` env.
-    struct MemStore(Mutex<std::collections::HashMap<PathBuf, Vec<u8>>>);
-
-    impl BackingStore for MemStore {
-        fn read(&self, id: &Path) -> anyhow::Result<Vec<u8>> {
-            self.0
-                .lock()
-                .unwrap()
-                .get(id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("not stored"))
-        }
-        fn store(&self, id: &Path, contents: &[u8]) -> anyhow::Result<()> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert(id.to_path_buf(), contents.to_vec());
-            Ok(())
-        }
-        fn delete(&self, id: &Path) -> anyhow::Result<()> {
-            self.0.lock().unwrap().remove(id);
-            Ok(())
-        }
-        fn list(&self) -> anyhow::Result<Vec<PathBuf>> {
-            Ok(self.0.lock().unwrap().keys().cloned().collect())
-        }
-        fn exists(&self, id: &Path) -> bool {
-            self.0.lock().unwrap().contains_key(id)
-        }
-    }
-
-    fn fuse_available() -> bool {
-        Path::new("/dev/fuse").exists()
+    fn memory_store(watched: &Path, contents: &[u8]) -> Arc<MemoryStore> {
+        Arc::new(MemoryStore::with_record(
+            watched.to_path_buf(),
+            mount_intent_record(watched, contents),
+        ))
     }
 
     fn settings(default_action: &str) -> Settings {
@@ -62,21 +32,15 @@ mod integration_tests {
 
     /// Mount `fs` over a fresh file under a temp dir and return (mountpoint,
     /// session). The session keeps the mount up and unmounts when dropped.
-    fn mount(fs: CredentialFs, tmp: &Path) -> Option<(PathBuf, fuser::BackgroundSession)> {
+    fn mount(fs: CredentialFs, tmp: &Path) -> (PathBuf, fuser::BackgroundSession) {
         let mountpoint = tmp.join("credential");
         std::fs::write(&mountpoint, b"").unwrap();
         let mut config = fuser::Config::default();
         config.mount_options = vec![fuser::MountOption::FSName("file-guard".into())];
-        match fuser::spawn_mount2(fs, &mountpoint, &config) {
-            Ok(session) => {
-                std::thread::sleep(Duration::from_millis(100));
-                Some((mountpoint, session))
-            }
-            Err(e) => {
-                eprintln!("SKIP: could not mount FUSE ({e})");
-                None
-            }
-        }
+        let session = fuser::spawn_mount2(fs, &mountpoint, &config)
+            .expect("the required FUSE integration environment must permit mounting");
+        std::thread::sleep(Duration::from_millis(100));
+        (mountpoint, session)
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -96,19 +60,14 @@ mod integration_tests {
     /// An "allow always" rule for this test binary lets the same binary read the
     /// real stored contents straight back through the mount.
     #[test]
+    #[ignore = "requires /dev/fuse; CI runs this suite explicitly"]
     fn allowed_binary_reads_real_contents() {
-        if !fuse_available() {
-            eprintln!("SKIP: no /dev/fuse");
-            return;
-        }
         let rt = tokio::runtime::Runtime::new().unwrap();
         let tmp = temp_dir("allow");
         let watched = tmp.join("credential");
         let secret = b"super-secret-token\n";
 
-        let store = Arc::new(MemStore(Mutex::new(
-            [(watched.clone(), secret.to_vec())].into_iter().collect(),
-        )));
+        let store = memory_store(&watched, secret);
 
         // The caller the FUSE layer will see is this test process.
         let me = std::env::current_exe().unwrap();
@@ -128,13 +87,9 @@ mod integration_tests {
         };
         let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
-        let fs =
-            CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
+        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
 
-        let Some((mountpoint, session)) = mount(fs, &tmp) else {
-            std::fs::remove_dir_all(&tmp).ok();
-            return;
-        };
+        let (mountpoint, session) = mount(fs, &tmp);
         let got = std::fs::read(&mountpoint);
         drop(session);
         std::fs::remove_dir_all(&tmp).ok();
@@ -151,12 +106,10 @@ mod integration_tests {
     /// with `set_len` — exactly an editor's save. The mount must persist only the
     /// new, shorter bytes, with no resurrected tail from the old content.
     #[test]
+    #[ignore = "requires /dev/fuse; CI runs this suite explicitly"]
     fn in_place_overwrite_then_shrink_has_no_stale_tail() {
-        if !fuse_available() {
-            eprintln!("SKIP: no /dev/fuse");
-            return;
-        }
         use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::PermissionsExt;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let tmp = temp_dir("shrink");
@@ -164,9 +117,7 @@ mod integration_tests {
         let old = b"OLD-LONGER-CREDENTIAL-CONTENTS\n";
         let new = b"new-short\n";
 
-        let store = Arc::new(MemStore(Mutex::new(
-            [(watched.clone(), old.to_vec())].into_iter().collect(),
-        )));
+        let store = memory_store(&watched, old);
         let me = std::env::current_exe().unwrap();
         let config = Config {
             settings: settings("deny"),
@@ -184,13 +135,9 @@ mod integration_tests {
         };
         let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
-        let fs =
-            CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
+        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
 
-        let Some((mountpoint, session)) = mount(fs, &tmp) else {
-            std::fs::remove_dir_all(&tmp).ok();
-            return;
-        };
+        let (mountpoint, session) = mount(fs, &tmp);
 
         // Open in place WITHOUT truncate, overwrite the head, then shrink — the
         // editor-save sequence that left a stale tail before the fix.
@@ -202,6 +149,11 @@ mod integration_tests {
             f.flush()
         })();
         let got = std::fs::read(&mountpoint);
+        let chmod_error =
+            std::fs::set_permissions(&mountpoint, std::fs::Permissions::from_mode(0o644))
+                .expect_err("unsupported chmod must not report success");
+        let mode_after_chmod =
+            std::fs::metadata(&mountpoint).unwrap().permissions().mode() & 0o7777;
 
         drop(session);
         std::fs::remove_dir_all(&tmp).ok();
@@ -212,25 +164,20 @@ mod integration_tests {
             new,
             "shrink left a resurrected tail from the old content"
         );
+        assert_eq!(chmod_error.raw_os_error(), Some(libc::EOPNOTSUPP));
+        assert_eq!(mode_after_chmod, 0o600);
     }
 
     /// With no rule and an unreachable agent, the deny-by-default policy makes
     /// the kernel return EACCES on open — the secret never leaves the store.
     #[test]
+    #[ignore = "requires /dev/fuse; CI runs this suite explicitly"]
     fn unauthorized_open_is_denied() {
-        if !fuse_available() {
-            eprintln!("SKIP: no /dev/fuse");
-            return;
-        }
         let rt = tokio::runtime::Runtime::new().unwrap();
         let tmp = temp_dir("deny");
         let watched = tmp.join("credential");
 
-        let store = Arc::new(MemStore(Mutex::new(
-            [(watched.clone(), b"secret".to_vec())]
-                .into_iter()
-                .collect(),
-        )));
+        let store = memory_store(&watched, b"secret");
         let config = Config {
             settings: settings("deny"),
             watch: vec![],
@@ -238,13 +185,9 @@ mod integration_tests {
         };
         let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
-        let fs =
-            CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
+        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
 
-        let Some((mountpoint, session)) = mount(fs, &tmp) else {
-            std::fs::remove_dir_all(&tmp).ok();
-            return;
-        };
+        let (mountpoint, session) = mount(fs, &tmp);
         let got = std::fs::read(&mountpoint);
         drop(session);
         std::fs::remove_dir_all(&tmp).ok();
@@ -280,29 +223,18 @@ mod integration_tests {
     /// denied (the latter would otherwise preload the secret into the buffer and
     /// serve it via read()), while O_WRONLY is allowed.
     #[test]
+    #[ignore = "requires /dev/fuse; CI runs this suite explicitly"]
     fn write_only_grant_cannot_read_via_rdwr() {
-        if !fuse_available() {
-            eprintln!("SKIP: no /dev/fuse");
-            return;
-        }
         let rt = tokio::runtime::Runtime::new().unwrap();
         let tmp = temp_dir("wronly");
         let watched = tmp.join("credential");
-        let store = Arc::new(MemStore(Mutex::new(
-            [(watched.clone(), b"TOP-SECRET".to_vec())]
-                .into_iter()
-                .collect(),
-        )));
+        let store = memory_store(&watched, b"TOP-SECRET");
         let config = rule_config(&watched, Access::Write);
         let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
-        let fs =
-            CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
+        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
 
-        let Some((mountpoint, session)) = mount(fs, &tmp) else {
-            std::fs::remove_dir_all(&tmp).ok();
-            return;
-        };
+        let (mountpoint, session) = mount(fs, &tmp);
 
         let ro = std::fs::OpenOptions::new().read(true).open(&mountpoint);
         let rw = std::fs::OpenOptions::new()
@@ -332,31 +264,20 @@ mod integration_tests {
     /// A write at an absurd offset is rejected with EFBIG and the daemon stays
     /// up (a prior version attempted a multi-terabyte allocation and aborted).
     #[test]
+    #[ignore = "requires /dev/fuse; CI runs this suite explicitly"]
     fn huge_offset_write_is_efbig_and_daemon_survives() {
-        if !fuse_available() {
-            eprintln!("SKIP: no /dev/fuse");
-            return;
-        }
         use std::os::unix::fs::FileExt;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let tmp = temp_dir("huge");
         let watched = tmp.join("credential");
-        let store = Arc::new(MemStore(Mutex::new(
-            [(watched.clone(), b"intact".to_vec())]
-                .into_iter()
-                .collect(),
-        )));
+        let store = memory_store(&watched, b"intact");
         let config = rule_config(&watched, Access::Any);
         let policy = Arc::new(PolicyEngine::new(&config, unreachable_client()));
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
-        let fs =
-            CredentialFs::new(watched, store, policy, logger, rt.handle().clone(), None).unwrap();
+        let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
 
-        let Some((mountpoint, session)) = mount(fs, &tmp) else {
-            std::fs::remove_dir_all(&tmp).ok();
-            return;
-        };
+        let (mountpoint, session) = mount(fs, &tmp);
 
         let write_err = {
             let f = std::fs::OpenOptions::new()

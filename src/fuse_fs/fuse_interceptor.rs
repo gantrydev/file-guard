@@ -1,5 +1,7 @@
+use std::collections::HashSet;
 use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -7,99 +9,155 @@ use fuser::{Config, MountOption, SessionACL};
 
 use super::credential_fs::CredentialFs;
 use crate::interceptor::{Interceptor, InterceptorArgs};
-use crate::store::BackingStore;
+use crate::store::{BackingStore, Entry, UnmountNext};
+use crate::transaction::TransactionManager;
 
-/// Decode the octal escapes (`\040` space, `\011` tab, `\012` newline, `\134`
-/// backslash) the kernel writes for whitespace in `/proc/mounts` fields.
-fn unescape_mount_field(field: &str) -> String {
-    let b = field.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        // Decode a `\ooo` escape in u32 (0..=511) and accept it only if it is a
-        // real byte value. Naive u8 arithmetic would overflow and panic on a
-        // leading octal digit >= 4; an out-of-range value falls through as a
-        // literal backslash.
-        if b[i] == b'\\'
-            && i + 3 < b.len()
-            && b[i + 1..=i + 3].iter().all(|c| (b'0'..=b'7').contains(c))
+fn unescape_mount_field(bytes: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && index + 3 < bytes.len()
+            && bytes[index + 1..=index + 3]
+                .iter()
+                .all(|byte| (b'0'..=b'7').contains(byte))
         {
-            let v = (b[i + 1] - b'0') as u32 * 64
-                + (b[i + 2] - b'0') as u32 * 8
-                + (b[i + 3] - b'0') as u32;
-            if v <= u8::MAX as u32 {
-                out.push(v as u8);
-                i += 4;
+            let value = (bytes[index + 1] - b'0') as u32 * 64
+                + (bytes[index + 2] - b'0') as u32 * 8
+                + (bytes[index + 3] - b'0') as u32;
+            if value <= u8::MAX as u32 {
+                output.push(value as u8);
+                index += 4;
                 continue;
             }
         }
-        out.push(b[i]);
-        i += 1;
+        output.push(bytes[index]);
+        index += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    output
 }
 
-/// The mountpoints in `/proc/mounts`-formatted `contents` that are file-guard
-/// FUSE mounts (`<source> <target> <fstype> ...`, source field 1).
-fn file_guard_mountpoints(contents: &str) -> Vec<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountInfo {
+    id: u64,
+    target: PathBuf,
+    fs_type: String,
+    source: Vec<u8>,
+    owner_uid: Option<u32>,
+}
+
+fn fields(bytes: &[u8]) -> Vec<&[u8]> {
+    bytes
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect()
+}
+
+fn parse_mountinfo(contents: &[u8]) -> Vec<MountInfo> {
     contents
-        .lines()
+        .split(|byte| *byte == b'\n')
         .filter_map(|line| {
-            let mut f = line.split(' ');
-            let source = f.next()?;
-            let target = f.next()?;
-            let fstype = f.next()?;
-            (source == "file-guard" && fstype.starts_with("fuse"))
-                .then(|| unescape_mount_field(target))
+            let separator = line.windows(3).position(|window| window == b" - ")?;
+            let mount_fields = fields(&line[..separator]);
+            let filesystem_fields = fields(&line[separator + 3..]);
+            let owner_uid = filesystem_fields.get(2).and_then(|options| {
+                options.split(|byte| *byte == b',').find_map(|option| {
+                    option
+                        .strip_prefix(b"user_id=")
+                        .and_then(|value| std::str::from_utf8(value).ok())
+                        .and_then(|value| value.parse().ok())
+                })
+            });
+            Some(MountInfo {
+                id: std::str::from_utf8(mount_fields.first()?)
+                    .ok()?
+                    .parse()
+                    .ok()?,
+                target: PathBuf::from(OsString::from_vec(unescape_mount_field(
+                    mount_fields.get(4)?,
+                ))),
+                fs_type: std::str::from_utf8(filesystem_fields.first()?)
+                    .ok()?
+                    .to_string(),
+                source: unescape_mount_field(filesystem_fields.get(1)?),
+                owner_uid,
+            })
         })
         .collect()
 }
 
-/// Lazily detach any leftover file-guard mount at `watched_path`. A daemon that
-/// died without running its unmount path (SIGKILL, crash, hard restart) leaves
-/// the mountpoint as a wedged FUSE endpoint whose reads/writes fail with
-/// ENOTCONN, so the next start can't recreate the file there. systemd runs a
-/// single instance, so any file-guard mount still present at our path on start
-/// is by definition orphaned and safe to detach — making startup self-healing.
-fn clear_stale_mount(watched_path: &Path) {
-    let proc_mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
-    let target = watched_path.to_string_lossy();
-    if !file_guard_mountpoints(&proc_mounts)
-        .iter()
-        .any(|m| m.as_str() == target)
-    {
-        return;
-    }
+fn mountinfo() -> anyhow::Result<Vec<MountInfo>> {
+    Ok(parse_mountinfo(&std::fs::read("/proc/self/mountinfo")?))
+}
 
-    tracing::warn!(
-        "clearing orphaned file-guard mount at {} (left by a previous daemon)",
-        watched_path.display()
-    );
-    match CString::new(watched_path.as_os_str().as_bytes()) {
-        // MNT_DETACH detaches even a wedged endpoint; the kernel completes the
-        // teardown once the mount is no longer busy.
-        Ok(c) => {
-            if unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) } != 0 {
-                tracing::warn!(
-                    "failed to detach stale mount {}: {}",
-                    watched_path.display(),
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
-        Err(e) => tracing::warn!("bad mountpoint path {}: {e}", watched_path.display()),
+fn mounts_at(path: &Path) -> anyhow::Result<Vec<MountInfo>> {
+    Ok(mountinfo()?
+        .into_iter()
+        .filter(|mount| mount.target == path)
+        .collect())
+}
+
+fn expected_source(token: &str) -> String {
+    format!("file-guard:{token}")
+}
+
+fn verify_mount(path: &Path, token: &str) -> anyhow::Result<Option<MountInfo>> {
+    let expected = expected_source(token);
+    let expected_uid = unsafe { libc::geteuid() };
+    let mounts = mounts_at(path)?;
+    if let Some(unexpected) = mounts.iter().find(|mount| {
+        mount.source != expected.as_bytes()
+            || !mount.fs_type.starts_with("fuse")
+            || mount.owner_uid != Some(expected_uid)
+    }) {
+        anyhow::bail!(
+            "refusing to operate on {}: mount {} has source {:?}, type {:?}, and owner {:?}; expected {:?} owned by uid {}",
+            path.display(),
+            unexpected.id,
+            String::from_utf8_lossy(&unexpected.source),
+            unexpected.fs_type,
+            unexpected.owner_uid,
+            expected,
+            expected_uid
+        )
     }
+    if mounts.len() > 1 {
+        anyhow::bail!("multiple mounts are stacked at {}", path.display())
+    }
+    Ok(mounts.into_iter().next())
+}
+
+fn detach_stale_mount(path: &Path, token: &str) -> anyhow::Result<()> {
+    let Some(mount) = verify_mount(path, token)? else {
+        return Ok(());
+    };
+    tracing::warn!(
+        "detaching orphaned file-guard mount {} at {}",
+        mount.id,
+        path.display()
+    );
+    let encoded_path = CString::new(path.as_os_str().as_bytes())?;
+    if unsafe { libc::umount2(encoded_path.as_ptr(), libc::MNT_DETACH) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if verify_mount(path, token)?.is_some() {
+        anyhow::bail!("mount remained present after detach")
+    }
+    Ok(())
 }
 
 struct MountSession {
     watched_path: PathBuf,
-    session: fuser::BackgroundSession,
+    token: String,
+    session: Option<fuser::BackgroundSession>,
 }
 
 pub struct FuseInterceptor {
     args: Option<InterceptorArgs>,
     sessions: Vec<MountSession>,
+    prepared: Vec<PathBuf>,
     store: Option<Arc<dyn BackingStore>>,
+    manager: Option<TransactionManager>,
     restore_on_stop: bool,
 }
 
@@ -108,180 +166,16 @@ impl FuseInterceptor {
         Self {
             args: Some(args),
             sessions: Vec::new(),
+            prepared: Vec::new(),
             store: None,
+            manager: None,
             restore_on_stop: false,
         }
     }
 
-    /// Capture the real credential into the backing store *without yet touching
-    /// the original on disk*. Splitting capture from placeholder creation makes
-    /// start() recoverable: once this returns Ok the content is durably in the
-    /// store, so a later failure can always restore it. Idempotent.
-    fn capture_original(watched_path: &Path, store: &Arc<dyn BackingStore>) -> anyhow::Result<()> {
-        // Self-heal across an unclean shutdown: a leftover mount from a crashed
-        // daemon wedges this path (ENOTCONN), so detach it before we touch it.
-        clear_stale_mount(watched_path);
-
-        // M3: never operate on a symlink - following it could expose or clobber
-        // an unintended target. `O_NOFOLLOW` refuses the final-component symlink
-        // *atomically* with the read: a separate lstat-then-read left a TOCTOU
-        // window in which a same-uid user could swap the file for a symlink and
-        // make this (root) daemon capture an arbitrary target's contents.
-        //
-        // A read error must NOT be coerced to "absent": treating e.g. EACCES/EIO
-        // as no-file would let the next step clobber a real credential with an
-        // empty placeholder and lose it forever. Only a genuine NotFound counts
-        // as absent; anything else aborts the guard loudly.
-        let on_disk = match read_no_follow(watched_path) {
-            Ok(content) => Some(content),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => anyhow::bail!(
-                "{} is a symlink; refusing to guard it (point the watch at the real file)",
-                watched_path.display()
-            ),
-            Err(e) => anyhow::bail!(
-                "refusing to guard {}: cannot read existing file: {e}",
-                watched_path.display()
-            ),
-        };
-        let in_store = store.read(watched_path).ok();
-
-        // H2: if there is real on-disk content the store doesn't already hold
-        // (a brand-new file, or one the user edited while we were stopped), it
-        // is authoritative - capture it before we replace it, so we never lose
-        // newer credentials. An *empty* on-disk file is treated as a leftover
-        // mountpoint from a previous run and must NOT overwrite stored content.
-        // NOTE (known limitation): an empty file is indistinguishable from a
-        // credential the user *deliberately* blanked while we were stopped, so
-        // we err toward preserving the stored content rather than risk losing a
-        // real secret to a crash-leftover placeholder.
-        if let Some(disk) = &on_disk
-            && !disk.is_empty()
-            && in_store.as_deref() != Some(disk.as_slice())
-        {
-            store.store(watched_path, disk)?;
-        }
-
-        Ok(())
-    }
-
-    /// Replace the original with an empty file to mount over. Runs only after
-    /// `capture_original` has durably stored any real content.
-    fn mount_placeholder(watched_path: &Path) -> anyhow::Result<()> {
-        match std::fs::remove_file(watched_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // H10: the watched file may not exist yet - ensure its directory.
-                if let Some(parent) = watched_path.parent() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-            }
-            Err(e) => {
-                anyhow::bail!("failed to remove {}: {e}", watched_path.display())
-            }
-        }
-
-        write_file_private(watched_path, b"").map_err(|e| {
-            anyhow::anyhow!(
-                "failed to create mountpoint {}: {e}",
-                watched_path.display()
-            )
-        })
-    }
-
-    fn restore_original(watched_path: &Path, store: &Arc<dyn BackingStore>) -> anyhow::Result<()> {
-        let contents = store.read(watched_path)?;
-        // Restore the plaintext at 0600 - never the umask default (~0644), which
-        // would expose a 0600 secret world-readable.
-        write_file_private(watched_path, &contents)
-            .map_err(|e| anyhow::anyhow!("failed to restore {}: {e}", watched_path.display()))?;
-
-        Ok(())
-    }
-
-    /// H9: undo a partially-completed start. Unmount everything mounted so far
-    /// and put every captured original back, so a failure midway never leaves
-    /// credentials stranded in the store with no live mount, and never deletes a
-    /// captured credential.
-    fn rollback(&mut self, store: &Arc<dyn BackingStore>, prepared: &[PathBuf]) {
-        for mount in self.sessions.drain(..) {
-            drop(mount.session);
-        }
-        for path in prepared {
-            match store.read(path) {
-                Ok(content) => {
-                    let _ = write_file_private(path, &content);
-                    let _ = store.delete(path);
-                }
-                // Nothing was captured (the original was absent or empty) - just
-                // remove the empty mountpoint we created.
-                Err(_) => {
-                    let _ = std::fs::remove_file(path);
-                }
-            }
-        }
-    }
-}
-
-/// Read `path` without following a final-component symlink (`O_NOFOLLOW`), so a
-/// symlink swapped in at the watched path can't redirect the read to another
-/// (possibly root-only) target. A symlink surfaces as `ELOOP`.
-fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
-    use std::io::Read;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut f = opts.open(path)?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
-    Ok(buf)
-}
-
-/// Write `contents` to `path`, creating it at mode 0600 (owner-only) so a
-/// restored/placed credential is never left world-readable. `O_NOFOLLOW`
-/// refuses to write *through* a symlink swapped in at the path (it would
-/// otherwise clobber the link target), matching the capture-side guard.
-fn write_file_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut f = opts.open(path)?;
-    f.write_all(contents)?;
-    // create() only applies mode on a fresh file; force 0600 even if it existed.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
-/// The uid that owns `watched_path`'s directory — the only non-root user allowed
-/// to reach the mount (see CredentialFs::authorize). Best-effort: None disables
-/// the uid gate.
-fn owner_uid_of(watched_path: &Path) -> Option<u32> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        watched_path
-            .parent()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| m.uid())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = watched_path;
-        None
+    fn rollback(&mut self) -> anyhow::Result<()> {
+        self.restore_on_stop = true;
+        <Self as Interceptor>::stop(self)
     }
 }
 
@@ -291,62 +185,124 @@ impl Interceptor for FuseInterceptor {
             .args
             .take()
             .ok_or_else(|| anyhow::anyhow!("FuseInterceptor already started"))?;
-
         self.restore_on_stop = args.restore_on_stop;
         self.store = Some(args.store.clone());
+        self.manager = Some(TransactionManager::new(args.store.clone()));
 
-        let mut prepared: Vec<PathBuf> = Vec::new();
+        let manager = self.manager.as_ref().unwrap().clone();
+        let mut unique_paths = HashSet::new();
+        let watched_paths = args
+            .watched_paths
+            .iter()
+            .map(|path| manager.normalize_path(path))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for path in &watched_paths {
+            if !unique_paths.insert(path.clone()) {
+                anyhow::bail!(
+                    "duplicate watched path after normalization: {}",
+                    path.display()
+                )
+            }
+        }
 
-        for watched_path in &args.watched_paths {
-            let owner_uid = owner_uid_of(watched_path);
+        for watched_path in &watched_paths {
+            let manager = self.manager.as_ref().unwrap().clone();
             let setup = (|| -> anyhow::Result<()> {
-                // Capture (durably) BEFORE marking the path recoverable and
-                // BEFORE the destructive placeholder step, so any later failure
-                // can always restore the original from the store.
-                Self::capture_original(watched_path, &args.store)?;
-                prepared.push(watched_path.clone());
-                Self::mount_placeholder(watched_path)?;
+                if let Entry::Present(record) = manager.load(watched_path)? {
+                    if let Some(reason) = &record.header.blocked_reason {
+                        anyhow::bail!(
+                            "transaction for {} requires manual recovery before mount reconciliation: {reason}",
+                            watched_path.display()
+                        )
+                    }
+                    detach_stale_mount(watched_path, &record.header.mount_token)?;
+                    manager.reconcile_after_mount_absent(watched_path)?;
+                } else if !mounts_at(watched_path)?.is_empty() {
+                    anyhow::bail!(
+                        "{} is mounted but has no v2 transaction record",
+                        watched_path.display()
+                    )
+                }
 
-                let credential_fs = CredentialFs::new(
+                self.prepared.push(watched_path.clone());
+                manager.prepare(watched_path)?;
+                let record = manager.begin_mount(watched_path)?;
+                let credential_fs = match CredentialFs::new(
                     watched_path.clone(),
                     args.store.clone(),
                     args.policy.clone(),
                     args.logger.clone(),
                     args.rt_handle.clone(),
-                    owner_uid,
-                )?;
+                ) {
+                    Ok(filesystem) => filesystem,
+                    Err(error) => {
+                        let rollback = manager.abort_mount(watched_path);
+                        return match rollback {
+                            Ok(_) => Err(error),
+                            Err(rollback_error) => Err(anyhow::anyhow!(
+                                "{error}; mount-intent rollback also failed: {rollback_error}"
+                            )),
+                        };
+                    }
+                };
 
-                // Read-write mount: writes are gated per-open like reads.
+                let source = expected_source(&record.header.mount_token);
                 let mut config = Config::default();
-                config.mount_options = vec![MountOption::FSName("file-guard".to_string())];
-                // When the daemon runs as root (the privileged deployment), the
-                // mount must be reachable by the guarded user's own processes.
-                // Requires `user_allow_other` in /etc/fuse.conf
-                // (NixOS: programs.fuse.userAllowOther = true).
+                config.mount_options = vec![MountOption::FSName(source.clone())];
                 if unsafe { libc::geteuid() == 0 } {
                     config.acl = SessionACL::All;
                 }
 
-                let session =
-                    fuser::spawn_mount2(credential_fs, watched_path, &config).map_err(|e| {
-                        anyhow::anyhow!("failed to mount FUSE at {}: {e}", watched_path.display())
-                    })?;
-
+                let session = match fuser::spawn_mount2(credential_fs, watched_path, &config) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        let rollback = (|| -> anyhow::Result<()> {
+                            detach_stale_mount(watched_path, &record.header.mount_token)?;
+                            manager.abort_mount(watched_path)?;
+                            Ok(())
+                        })();
+                        return match rollback {
+                            Ok(()) => Err(anyhow::anyhow!(
+                                "failed to mount FUSE at {}: {error}",
+                                watched_path.display()
+                            )),
+                            Err(rollback_error) => Err(anyhow::anyhow!(
+                                "failed to mount FUSE at {}: {error}; rollback also failed: {rollback_error}",
+                                watched_path.display()
+                            )),
+                        };
+                    }
+                };
+                let Some(mount) = verify_mount(watched_path, &record.header.mount_token)? else {
+                    drop(session);
+                    detach_stale_mount(watched_path, &record.header.mount_token)?;
+                    manager.abort_mount(watched_path)?;
+                    anyhow::bail!(
+                        "FUSE mount at {} returned success but was not observable",
+                        watched_path.display()
+                    )
+                };
                 self.sessions.push(MountSession {
                     watched_path: watched_path.clone(),
-                    session,
+                    token: record.header.mount_token,
+                    session: Some(session),
                 });
-                tracing::info!("FUSE mounted at {}", watched_path.display());
+                tracing::info!(
+                    "FUSE mount {} active at {} ({source})",
+                    mount.id,
+                    watched_path.display()
+                );
                 Ok(())
             })();
 
-            if let Err(e) = setup {
-                tracing::error!(
-                    "failed to set up {}: {e}; rolling back",
-                    watched_path.display()
-                );
-                self.rollback(&args.store, &prepared);
-                return Err(e);
+            if let Err(error) = setup {
+                let rollback = self.rollback();
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(anyhow::anyhow!(
+                        "{error}; rollback also failed: {rollback_error}"
+                    )),
+                };
             }
         }
 
@@ -354,207 +310,173 @@ impl Interceptor for FuseInterceptor {
             "file-guard FUSE started, watching {} files",
             self.sessions.len()
         );
-
         Ok(())
     }
 
+    fn abort_start(&mut self) -> anyhow::Result<()> {
+        self.rollback()
+    }
+
     fn stop(&mut self) -> anyhow::Result<()> {
-        let sessions: Vec<MountSession> = self.sessions.drain(..).collect();
-        let store = self.store.take();
-
-        for mount in sessions {
-            drop(mount.session);
-            tracing::info!("FUSE unmounted at {}", mount.watched_path.display());
-
-            let should_restore = self.restore_on_stop && store.is_some();
-            if should_restore {
-                let result = Self::restore_original(&mount.watched_path, store.as_ref().unwrap());
-                if let Err(e) = result {
-                    tracing::warn!("failed to restore {}: {e}", mount.watched_path.display());
+        let sessions: Vec<_> = self.sessions.drain(..).collect();
+        let mut errors = Vec::new();
+        let mut retained = Vec::new();
+        let manager = self
+            .manager
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("transaction manager is unavailable during stop"))?;
+        let next = if self.restore_on_stop {
+            UnmountNext::Restore
+        } else {
+            UnmountNext::LeaveInstalled
+        };
+        let mut completed = HashSet::new();
+        for mut mount in sessions {
+            if mount.session.is_some()
+                && let Err(error) = manager.begin_unmount(&mount.watched_path, next.clone())
+            {
+                errors.push(format!(
+                    "failed to fence writes before unmounting {}: {error}",
+                    mount.watched_path.display()
+                ));
+                retained.push(mount);
+                continue;
+            }
+            if let Some(session) = mount.session.take()
+                && let Err(error) = session.umount_and_join()
+            {
+                tracing::warn!(
+                    "FUSE session unmount at {} returned {error}; reconciling against mountinfo",
+                    mount.watched_path.display()
+                );
+            }
+            let recovery = (|| -> anyhow::Result<()> {
+                detach_stale_mount(&mount.watched_path, &mount.token)?;
+                manager.reconcile_after_mount_absent(&mount.watched_path)?;
+                if self.restore_on_stop {
+                    manager.restore(&mount.watched_path)?;
                 }
+                Ok(())
+            })();
+            if let Err(error) = recovery {
+                errors.push(format!(
+                    "failed to reconcile unmount of {}: {error}",
+                    mount.watched_path.display()
+                ));
+                retained.push(mount);
+                continue;
+            }
+            tracing::info!("FUSE unmounted at {}", mount.watched_path.display());
+            completed.insert(mount.watched_path);
+        }
+        self.sessions = retained;
+
+        let retained_paths = self
+            .sessions
+            .iter()
+            .map(|mount| mount.watched_path.clone())
+            .collect::<HashSet<_>>();
+        let mut retained_prepared = Vec::new();
+        for path in self.prepared.drain(..) {
+            if retained_paths.contains(&path) {
+                retained_prepared.push(path);
+                continue;
+            }
+            if completed.contains(&path) {
+                continue;
+            }
+            let recovery = (|| -> anyhow::Result<()> {
+                match manager.load(&path)? {
+                    Entry::Present(record) => {
+                        detach_stale_mount(&path, &record.header.mount_token)?;
+                        manager.reconcile_after_mount_absent(&path)?;
+                        if self.restore_on_stop {
+                            manager.restore(&path)?;
+                        }
+                    }
+                    Entry::Finalizing(_) if mounts_at(&path)?.is_empty() => {
+                        manager.restore(&path)?;
+                    }
+                    Entry::Finalizing(_) => anyhow::bail!(
+                        "{} is mounted while its snapshot is finalizing",
+                        path.display()
+                    ),
+                    Entry::Missing if mounts_at(&path)?.is_empty() => {}
+                    Entry::Missing => {
+                        anyhow::bail!("{} is mounted without a snapshot record", path.display())
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = recovery {
+                errors.push(format!("failed to recover {}: {error}", path.display()));
+                retained_prepared.push(path);
             }
         }
+        self.prepared = retained_prepared;
 
-        Ok(())
+        if self.sessions.is_empty() && self.prepared.is_empty() {
+            self.manager = None;
+            self.store = None;
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(errors.join("; "))
+        }
+    }
+}
+
+impl Drop for FuseInterceptor {
+    fn drop(&mut self) {
+        if (!self.sessions.is_empty() || !self.prepared.is_empty())
+            && let Err(error) = <Self as Interceptor>::stop(self)
+        {
+            tracing::error!("failed to clean up FUSE interceptor during drop: {error}");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FuseInterceptor, file_guard_mountpoints, owner_uid_of, unescape_mount_field,
-        write_file_private,
-    };
-    use crate::store::BackingStore;
-    use FuseInterceptor as Fi;
-    use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
-
-    struct MemStore(Mutex<std::collections::HashMap<PathBuf, Vec<u8>>>);
-    impl MemStore {
-        fn shared() -> Arc<dyn BackingStore> {
-            Arc::new(MemStore(Mutex::new(std::collections::HashMap::new())))
-        }
-    }
-    impl BackingStore for MemStore {
-        fn read(&self, id: &Path) -> anyhow::Result<Vec<u8>> {
-            self.0
-                .lock()
-                .unwrap()
-                .get(id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("not stored"))
-        }
-        fn store(&self, id: &Path, c: &[u8]) -> anyhow::Result<()> {
-            self.0.lock().unwrap().insert(id.to_path_buf(), c.to_vec());
-            Ok(())
-        }
-        fn delete(&self, id: &Path) -> anyhow::Result<()> {
-            self.0.lock().unwrap().remove(id);
-            Ok(())
-        }
-        fn list(&self) -> anyhow::Result<Vec<PathBuf>> {
-            Ok(self.0.lock().unwrap().keys().cloned().collect())
-        }
-        fn exists(&self, id: &Path) -> bool {
-            self.0.lock().unwrap().contains_key(id)
-        }
-    }
-
-    fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("fg-it-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
+    use super::*;
 
     #[test]
-    fn unescape_decodes_octal_whitespace() {
-        assert_eq!(unescape_mount_field("/a/b"), "/a/b");
-        assert_eq!(unescape_mount_field("/a\\040b"), "/a b"); // space
-        assert_eq!(unescape_mount_field("/a\\011b"), "/a\tb"); // tab
-        assert_eq!(unescape_mount_field("/a\\134b"), "/a\\b"); // backslash
-        assert_eq!(unescape_mount_field("trailing\\04"), "trailing\\04"); // not a full escape
-    }
-
-    #[test]
-    fn unescape_high_octal_does_not_panic() {
-        // Leading octal digit >= 4 overflows naive u8 arithmetic; must be left
-        // as a literal, never panic (it would take down /proc/mounts parsing).
-        assert_eq!(unescape_mount_field("x\\500y"), "x\\500y"); // 0o500 > 255: literal
-        assert_eq!(unescape_mount_field("\\777"), "\\777"); // 0o777 > 255: literal
-        assert_ne!(unescape_mount_field("\\377"), "\\377"); // 0o377 = 255: decoded (then lossy)
-    }
-
-    #[test]
-    fn parser_tolerates_short_and_malformed_lines() {
-        let mounts =
-            file_guard_mountpoints("file-guard\nfile-guard /only-two\n\nfile-guard /p fuse rw\n");
-        assert_eq!(mounts, vec!["/p".to_string()]);
-    }
-
-    #[test]
-    fn write_file_private_creates_0600() {
-        let dir = tmp("priv");
-        let p = dir.join("secret");
-        std::fs::write(&p, b"world-readable-before").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-        }
-        write_file_private(&p, b"secret").unwrap();
-        assert_eq!(std::fs::read(&p).unwrap(), b"secret");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&p).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "restored secret must be 0600");
-        }
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn capture_original_stores_real_content_keeps_empty() {
-        let dir = tmp("capture");
-        let store = MemStore::shared();
-
-        // Non-empty original is captured.
-        let real = dir.join("cred");
-        std::fs::write(&real, b"SECRET").unwrap();
-        Fi::capture_original(&real, &store).unwrap();
-        assert_eq!(store.read(&real).unwrap(), b"SECRET");
-
-        // Empty file is NOT captured (treated as a leftover placeholder).
-        let empty = dir.join("empty");
-        std::fs::write(&empty, b"").unwrap();
-        Fi::capture_original(&empty, &store).unwrap();
-        assert!(!store.exists(&empty));
-
-        // Absent file is fine (no-op).
-        Fi::capture_original(&dir.join("absent"), &store).unwrap();
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn capture_original_refuses_unreadable_file() {
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("SKIP: root bypasses file permissions");
-            return;
-        }
-        let dir = tmp("unreadable");
-        let p = dir.join("cred");
-        std::fs::write(&p, b"SECRET").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
-        }
-        let store = MemStore::shared();
-        // A read error must abort, NOT be coerced to "absent" (which would later
-        // clobber the credential with an empty placeholder and lose it).
-        assert!(Fi::capture_original(&p, &store).is_err());
-        assert!(!store.exists(&p), "must not have captured anything");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).ok();
-        }
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn owner_uid_matches_directory_owner() {
-        let dir = tmp("owner");
-        let p = dir.join("cred");
-        std::fs::write(&p, b"x").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let expected = std::fs::metadata(&dir).unwrap().uid();
-            assert_eq!(owner_uid_of(&p), Some(expected));
-        }
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn finds_only_file_guard_fuse_mounts() {
-        let proc_mounts = "\
-proc /proc proc rw,nosuid 0 0
-file-guard /home/u/.config/gcloud/credentials.db fuse rw,nosuid,allow_other 0 0
-file-guard /home/u/with\\040space/adc.json fuse.file-guard rw 0 0
-/dev/sda1 / ext4 rw 0 0
-other-fuse /mnt/x fuse rw 0 0
-";
-        let mounts = file_guard_mountpoints(proc_mounts);
+    fn mountinfo_parser_preserves_identity_and_escapes() {
+        let input = "42 31 0:50 / /tmp/a\\040b rw,nosuid - fuse.file-guard file-guard:abc rw,user_id=0\n\
+                     43 31 8:1 / /home rw - ext4 /dev/sda1 rw\n";
         assert_eq!(
-            mounts,
+            parse_mountinfo(input.as_bytes()),
             vec![
-                "/home/u/.config/gcloud/credentials.db".to_string(),
-                "/home/u/with space/adc.json".to_string(),
-            ],
-            "must match file-guard fuse mounts only, decoding escapes"
+                MountInfo {
+                    id: 42,
+                    target: PathBuf::from("/tmp/a b"),
+                    fs_type: "fuse.file-guard".to_string(),
+                    source: b"file-guard:abc".to_vec(),
+                    owner_uid: Some(0),
+                },
+                MountInfo {
+                    id: 43,
+                    target: PathBuf::from("/home"),
+                    fs_type: "ext4".to_string(),
+                    source: b"/dev/sda1".to_vec(),
+                    owner_uid: None,
+                },
+            ]
         );
+    }
+
+    #[test]
+    fn malformed_octal_escape_is_literal() {
+        assert_eq!(unescape_mount_field(b"/a\\777b"), b"/a\\777b");
+    }
+
+    #[test]
+    fn mountinfo_parser_preserves_non_utf8_paths() {
+        let input = b"42 31 0:50 / /tmp/a\\377b rw - fuse.file-guard file-guard:abc rw\n";
+        let mounts = parse_mountinfo(input);
+        assert_eq!(mounts[0].target.as_os_str().as_bytes(), b"/tmp/a\xffb");
     }
 }

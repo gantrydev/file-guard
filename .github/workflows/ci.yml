@@ -26,6 +26,10 @@ jobs:
         run: nix develop --command cargo clippy --all-targets -- -D warnings
       - name: test
         run: nix develop --command cargo test
+      - name: FUSE integration tests
+        run: |
+          test -c /dev/fuse
+          nix develop --command cargo test fuse_fs::integration_tests -- --ignored --test-threads=1
       - name: build package
         run: nix build .#file-guard
 

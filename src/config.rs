@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     pub settings: Settings,
+    #[serde(default)]
     pub watch: Vec<WatchEntry>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -497,6 +498,20 @@ action = "allow"
         assert_eq!(config.settings.default_action, DefaultAction::Deny);
         assert_eq!(config.settings.prompt_timeout, 30); // serde default
         assert_eq!(config.rule[0].action, RuleAction::Allow);
+    }
+
+    #[test]
+    fn settings_only_config_defaults_to_no_watches() {
+        let config: Config = toml::from_str(
+            r#"
+[settings]
+default_action = "deny"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.watch.is_empty());
+        assert!(config.rule.is_empty());
     }
 
     #[test]

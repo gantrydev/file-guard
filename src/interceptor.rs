@@ -16,6 +16,7 @@ pub struct InterceptorArgs {
 
 pub trait Interceptor: Send {
     fn start(&mut self) -> anyhow::Result<()>;
+    fn abort_start(&mut self) -> anyhow::Result<()>;
     fn stop(&mut self) -> anyhow::Result<()>;
 }
 

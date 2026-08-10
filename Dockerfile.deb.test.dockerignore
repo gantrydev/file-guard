@@ -1,0 +1,15 @@
+*
+!Cargo.lock
+!Cargo.toml
+!LICENSE
+!README.md
+!build.rs
+!configs/
+!configs/**
+!docs/
+!docs/**
+!packaging/
+!packaging/**
+!scripts/deb-package-container-test.sh
+!src/
+!src/**

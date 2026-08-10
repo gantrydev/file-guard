@@ -47,7 +47,19 @@ jobs:
         run: cargo install cargo-deb
       - name: Build .deb
         run: cargo deb
+      - name: Test built .deb
+        env:
+          FILE_GUARD_RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          shopt -s nullglob
+          packages=(target/debian/*.deb)
+          [[ "${#packages[@]}" -eq 1 ]]
+          FILE_GUARD_DEB_PATH="${packages[0]}" scripts/test-deb-release.sh
       - name: Publish .deb
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           files: target/debian/*.deb
+      - name: Test published .deb
+        env:
+          FILE_GUARD_RELEASE_TAG: ${{ github.ref_name }}
+        run: scripts/test-deb-release.sh

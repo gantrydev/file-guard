@@ -57,10 +57,11 @@ impl Daemon {
         };
 
         let mut interceptor = interceptor::create_interceptor(args)?;
-        interceptor.start()?;
+        if let Err(error) = start_and_publish(interceptor.as_mut(), write_pid_file) {
+            remove_pid_file();
+            return Err(error);
+        }
         self.interceptor = Some(interceptor);
-
-        write_pid_file()?;
         if let Err(e) = publish_config_pointer() {
             // Non-fatal: the daemon still runs; only CLI auto-discovery degrades.
             tracing::warn!("failed to publish config pointer: {e}");
@@ -83,13 +84,31 @@ impl Daemon {
     }
 }
 
+fn start_and_publish(
+    interceptor: &mut dyn Interceptor,
+    publish: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    interceptor.start()?;
+    if let Err(error) = publish() {
+        return match interceptor.abort_start() {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(anyhow::anyhow!(
+                "{error}; startup rollback also failed: {rollback_error}"
+            )),
+        };
+    }
+    Ok(())
+}
+
 /// Record this process's PID so `file-guard stop`/`status` can find it.
 fn write_pid_file() -> anyhow::Result<()> {
     let path = config::pid_file_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, format!("{}\n", std::process::id()))?;
+    let pid = std::process::id();
+    let start_time = crate::process::start_time(pid)?;
+    std::fs::write(&path, format!("{pid} {start_time}\n"))?;
     Ok(())
 }
 
@@ -126,5 +145,47 @@ fn remove_config_pointer() {
         && e.kind() != std::io::ErrorKind::NotFound
     {
         tracing::warn!("failed to remove config pointer {}: {e}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RecordingInterceptor {
+        started: bool,
+        aborted: bool,
+    }
+
+    impl Interceptor for RecordingInterceptor {
+        fn start(&mut self) -> anyhow::Result<()> {
+            self.started = true;
+            Ok(())
+        }
+
+        fn abort_start(&mut self) -> anyhow::Result<()> {
+            self.aborted = true;
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn publication_failure_rolls_back_started_interceptor() {
+        let mut interceptor = RecordingInterceptor {
+            started: false,
+            aborted: false,
+        };
+
+        let result = start_and_publish(&mut interceptor, || {
+            anyhow::bail!("injected PID publication failure")
+        });
+
+        assert!(result.is_err());
+        assert!(interceptor.started);
+        assert!(interceptor.aborted);
     }
 }

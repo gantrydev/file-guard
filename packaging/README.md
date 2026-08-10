@@ -28,6 +28,26 @@ Recommends: `zenity` and `libnotify-bin` for GUI prompts / notifications.
 Nothing is enabled or started on install - guarding real credentials is an
 explicit opt-in.
 
+## Release package integration test
+
+Run the published `.deb` in a clean Ubuntu container:
+
+```sh
+scripts/test-deb-release.sh
+```
+
+The runner resolves the latest GitHub release, verifies its published SHA-256
+digest, installs the amd64 package with `apt`, and checks its metadata, runtime
+dependencies, files, modes, systemd units, tmpfiles rule, CLI behavior, and a
+real SQLite/FUSE write, crash-restart, and restore lifecycle. Set
+`FILE_GUARD_RELEASE_TAG=v0.1.16` to test a specific release. The FUSE test passes
+`/dev/fuse` and `CAP_SYS_ADMIN` into the disposable container; set
+`FILE_GUARD_REQUIRE_FUSE=0` to run only the package checks on a host without
+FUSE. Before publishing, set `FILE_GUARD_DEB_PATH` and
+`FILE_GUARD_RELEASE_TAG` to run the same checks against a local package.
+Starting the units under systemd still requires a systemd PID 1 and is reported
+as an explicit skip.
+
 ## Setup
 
 Replace `alice` with the user whose credentials are guarded.
@@ -59,7 +79,7 @@ Replace `alice` with the user whose credentials are guarded.
 This package ships the **hardened** topology by default - the same one the NixOS
 module uses. The agent's listening socket (`/run/file-guard/agent.sock`) is
 created and held by **root** (PID 1) via systemd socket activation, inside the
-root-owned `/run/file-guard` (mode `0600`). A same-uid attacker can therefore
+root-owned `/run/file-guard` (mode `0755`); the socket is mode `0600`. A same-uid attacker can therefore
 neither hijack the socket name nor connect to it to self-approve prompts; the
 agent process runs as the guarded user only so GUI dialogs reach their session,
 and receives the listening fd rather than creating it.

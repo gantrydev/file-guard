@@ -7,7 +7,9 @@ mod logging;
 mod policy;
 mod process;
 mod prompt;
+mod secure_file;
 mod store;
+mod transaction;
 
 #[cfg(target_os = "macos")]
 mod es;
@@ -146,13 +148,9 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            // Move semantics: capture the original into the store, then remove
-            // it from disk so only the guarded view remains. `restore` is the
-            // inverse. The plaintext is safe in the store throughout.
-            let store = store::create_store()?;
-            let contents = std::fs::read(&expanded)?;
-            store.store(&expanded, &contents)?;
-            std::fs::remove_file(&expanded)?;
+            let store: std::sync::Arc<dyn store::BackingStore> =
+                std::sync::Arc::from(store::create_store()?);
+            transaction::TransactionManager::new(store).store_offline(&expanded)?;
             println!("moved {} into the backing store", expanded.display());
         }
         Command::Restore { file } => {
@@ -170,25 +168,26 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let store = store::create_store()?;
-            if !store.exists(&expanded) {
-                if expanded.exists() {
+            let store: std::sync::Arc<dyn store::BackingStore> =
+                std::sync::Arc::from(store::create_store()?);
+            let manager = transaction::TransactionManager::new(store);
+            match manager.restore(&expanded)? {
+                transaction::RestoreOutcome::Restored => {
+                    println!("restored {}", expanded.display());
+                }
+                transaction::RestoreOutcome::Missing
+                    if std::fs::symlink_metadata(&expanded).is_ok() =>
+                {
                     println!(
                         "{} is already on disk; nothing to restore.",
                         expanded.display()
                     );
-                    return Ok(());
                 }
-                anyhow::bail!(
-                    "no backing-store entry for {} and no file on disk - nothing to recover.",
+                transaction::RestoreOutcome::Missing => anyhow::bail!(
+                    "no v2 snapshot for {} and no file on disk",
                     expanded.display()
-                );
+                ),
             }
-
-            let contents = store.read(&expanded)?;
-            std::fs::write(&expanded, contents)?;
-            store.delete(&expanded)?;
-            println!("restored {}", expanded.display());
         }
     }
 

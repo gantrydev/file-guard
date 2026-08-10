@@ -1,6 +1,6 @@
 [package]
 name = "file-guard"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 description = "Per-process credential access control daemon for Linux (FUSE)"
 license = "MIT"
@@ -36,6 +36,7 @@ assets = [
     ["packaging/tmpfiles/file-guard.conf", "usr/lib/tmpfiles.d/file-guard.conf", "644"],
     ["README.md", "usr/share/doc/file-guard/README.md", "644"],
     ["packaging/README.md", "usr/share/doc/file-guard/PACKAGING.md", "644"],
+    ["docs/storage-v2.md", "usr/share/doc/file-guard/docs/storage-v2.md", "644"],
     ["configs/*.toml", "usr/share/doc/file-guard/configs/", "644"],
     ["LICENSE", "usr/share/doc/file-guard/LICENSE", "644"],
 ]
@@ -80,6 +81,10 @@ fs2 = "0.4"
 
 # Platform FFI
 libc = "0.2"
+rustix = { version = "1.1.4", features = ["event", "fs", "process"] }
+
+# Atomic snapshot journal
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 
 # Binary identity pinning (re-prompt when a binary changes)
 sha2 = "0.11"
