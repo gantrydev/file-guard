@@ -40,7 +40,7 @@ The runner resolves the latest GitHub release, verifies its published SHA-256
 digest, installs the amd64 package with `apt`, and checks its metadata, runtime
 dependencies, files, modes, systemd units, tmpfiles rule, CLI behavior, and a
 real SQLite/FUSE write, crash-restart, and restore lifecycle. Set
-`FILE_GUARD_RELEASE_TAG=v0.1.17` to test a specific release. The FUSE test passes
+`FILE_GUARD_RELEASE_TAG=v0.1.18` to test a specific release. The FUSE test passes
 `/dev/fuse` and `CAP_SYS_ADMIN` into the disposable container; set
 `FILE_GUARD_REQUIRE_FUSE=0` to run only the package checks on a host without
 FUSE. Before publishing, set `FILE_GUARD_DEB_PATH` and

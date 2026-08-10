@@ -17,7 +17,7 @@ pub struct Cli {
 pub enum Command {
     /// Start the daemon (runs in the foreground; let systemd supervise it)
     Start {
-        /// No-op: file-guard is supervised by systemd (Type=exec), not
+        /// No-op: file-guard is supervised by systemd (Type=notify), not
         /// self-daemonizing. Kept for compatibility; use `systemctl` to manage.
         #[arg(short, long)]
         daemon: bool,
@@ -32,6 +32,9 @@ pub enum Command {
         /// How to render prompts. Defaults to the config's prompt_method, else gui.
         #[arg(long, value_enum)]
         method: Option<PromptMethod>,
+        /// Send a desktop notification alongside each prompt
+        #[arg(long)]
+        notify: bool,
     },
     /// Stop the running daemon (SIGTERM; unmounts all FUSE mounts)
     Stop,
@@ -80,6 +83,41 @@ pub enum RulesAction {
     },
     /// Remove the rule at INDEX (as shown by `file-guard rules`)
     Remove { index: usize },
+    /// Edit an existing rule at INDEX: change action, access, or pinning.
+    /// Unchanged fields keep their current values.
+    Edit {
+        /// Index of the rule to edit (as shown by `file-guard rules`)
+        index: usize,
+        /// Change action (allow / deny)
+        #[arg(long, value_enum)]
+        action: Option<RuleAction>,
+        /// Change access direction
+        #[arg(long, value_enum)]
+        access: Option<Access>,
+        /// Pin a new sha256 for the binary (re-hashes the current binary)
+        #[arg(long, conflicts_with = "no_pin")]
+        repin: bool,
+        /// Drop the binary pin (match on path only)
+        #[arg(long)]
+        no_pin: bool,
+    },
+    /// List rules matching one or more filters
+    Find {
+        /// Filter by watched file path (substring match)
+        #[arg(long)]
+        file: Option<String>,
+        /// Filter by binary path (substring match)
+        #[arg(long)]
+        binary: Option<String>,
+        /// Filter by action
+        #[arg(long, value_enum)]
+        action: Option<RuleAction>,
+    },
+    /// Export all rules as TOML to stdout (portable format)
+    Export,
+    /// Import rules from TOML on stdin. Duplicates are skipped; existing
+    /// rules are preserved. Reads until EOF.
+    Import,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]

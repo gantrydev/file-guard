@@ -141,14 +141,14 @@ pub fn stop() -> anyhow::Result<()> {
     let pid = identity.pid;
 
     #[cfg(target_os = "linux")]
-    let process = signal_linux_daemon(identity)?;
+    let maybe_process = signal_linux_daemon(identity)?;
     #[cfg(not(target_os = "linux"))]
     signal_daemon(identity)?;
 
     println!("sent SIGTERM to file-guard (pid {pid}); waiting for unmount…");
 
     #[cfg(target_os = "linux")]
-    {
+    if let Some(process) = maybe_process {
         use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
         let timeout = Timespec {
@@ -174,7 +174,7 @@ pub fn stop() -> anyhow::Result<()> {
         anyhow::bail!("daemon (pid {pid}) did not exit within 15s")
     }
 
-    #[cfg(not(target_os = "linux"))]
+    // pidfd-free polling path (pre-5.1 Linux fallback + all non-Linux).
     for _ in 0..150 {
         if !identity_alive(identity) {
             println!("stopped");
@@ -182,40 +182,75 @@ pub fn stop() -> anyhow::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-
-    #[cfg(not(target_os = "linux"))]
     anyhow::bail!("daemon (pid {pid}) did not exit within 15s");
 }
 
 #[cfg(target_os = "linux")]
-fn signal_linux_daemon(identity: DaemonIdentity) -> anyhow::Result<rustix::fd::OwnedFd> {
+fn signal_linux_daemon(identity: DaemonIdentity) -> anyhow::Result<Option<rustix::fd::OwnedFd>> {
     use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 
     let raw_pid = i32::try_from(identity.pid)
         .ok()
         .and_then(Pid::from_raw)
         .ok_or_else(|| anyhow::anyhow!("invalid daemon pid {}", identity.pid))?;
-    let process = pidfd_open(raw_pid, PidfdFlags::empty())
-        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
-    if !identity_alive(identity) {
-        anyhow::bail!(
-            "daemon pid {} was recycled before it could be signaled",
-            identity.pid
-        )
-    }
-    pidfd_send_signal(&process, Signal::TERM).map_err(|error| {
-        let error = std::io::Error::from_raw_os_error(error.raw_os_error());
-        if error.kind() == std::io::ErrorKind::PermissionDenied {
-            anyhow::anyhow!(
-                "cannot signal daemon (pid {}): it runs as another user. \
-                 Use `sudo systemctl stop file-guard`.",
-                identity.pid
-            )
-        } else {
-            anyhow::anyhow!("failed to signal daemon (pid {}): {error}", identity.pid)
+    match pidfd_open(raw_pid, PidfdFlags::empty()) {
+        Ok(process) => {
+            if !identity_alive(identity) {
+                anyhow::bail!(
+                    "daemon pid {} was recycled before it could be signaled",
+                    identity.pid
+                )
+            }
+            pidfd_send_signal(&process, Signal::TERM).map_err(|error| {
+                let error = std::io::Error::from_raw_os_error(error.raw_os_error());
+                if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    anyhow::anyhow!(
+                        "cannot signal daemon (pid {}): it runs as another user. \
+                         Use `sudo systemctl stop file-guard`.",
+                        identity.pid
+                    )
+                } else {
+                    anyhow::anyhow!("failed to signal daemon (pid {}): {error}", identity.pid)
+                }
+            })?;
+            Ok(Some(process))
         }
-    })?;
-    Ok(process)
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::INVAL) => {
+            // Pre-5.1 kernel: pidfd_open not available. Fall back to kill()
+            // after re-verifying the start-time identity to guard against
+            // PID recycling.
+            if !identity_alive(identity) {
+                anyhow::bail!(
+                    "daemon pid {} was recycled before it could be signaled",
+                    identity.pid
+                )
+            }
+            let pid = identity.pid as libc::pid_t;
+            if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    anyhow::bail!(
+                        "cannot signal daemon (pid {}): it runs as another user. \
+                         Use `sudo systemctl stop file-guard`.",
+                        identity.pid
+                    )
+                }
+                anyhow::bail!("failed to signal daemon (pid {}): {error}", identity.pid)
+            }
+            tracing::info!(
+                "pidfd_open unavailable (kernel < 5.1); signaled via kill(), \
+                 falling back to sleep-based polling"
+            );
+            Ok(None)
+        }
+        Err(error) => {
+            let error = std::io::Error::from_raw_os_error(error.raw_os_error());
+            Err(anyhow::anyhow!(
+                "pidfd_open for pid {}: {error}",
+                identity.pid
+            ))
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

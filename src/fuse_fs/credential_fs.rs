@@ -1,3 +1,29 @@
+//! FUSE filesystem that serves a single guarded credential file.
+//!
+//! Each [`CredentialFs`] instance mounts over one watched path. The FUSE
+//! handlers gate every `open`, `read`, `write`, and `setattr` (truncate)
+//! through the [`PolicyEngine`]. Authorization for `open` and handle-less
+//! `setattr` runs off the FUSE session thread (spawned onto the tokio runtime)
+//! so a slow user prompt cannot stall `stat` or `read` on unrelated handles
+//! of the same mount.
+//!
+//! # Shared-content buffer
+//!
+//! All open handles share a single [`Content`] buffer (POSIX shared-inode
+//! semantics). This prevents the classic "truncate reverted by stale handle
+//! buffer" corruption and ensures concurrent writers see each other's edits.
+//! The buffer is capped at [`MAX_CONTENT_LEN`] (16 MiB) — credential files
+//! are tiny, and a write at a huge offset is rejected with `EFBIG` rather
+//! than triggering a multi-gigabyte allocation.
+//!
+//! # Off-thread authorization
+//!
+//! The free-standing [`decide_open`] function is used by both `open()` and
+//! `setattr()` to identify the calling process and evaluate policy without
+//! blocking the single-threaded FUSE session. It spawns `identify` (which
+//! stats `/proc` and hashes the binary) onto a blocking thread pool so it
+//! doesn't occupy an async worker.
+
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -247,46 +273,6 @@ impl CredentialFs {
     /// just `open`, so a foreign user can't even `stat` it to learn its size.
     fn uid_permitted(&self, uid: u32) -> bool {
         uid == self.owner_uid || uid == 0
-    }
-
-    /// Identify the calling process, evaluate policy for a single `access`
-    /// direction, and return the process info iff allowed. Runs on the caller's
-    /// thread (used by the handle-less `setattr` truncate); `open` uses the
-    /// off-thread `decide_open` instead so a pending prompt can't freeze the
-    /// single-threaded FUSE session.
-    fn authorize(&self, req: &Request, access: Access) -> Option<ProcessInfo> {
-        let info = match crate::process::identify::identify(req.pid()) {
-            Ok(info) => info,
-            Err(e) => {
-                tracing::warn!("failed to identify pid {}: {e}", req.pid());
-                return None;
-            }
-        };
-
-        if !self.uid_permitted(req.uid()) {
-            tracing::warn!(
-                "denying uid {} access to {} (owner uid {:?})",
-                req.uid(),
-                self.watched_path.display(),
-                self.owner_uid,
-            );
-            self.logger
-                .log(&info, &self.watched_path, access, &Decision::DenyOnce, None);
-            return None;
-        }
-
-        let needs_read = access != Access::Write;
-        let needs_write = access != Access::Read;
-        let decision = self.rt_handle.block_on(self.policy.evaluate_open(
-            &info,
-            &self.watched_path,
-            needs_read,
-            needs_write,
-        ));
-        self.logger
-            .log(&info, &self.watched_path, access, &decision, None);
-
-        decision.is_allowed().then_some(info)
     }
 
     fn apply_write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, MutationError> {
@@ -581,17 +567,24 @@ impl Filesystem for CredentialFs {
             return;
         }
 
-        if let Some(new_size) = size {
-            let authorized = match fh {
-                Some(handle) => self
-                    .shared
-                    .handles
-                    .lock()
-                    .unwrap()
-                    .get(&handle.0)
-                    .is_some_and(|state| state.access == Access::Write),
-                None => self.authorize(req, Access::Write).is_some(),
-            };
+        let Some(new_size) = size else {
+            reply.attr(
+                &default_ttl(),
+                &build_file_attr(self.current_size(), &self.presentation),
+            );
+            return;
+        };
+
+        // Truncate via an open handle: the handle already passed authorization,
+        // so just check its access direction synchronously.
+        if let Some(handle) = fh {
+            let authorized = self
+                .shared
+                .handles
+                .lock()
+                .unwrap()
+                .get(&handle.0)
+                .is_some_and(|state| state.access == Access::Write);
             if !authorized {
                 reply.error(Errno::EACCES);
                 return;
@@ -611,12 +604,58 @@ impl Filesystem for CredentialFs {
                     return;
                 }
             }
+            reply.attr(
+                &default_ttl(),
+                &build_file_attr(self.current_size(), &self.presentation),
+            );
+            return;
         }
 
-        reply.attr(
-            &default_ttl(),
-            &build_file_attr(self.current_size(), &self.presentation),
-        );
+        // No open handle — a path-based ftruncate. Authorize off the FUSE
+        // session thread: a prompt can block for `prompt_timeout` seconds and
+        // must not stall the entire mount (concurrent `stat`/`read` on other
+        // handles would hang). The reply is delivered from the spawned task,
+        // matching the pattern used in `open()`.
+        let policy = self.policy.clone();
+        let logger = self.logger.clone();
+        let shared = self.shared.clone();
+        let manager = self.manager.clone();
+        let watched = self.watched_path.clone();
+        let owner_uid = self.owner_uid;
+        let uid = req.uid();
+        let pid = req.pid();
+        let presentation = self.presentation.clone();
+
+        self.rt_handle.spawn(async move {
+            match decide_open(
+                &policy, &logger, &watched, owner_uid, uid, pid,
+                false, // truncate only needs write
+                true,
+            )
+            .await
+            {
+                Some(_info) => {
+                    let result = shared.apply_truncate(&manager, new_size);
+                    match result {
+                        Ok(()) => {}
+                        Err(MutationError::Invalid(error)) => {
+                            reply.error(error);
+                            return;
+                        }
+                        Err(MutationError::Commit(error)) => {
+                            tracing::error!("truncate of {} failed: {error}", watched.display());
+                            reply.error(Errno::EIO);
+                            return;
+                        }
+                    }
+                    reply.attr(
+                        &default_ttl(),
+                        &build_file_attr(shared.current_size(), &presentation),
+                    );
+                }
+                None => reply.error(Errno::EACCES),
+            }
+        });
     }
 
     fn flush(
@@ -676,8 +715,8 @@ mod tests {
     use crate::logging::AccessLogger;
     use crate::policy::engine::PolicyEngine;
     use crate::prompt::PromptClient;
-    use crate::store::testing::{MemoryStore, mount_intent_record};
     use crate::store::{FinalizationRecord, RecordVersion, StoreError, StoreResult};
+    use crate::testing::{MemoryStore, mount_intent_record};
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
 

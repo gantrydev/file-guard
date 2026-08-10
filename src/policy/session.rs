@@ -68,10 +68,4 @@ impl SessionState {
         };
         has(access) || has(Access::Any)
     }
-
-    /// Clear all session state.
-    #[allow(dead_code)] // TODO: invoke on an explicit `session reset` / re-auth.
-    pub fn clear(&self) {
-        self.session_allows.write().unwrap().clear();
-    }
 }

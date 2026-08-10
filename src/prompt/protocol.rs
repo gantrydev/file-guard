@@ -68,7 +68,7 @@ impl From<&ProcessInfo> for ProcessDesc {
                 .script
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
-            code_signature: info.code_signature.clone(),
+            code_signature: None,
             parents: info
                 .parent_chain
                 .iter()

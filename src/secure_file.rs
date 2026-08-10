@@ -1,3 +1,24 @@
+//! Low-level, race-free filesystem operations for credential capture and restore.
+//!
+//! Every operation that touches the guarded file's parent directory uses
+//! `O_NOFOLLOW` and `openat`-style APIs (via `rustix`) to avoid TOCTOU races
+//! through symlink swaps. The [`ResolvedPath`] type pins a file's parent
+//! directory as an `OwnedFd` at resolution time, and all subsequent operations
+//! (stat, rename, create) go through that fd.
+//!
+//! # Key types
+//!
+//! - [`ResolvedPath`]: a pinned parent-directory fd + filename, the basis for
+//!   all safe operations on the guarded file.
+//! - [`StagingArea`]: a hidden `.tmp` directory inside the parent, used for
+//!   crash-safe atomic rename (write temp file, `fsync`, rename into place).
+//! - [`capture`]: reads the current file contents and metadata through the
+//!   pinned directory fd into a [`CapturedSource`].
+//! - [`restore_file`]: writes contents back with the original metadata (uid,
+//!   gid, mode, timestamps, xattrs), all through the pinned fd.
+//! - [`transactional_write`]: write-then-rename pattern used by the
+//!   transaction manager for atomic content updates.
+
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -742,30 +763,6 @@ fn stat_ctime(stat: &Stat) -> Timestamp {
     Timestamp {
         seconds: stat.st_ctime,
         nanoseconds: stat.st_ctime_nsec as i64,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn stat_atime(stat: &Stat) -> Timestamp {
-    Timestamp {
-        seconds: stat.st_atimespec.tv_sec,
-        nanoseconds: stat.st_atimespec.tv_nsec,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn stat_mtime(stat: &Stat) -> Timestamp {
-    Timestamp {
-        seconds: stat.st_mtimespec.tv_sec,
-        nanoseconds: stat.st_mtimespec.tv_nsec,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn stat_ctime(stat: &Stat) -> Timestamp {
-    Timestamp {
-        seconds: stat.st_ctimespec.tv_sec,
-        nanoseconds: stat.st_ctimespec.tv_nsec,
     }
 }
 

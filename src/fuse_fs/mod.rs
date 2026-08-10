@@ -14,7 +14,7 @@ mod integration_tests {
     use crate::policy::engine::PolicyEngine;
     use crate::policy::rule::Access;
     use crate::prompt::PromptClient;
-    use crate::store::testing::{MemoryStore, mount_intent_record};
+    use crate::testing::{MemoryStore, mount_intent_record};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;

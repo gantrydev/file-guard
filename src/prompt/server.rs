@@ -18,13 +18,15 @@ use crate::prompt::{notification, terminal};
 
 pub struct PromptServer {
     method: PromptMethod,
+    notify: bool,
     dialog_lock: tokio::sync::Mutex<()>,
 }
 
 impl PromptServer {
-    pub fn new(method: PromptMethod) -> Self {
+    pub fn new(method: PromptMethod, notify: bool) -> Self {
         Self {
             method,
+            notify,
             dialog_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -78,7 +80,9 @@ impl PromptServer {
     }
 
     async fn render(&self, req: &AgentRequest) -> PromptOutcome {
-        notification::notify(req);
+        if self.notify {
+            notification::notify(req);
+        }
         let timeout = Duration::from_millis(req.timeout_ms.max(1));
 
         match self.method {
@@ -91,7 +95,7 @@ impl PromptServer {
                     decided_or_none(terminal_prompt(req, timeout).await)
                 }
             },
-            PromptMethod::Notification => {
+            PromptMethod::LogOnly => {
                 tokio::time::sleep(timeout).await;
                 PromptOutcome::NoResponse
             }
@@ -114,9 +118,13 @@ fn decided_or_none(choice: Option<UserChoice>) -> PromptOutcome {
 }
 
 /// Build the listener and run the agent until terminated.
-pub async fn run_agent(method: PromptMethod, socket: Option<PathBuf>) -> anyhow::Result<()> {
+pub async fn run_agent(
+    method: PromptMethod,
+    notify: bool,
+    socket: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let listener = build_listener(socket)?;
-    PromptServer::new(method).serve(listener).await
+    PromptServer::new(method, notify).serve(listener).await
 }
 
 fn build_listener(socket: Option<PathBuf>) -> anyhow::Result<UnixListener> {

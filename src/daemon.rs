@@ -67,12 +67,15 @@ impl Daemon {
             tracing::warn!("failed to publish config pointer: {e}");
         }
 
+        notify_systemd_ready();
+
         tracing::info!("file-guard started, watching {} files", watched.len());
 
         Ok(())
     }
 
     pub async fn stop(&mut self) -> anyhow::Result<()> {
+        notify_systemd_stopping();
         if let Some(mut interceptor) = self.interceptor.take() {
             interceptor.stop()?;
         }
@@ -148,6 +151,61 @@ fn remove_config_pointer() {
     }
 }
 
+/// Notify systemd that the daemon has finished startup (all mounts up). Uses
+/// the `NOTIFY_SOCKET` environment variable directly — no link-time dependency
+/// on libsystemd. If the daemon is not running under systemd (no socket), this
+/// is a silent no-op.
+fn notify_systemd_ready() {
+    send_systemd_notification(b"READY=1");
+}
+
+/// Notify systemd that the daemon is stopping.
+fn notify_systemd_stopping() {
+    send_systemd_notification(b"STOPPING=1");
+}
+
+fn send_systemd_notification(state: &[u8]) {
+    let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") else {
+        return;
+    };
+
+    if let Err(error) = send_systemd_notification_to(&socket_path, state) {
+        tracing::warn!("systemd notification failed: {error}");
+    }
+}
+
+fn send_systemd_notification_to(socket_path: &str, state: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::net::UnixDatagram;
+
+    let socket = UnixDatagram::unbound()?;
+    if let Some(name) = socket_path.strip_prefix('@') {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::linux::net::SocketAddrExt;
+
+            let address = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+            socket.send_to_addr(state, &address)?;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = name;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "abstract Unix sockets are only supported on Linux",
+            ));
+        }
+    }
+    if !socket_path.starts_with('/') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "NOTIFY_SOCKET must be an absolute or abstract Unix socket path",
+        ));
+    }
+    socket.send_to(state, socket_path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +245,35 @@ mod tests {
         assert!(result.is_err());
         assert!(interceptor.started);
         assert!(interceptor.aborted);
+    }
+
+    #[test]
+    fn systemd_notification_supports_filesystem_socket() {
+        let path = std::env::temp_dir().join(format!("file-guard-notify-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+
+        send_systemd_notification_to(path.to_str().unwrap(), b"READY=1").unwrap();
+
+        let mut received = [0; 32];
+        let length = listener.recv(&mut received).unwrap();
+        assert_eq!(&received[..length], b"READY=1");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_notification_supports_abstract_socket() {
+        use std::os::linux::net::SocketAddrExt;
+
+        let name = format!("file-guard-notify-{}", std::process::id());
+        let address = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let listener = std::os::unix::net::UnixDatagram::bind_addr(&address).unwrap();
+
+        send_systemd_notification_to(&format!("@{name}"), b"STOPPING=1").unwrap();
+
+        let mut received = [0; 32];
+        let length = listener.recv(&mut received).unwrap();
+        assert_eq!(&received[..length], b"STOPPING=1");
     }
 }

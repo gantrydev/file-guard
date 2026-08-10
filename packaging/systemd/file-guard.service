@@ -4,7 +4,7 @@ Documentation=https://github.com/gantrydev/file-guard
 After=local-fs.target
 
 [Service]
-Type=exec
+Type=notify
 # Set FILE_GUARD_USER=<you> here (REQUIRED): the user whose ~ is guarded and
 # whose graphical session renders prompts.
 EnvironmentFile=-/etc/default/file-guard

@@ -2,44 +2,24 @@ use std::path::PathBuf;
 
 pub fn binary_path(pid: u32) -> anyhow::Result<PathBuf> {
     let proc_path = format!("/proc/{pid}/exe");
-    let resolved = std::fs::read_link(&proc_path)
-        .map_err(|e| anyhow::anyhow!("readlink {proc_path} failed for pid {pid}: {e}"))?;
-
-    Ok(resolved)
+    std::fs::read_link(&proc_path)
+        .map_err(|e| anyhow::anyhow!("readlink {proc_path} failed for pid {pid}: {e}"))
 }
 
 pub fn start_time(pid: u32) -> anyhow::Result<u64> {
-    let stat_path = format!("/proc/{pid}/stat");
-    let stat_contents = std::fs::read_to_string(&stat_path)
-        .map_err(|e| anyhow::anyhow!("failed to read {stat_path}: {e}"))?;
-
-    let close_paren_offset = stat_contents
-        .rfind(')')
-        .ok_or_else(|| anyhow::anyhow!("malformed /proc/{pid}/stat: no closing paren"))?;
-
-    let fields_after_comm = &stat_contents[close_paren_offset + 2..];
-    let fields: Vec<&str> = fields_after_comm.split_whitespace().collect();
-    let starttime_field_index = 19;
-    let starttime_raw = fields
-        .get(starttime_field_index)
-        .ok_or_else(|| anyhow::anyhow!("missing starttime field in /proc/{pid}/stat"))?;
-
-    let starttime_ticks: u64 = starttime_raw
-        .parse()
-        .map_err(|e| anyhow::anyhow!("failed to parse starttime for pid {pid}: {e}"))?;
-
+    let me = procfs::process::Process::new(pid as i32)
+        .map_err(|e| anyhow::anyhow!("opening /proc/{pid}: {e}"))?;
+    let stat = me
+        .stat()
+        .map_err(|e| anyhow::anyhow!("reading /proc/{pid}/stat: {e}"))?;
+    // starttime is in clock ticks since boot; convert to nanosecond epoch
+    // approximation by scaling to seconds via sysconf(_SC_CLK_TCK) then nanos.
+    let ticks = stat.starttime;
     let clock_ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    let valid_ticks = clock_ticks_per_sec > 0;
-    if !valid_ticks {
+    if clock_ticks_per_sec <= 0 {
         anyhow::bail!("sysconf(_SC_CLK_TCK) returned invalid value");
     }
-
-    let nanos = starttime_ticks * 1_000_000_000 / clock_ticks_per_sec as u64;
-    Ok(nanos)
-}
-
-pub fn code_signature(_pid: u32) -> Option<String> {
-    None
+    Ok(ticks * 1_000_000_000 / clock_ticks_per_sec as u64)
 }
 
 /// The process's argv, from `/proc/<pid>/cmdline` (NUL-separated).
@@ -51,4 +31,37 @@ pub fn cmdline(pid: u32) -> anyhow::Result<Vec<String>> {
         .filter(|s| !s.is_empty())
         .map(|s| String::from_utf8_lossy(s).into_owned())
         .collect())
+}
+
+/// Read the immediate parent's identity from `/proc`.
+pub fn parent_info(pid: u32) -> Option<(u32, String, Option<PathBuf>)> {
+    let process = procfs::process::Process::new(pid as i32).ok()?;
+    let ppid = u32::try_from(process.stat().ok()?.ppid).ok()?;
+    if ppid == 0 {
+        return None;
+    }
+    let parent = procfs::process::Process::new(ppid as i32).ok()?;
+    let name = parent.stat().ok()?.comm;
+    let binary_path = binary_path(ppid).ok();
+    Some((ppid, name, binary_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parent_info_labels_the_parent_process() {
+        let expected_pid = unsafe { libc::getppid() } as u32;
+        let expected_name = procfs::process::Process::new(expected_pid as i32)
+            .unwrap()
+            .stat()
+            .unwrap()
+            .comm;
+
+        let (pid, name, _) = parent_info(std::process::id()).unwrap();
+
+        assert_eq!(pid, expected_pid);
+        assert_eq!(name, expected_name);
+    }
 }

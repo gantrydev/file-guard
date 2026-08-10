@@ -15,9 +15,10 @@
 default_action  = "deny"     # "allow" | "deny" - applied when a prompt times out
                              #   or the session agent is unreachable
 prompt_timeout  = 30         # seconds to wait for a response before default_action
-prompt_method   = "terminal" # "terminal" | "gui" | "notification"
+prompt_method   = "terminal" # "terminal" | "gui" | "log_only"
                              #   prompts are rendered by `file-guard agent`;
                              #   "gui" uses zenity/kdialog in your session.
+notify          = false      # send a desktop notification alongside prompts
 restore_on_stop = false      # restore originals to disk when the daemon stops
 log_destination = "stdout"   # "stdout" (journal), or a file path for an NDJSON
                              #   audit log queryable with `file-guard log`,
@@ -62,7 +63,7 @@ path = "~/.gitconfig"
 default_action = "allow"   # NOTE: per-file default is not honored yet (TODO)
 
 # ── Rules ───────────────────────────────────────────────────────────────────
-# A rule = (file, binary, action [, access, sha256, signature]). `binary` must
+# A rule = (file, binary, action [, access, sha256]). `binary` must
 # equal the *resolved* executable path of the caller (`readlink /proc/<pid>/exe`).
 #
 #   access   "read" (default) | "write" | "any" - the direction(s) authorized.
@@ -71,7 +72,6 @@ default_action = "allow"   # NOTE: per-file default is not honored yet (TODO)
 #            (e.g. an upgrade) the rule no longer matches and file-guard
 #            RE-PROMPTS rather than honoring a stale grant. Hand-written rules
 #            usually omit it (path-only match, with a one-time warning).
-#   signature  macOS code-signing identity (ignored on Linux).
 #
 # The robust way to build rules is to let the daemon prompt you and choose
 # "Allow always": it records the caller's real path AND pins its current sha256

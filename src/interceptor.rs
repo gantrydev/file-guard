@@ -21,19 +21,13 @@ pub trait Interceptor: Send {
 }
 
 pub fn create_interceptor(args: InterceptorArgs) -> anyhow::Result<Box<dyn Interceptor>> {
-    #[cfg(target_os = "macos")]
-    {
-        let interceptor = crate::es::EsInterceptor::new(args);
-        return Ok(Box::new(interceptor));
-    }
-
     #[cfg(target_os = "linux")]
     {
         let interceptor = crate::fuse_fs::FuseInterceptor::new(args);
         Ok(Box::new(interceptor))
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     {
         anyhow::bail!("unsupported platform");
     }

@@ -32,7 +32,3 @@ jobs:
           nix develop --command cargo test fuse_fs::integration_tests -- --ignored --test-threads=1
       - name: build package
         run: nix build .#file-guard
-
-  # macOS (Endpoint Security) is not built here: its enforcement path is
-  # cfg-gated and pending the ES layout fix plus an Apple entitlement. Re-add a
-  # build job when that work resumes.

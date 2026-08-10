@@ -34,7 +34,6 @@ impl PolicyEngine {
                 },
                 access: r.access,
                 sha256: r.sha256.clone(),
-                signature: r.signature.clone(),
                 script: r.script.clone(),
                 script_sha256: r.script_sha256.clone(),
             })
@@ -177,7 +176,7 @@ impl PolicyEngine {
     /// legitimately rebuilt/upgraded binary re-authorizes interactively instead
     /// of being hard-blocked. An unpinned (legacy) rule matches on path alone.
     fn identity_matches(&self, rule: &Rule, process: &ProcessInfo) -> bool {
-        if rule.sha256.is_none() && rule.signature.is_none() {
+        if rule.sha256.is_none() {
             warn_unpinned_once(&rule.binary);
             return true;
         }
@@ -200,13 +199,6 @@ impl PolicyEngine {
                     return false;
                 }
             }
-        }
-
-        #[cfg(target_os = "macos")]
-        if let Some(expected) = &rule.signature
-            && process.code_signature.as_deref() != Some(expected.as_str())
-        {
-            return false;
         }
 
         // Interpreter rules also pin the script: the same interpreter running a
@@ -251,7 +243,7 @@ impl PolicyEngine {
     }
 
     /// Capture a persistent rule from a prompt response, pinning the binary's
-    /// current hash (and macOS signature) so a later change re-prompts.
+    /// current hash so a later change re-prompts.
     fn persist_rule(&self, process: &ProcessInfo, file: &Path, access: Access, action: Action) {
         let sha256 = match crate::process::integrity::hash_file(&process.binary_path) {
             Ok(h) => Some(h),
@@ -284,8 +276,6 @@ impl PolicyEngine {
             action,
             access,
             sha256,
-            // None on Linux (code_signature is always None there).
-            signature: process.code_signature.clone(),
             script: process
                 .script
                 .as_ref()
@@ -310,11 +300,11 @@ impl PolicyEngine {
             },
             access: rule.access,
             sha256: rule.sha256.clone(),
-            signature: rule.signature.clone(),
+            signature: None,
             script: rule.script.clone(),
             script_sha256: rule.script_sha256.clone(),
         };
-        Config::append_rule(&entry)?;
+        let _ = Config::append_rule(&entry)?;
         self.rules.write().unwrap().push(rule);
         Ok(())
     }
@@ -363,7 +353,6 @@ mod tests {
             binary_name: "x".into(),
             script: None,
             parent_chain: vec![],
-            code_signature: None,
         }
     }
 
@@ -374,7 +363,6 @@ mod tests {
             action: Action::Allow,
             access: Access::Read,
             sha256,
-            signature: None,
             script: None,
             script_sha256: None,
         }
@@ -432,7 +420,6 @@ mod tests {
             action: Action::Allow,
             access: Access::Read,
             sha256: Some(bin_hash.clone()),
-            signature: None,
             script: Some(script.to_string_lossy().into_owned()),
             script_sha256,
         };

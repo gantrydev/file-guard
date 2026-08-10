@@ -53,7 +53,7 @@ impl Access {
 }
 
 /// A persistent rule: binary X accessing file Y -> allow/deny, scoped to a
-/// direction and (optionally) pinned to the binary's content hash / signature.
+/// direction and optionally pinned to the binary's content hash.
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub file: PathBuf,
@@ -64,8 +64,6 @@ pub struct Rule {
     /// caller whose hash differs does **not** match (it re-prompts) rather than
     /// being denied - so a legitimate rebuild re-authorizes instead of breaking.
     pub sha256: Option<String>,
-    /// macOS code-signing identity captured with the rule (unused on Linux).
-    pub signature: Option<String>,
     /// For interpreter rules, the pinned script path. When set, a caller running
     /// the same interpreter but a *different* script does not match (re-prompts),
     /// narrowing "any python" to "this program".
