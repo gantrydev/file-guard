@@ -149,6 +149,8 @@ mod integration_tests {
             f.flush()
         })();
         let got = std::fs::read(&mountpoint);
+        std::fs::set_permissions(&mountpoint, std::fs::Permissions::from_mode(0o600))
+            .expect("idempotent chmod must succeed");
         let chmod_error =
             std::fs::set_permissions(&mountpoint, std::fs::Permissions::from_mode(0o644))
                 .expect_err("unsupported chmod must not report success");

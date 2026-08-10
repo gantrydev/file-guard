@@ -54,6 +54,10 @@ fn build_file_attr(file_size: u64, metadata: &RestoreMetadata) -> FileAttr {
     }
 }
 
+fn changes_permissions(requested: Option<u32>, current: u32) -> bool {
+    requested.is_some_and(|mode| mode & 0o7777 != current & 0o7777)
+}
+
 fn slice_content(content: &[u8], offset: u64, size: u32) -> &[u8] {
     let start = offset as usize;
     let content_len = content.len();
@@ -562,7 +566,7 @@ impl Filesystem for CredentialFs {
             reply.error(Errno::EACCES);
             return;
         }
-        if mode.is_some()
+        if changes_permissions(mode, self.presentation.mode)
             || uid.is_some()
             || gid.is_some()
             || atime.is_some()
@@ -877,6 +881,14 @@ mod tests {
             Err(libc::EFBIG)
         );
         assert_eq!(fs.current_size(), 0); // nothing allocated/grown
+    }
+
+    #[test]
+    fn identical_chmod_is_not_a_metadata_change() {
+        assert!(!changes_permissions(None, 0o600));
+        assert!(!changes_permissions(Some(0o600), 0o600));
+        assert!(!changes_permissions(Some(libc::S_IFREG | 0o600), 0o600));
+        assert!(changes_permissions(Some(0o640), 0o600));
     }
 
     /// A sparse write past EOF zero-fills the gap and grows the file.
