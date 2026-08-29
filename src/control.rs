@@ -176,7 +176,7 @@ pub fn stop() -> anyhow::Result<()> {
         anyhow::bail!("daemon (pid {pid}) did not exit within 15s")
     }
 
-    // pidfd-free polling path (pre-5.1 Linux fallback + all non-Linux).
+    // pidfd-free polling path when pidfds are unavailable.
     for _ in 0..150 {
         if !identity_alive(identity) {
             println!("stopped");

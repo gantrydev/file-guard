@@ -338,8 +338,9 @@ fn print_rule(index: usize, rule: &ManagedRule) {
 }
 
 /// Block until the daemon is asked to shut down. Handles SIGINT (Ctrl-C) and,
-/// on Unix, SIGTERM (what `systemctl stop` / launchd send) so the daemon
-/// always runs its unmount path instead of being killed with mounts live.
+/// on Unix, SIGTERM (typically sent by a service manager such as systemd) so
+/// the daemon always runs its unmount path instead of being killed with live
+/// mounts.
 async fn wait_for_shutdown() -> anyhow::Result<()> {
     #[cfg(unix)]
     {

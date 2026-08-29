@@ -1,8 +1,8 @@
 //! Graphical prompt backends. Tries `zenity`, then `kdialog`. Each renders a
 //! radio list of the five choices and prints a machine key on stdout.
 //!
-//! All arguments are passed as argv (never interpolated into a shell or an
-//! AppleScript string), so a hostile file path or binary name can't inject.
+//! All arguments are passed directly as argv (never interpolated into a shell
+//! command), so a hostile file path or binary name can't inject.
 
 use std::process::ExitStatus;
 use std::time::Duration;
