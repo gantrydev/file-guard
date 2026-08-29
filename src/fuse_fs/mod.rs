@@ -38,7 +38,7 @@ mod integration_tests {
         std::fs::write(&mountpoint, b"").unwrap();
         let mut config = fuser::Config::default();
         config.mount_options = vec![fuser::MountOption::FSName("file-guard".into())];
-        let session = fuser::spawn_mount2(fs, &mountpoint, &config)
+        let session = fuser::spawn_mount(fs, &mountpoint, &config)
             .expect("the required FUSE integration environment must permit mounting");
         std::thread::sleep(Duration::from_millis(100));
         (mountpoint, session)
