@@ -22,13 +22,17 @@ jobs:
             experimental-features = nix-command flakes
       - name: rustfmt
         run: nix develop --command cargo fmt --check
+      - name: actionlint
+        run: nix develop --command actionlint
+      - name: pinned actions
+        run: nix develop --command pinact run -fix=false -no-api
       - name: clippy (deny warnings)
-        run: nix develop --command cargo clippy --all-targets -- -D warnings
+        run: nix develop --command cargo clippy --locked --all-targets -- -D warnings
       - name: test
-        run: nix develop --command cargo test
+        run: nix develop --command cargo test --locked
       - name: FUSE integration tests
         run: |
           test -c /dev/fuse
-          nix develop --command cargo test fuse_fs::integration_tests -- --ignored --test-threads=1
+          nix develop --command cargo test --locked fuse_fs::integration_tests -- --ignored --test-threads=1
       - name: build package
         run: nix build .#file-guard

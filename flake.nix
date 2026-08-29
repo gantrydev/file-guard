@@ -24,6 +24,8 @@
               cargoLock.lockFile = ./Cargo.lock;
               nativeBuildInputs = [ pkgs.pkg-config ];
               buildInputs = [ pkgs.fuse3 ];
+              # Nix 2.35's Linux sandbox blocks xattr syscalls; CI runs cargo test separately.
+              doCheck = false;
               meta = {
                 description = "Per-process credential file access control (FUSE)";
                 homepage = "https://github.com/gantrydev/file-guard";
@@ -45,7 +47,7 @@
         default = pkgs.mkShell {
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.fuse3 ];
-          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer ];
+          packages = with pkgs; [ actionlint cargo rustc clippy pinact rustfmt rust-analyzer ];
         };
       });
 

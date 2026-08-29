@@ -87,6 +87,6 @@ sha2 = "0.11"
 hex = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = "0.17"
+fuser = "0.18"
 # /proc filesystem reader (process info without whole-table scan)
-procfs = "0.17"
+procfs = "0.18"

@@ -253,7 +253,7 @@ impl Interceptor for FuseInterceptor {
                     config.acl = SessionACL::All;
                 }
 
-                let session = match fuser::spawn_mount2(credential_fs, watched_path, &config) {
+                let session = match fuser::spawn_mount(credential_fs, watched_path, &config) {
                     Ok(session) => session,
                     Err(error) => {
                         let rollback = (|| -> anyhow::Result<()> {
