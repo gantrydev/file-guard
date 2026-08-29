@@ -24,6 +24,9 @@
               cargoLock.lockFile = ./Cargo.lock;
               nativeBuildInputs = [ pkgs.pkg-config ];
               buildInputs = [ pkgs.fuse3 ];
+              preCheck = ''
+                chmod 700 "$TMPDIR"
+              '';
               meta = {
                 description = "Per-process credential file access control (FUSE)";
                 homepage = "https://github.com/gantrydev/file-guard";
