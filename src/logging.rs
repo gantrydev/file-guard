@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config_runtime;
 use crate::policy::rule::{Access, Decision};
 use crate::process::identify::ProcessInfo;
 use std::collections::VecDeque;
@@ -63,7 +63,7 @@ impl AccessLogger {
         let sink = match destination.trim() {
             "" | "stdout" | "journal" => Sink::Stdout,
             path => {
-                let path = Config::expand_path(path)?;
+                let path = config_runtime::expand_path(path)?;
                 prepare_audit_file(&path)?;
                 Sink::File(path)
             }

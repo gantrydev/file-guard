@@ -1,6 +1,7 @@
 mod cli;
 mod commands;
 mod config;
+mod config_runtime;
 mod control;
 mod control_api;
 mod daemon;

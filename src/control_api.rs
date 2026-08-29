@@ -118,7 +118,7 @@ impl Drop for ControlEndpoint {
 }
 
 pub fn bind_listener(guarded_gid: u32) -> anyhow::Result<ControlEndpoint> {
-    let path = crate::config::control_socket_path()?;
+    let path = crate::config_runtime::control_socket_path()?;
     bind_listener_at(path, guarded_gid)
 }
 
@@ -199,7 +199,7 @@ async fn request_at(path: &Path, command: ControlCommand) -> anyhow::Result<Cont
 }
 
 pub async fn dispatch(command: ControlCommand) -> anyhow::Result<ControlPayload> {
-    let paths = crate::config::control_socket_client_paths()?;
+    let paths = crate::config_runtime::control_socket_client_paths()?;
     for path in &paths {
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_socket() => {
@@ -450,7 +450,7 @@ fn execute_offline(command: ControlCommand, lease: RuleLease) -> anyhow::Result<
 }
 
 fn normalized_declarative_rules() -> anyhow::Result<Vec<RuleEntry>> {
-    crate::config::Config::load()?
+    crate::config_runtime::load()?
         .rule
         .into_iter()
         .map(crate::policy::engine::normalize_rule_entry)

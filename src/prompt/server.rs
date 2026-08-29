@@ -181,7 +181,7 @@ fn build_listener(socket: Option<PathBuf>) -> anyhow::Result<UnixListener> {
 
     let path = match socket {
         Some(path) => path,
-        None => crate::config::agent_socket_path()?,
+        None => crate::config_runtime::agent_socket_path()?,
     };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

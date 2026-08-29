@@ -11,10 +11,10 @@ pub(super) async fn execute(command: Command) -> anyhow::Result<()> {
                     anyhow::anyhow!("another learned-rule owner is already active")
                 })?,
             );
-            crate::config::Config::reconcile_seed(|previous, declarative| {
+            crate::config_runtime::reconcile_seed(|previous, declarative| {
                 migrate_legacy_rules(&rule_lease, previous, declarative)
             })?;
-            let config = crate::config::Config::load()?;
+            let config = crate::config_runtime::load()?;
             let mut d = crate::daemon::Daemon::new(config, rule_lease)?;
             d.start().await?;
 
@@ -29,7 +29,7 @@ pub(super) async fn execute(command: Command) -> anyhow::Result<()> {
             notify,
         } => {
             // CLI flag wins; else the config's prompt_method; else GUI.
-            let config = crate::config::Config::load().ok();
+            let config = crate::config_runtime::load().ok();
             let method = method
                 .or_else(|| config.as_ref().map(|c| c.settings.prompt_method))
                 .unwrap_or(crate::config::PromptMethod::Gui);
@@ -41,11 +41,11 @@ pub(super) async fn execute(command: Command) -> anyhow::Result<()> {
             crate::control::stop()?;
         }
         Command::Status => {
-            let config = crate::config::Config::load()?;
+            let config = crate::config_runtime::load()?;
             crate::control::status(&config)?;
         }
         Command::Log { lines, follow } => {
-            let config = crate::config::Config::load()?;
+            let config = crate::config_runtime::load()?;
             crate::control::tail_log(&config, lines, follow)?;
         }
         Command::Rules { action } => match action {
@@ -199,7 +199,7 @@ pub(super) async fn execute(command: Command) -> anyhow::Result<()> {
             }
         },
         Command::Store { file } => {
-            let expanded = crate::config::Config::expand_path(&file.to_string_lossy())?;
+            let expanded = crate::config_runtime::expand_path(&file.to_string_lossy())?;
 
             // A live mount means the daemon already guards this path (it
             // captured the original itself); storing again and removing the
@@ -217,7 +217,7 @@ pub(super) async fn execute(command: Command) -> anyhow::Result<()> {
             println!("moved {} into the backing store", expanded.display());
         }
         Command::Restore { file } => {
-            let expanded = crate::config::Config::expand_path(&file.to_string_lossy())?;
+            let expanded = crate::config_runtime::expand_path(&file.to_string_lossy())?;
 
             // A live mount means the daemon still owns this path; writing under
             // it fights the daemon and is overwritten when it stops (with

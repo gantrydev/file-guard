@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::{self, Config};
+use crate::config::Config;
+use crate::config_runtime;
 use crate::interceptor::{self, Interceptor, InterceptorArgs};
 use crate::logging::AccessLogger;
 use crate::policy::engine::PolicyEngine;
@@ -23,7 +24,7 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn new(config: Config, rule_lease: Arc<RuleLease>) -> anyhow::Result<Self> {
-        let (guarded_uid, guarded_gid) = config::target_identity()?;
+        let (guarded_uid, guarded_gid) = config_runtime::target_identity()?;
         let control = crate::control_api::bind_listener(guarded_gid)?;
         let logger = Arc::new(AccessLogger::new(&config.settings.log_destination)?);
 
@@ -31,7 +32,7 @@ impl Daemon {
         // it asks the user-session agent over a unix socket, falling back to
         // `default_action` if the agent is unreachable.
         let prompter = Arc::new(PromptClient::new(
-            config::agent_socket_path()?,
+            config_runtime::agent_socket_path()?,
             Duration::from_secs(config.settings.prompt_timeout),
             guarded_uid,
         ));
@@ -55,7 +56,7 @@ impl Daemon {
     }
 
     pub async fn start(&mut self) -> anyhow::Result<()> {
-        let watched = self.config.watched_paths()?;
+        let watched = config_runtime::watched_paths(&self.config)?;
         let control_listener = self
             .control
             .as_mut()
@@ -144,7 +145,7 @@ fn start_and_publish(
 
 /// Record this process's PID so `file-guard stop`/`status` can find it.
 fn write_pid_file() -> anyhow::Result<()> {
-    let path = config::pid_file_path()?;
+    let path = config_runtime::pid_file_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -155,7 +156,7 @@ fn write_pid_file() -> anyhow::Result<()> {
 }
 
 fn remove_pid_file() {
-    let path = match config::pid_file_path() {
+    let path = match config_runtime::pid_file_path() {
         Ok(path) => path,
         Err(error) => {
             tracing::warn!("cannot resolve PID file for cleanup: {error}");
@@ -172,11 +173,14 @@ fn remove_pid_file() {
 /// Publish this daemon's resolved config path so a separate CLI invocation
 /// (which lacks FILE_GUARD_CONFIG) can find and act on the same config.
 fn publish_config_pointer() -> anyhow::Result<()> {
-    let pointer = config::runtime_config_pointer_path();
+    let pointer = config_runtime::runtime_config_pointer_path();
     if let Some(parent) = pointer.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&pointer, format!("{}\n", config::config_path()?.display()))?;
+    std::fs::write(
+        &pointer,
+        format!("{}\n", config_runtime::config_path()?.display()),
+    )?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -186,7 +190,7 @@ fn publish_config_pointer() -> anyhow::Result<()> {
 }
 
 fn remove_config_pointer() {
-    let path = config::runtime_config_pointer_path();
+    let path = config_runtime::runtime_config_pointer_path();
     if let Err(e) = std::fs::remove_file(&path)
         && e.kind() != std::io::ErrorKind::NotFound
     {

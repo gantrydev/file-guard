@@ -2,7 +2,8 @@
 //! These run as a separate short-lived `file-guard` invocation and locate the
 //! daemon via its PID file and the audit log via the config.
 
-use crate::config::{self, Config};
+use crate::config::Config;
+use crate::config_runtime;
 use crate::logging;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -50,7 +51,7 @@ pub fn running_pid() -> anyhow::Result<Option<u32>> {
 }
 
 fn running_process() -> anyhow::Result<Option<DaemonProcess>> {
-    let primary = config::pid_file_path()?;
+    let primary = config_runtime::pid_file_path()?;
     if let Some(process) = process_from(&primary) {
         return Ok(Some(process));
     }
@@ -123,7 +124,7 @@ fn probe_process(pid: u32) -> ProcessProbe {
 /// Send SIGTERM to the running daemon and wait for it to exit (and run its
 /// unmount path). Errors if no daemon is running.
 pub fn stop() -> anyhow::Result<()> {
-    let pid_path = config::pid_file_path()?;
+    let pid_path = config_runtime::pid_file_path()?;
     let Some(process) = running_process()? else {
         anyhow::bail!(
             "no running daemon found (no matching process identity at {}). \
@@ -288,7 +289,7 @@ pub fn status(config: &Config) -> anyhow::Result<()> {
     if config.watch.is_empty() {
         println!("  (none configured)");
     }
-    for path in config.watched_paths()? {
+    for path in config_runtime::watched_paths(config)? {
         let state = if mounts.contains(&path) {
             "mounted"
         } else {
@@ -302,7 +303,7 @@ pub fn status(config: &Config) -> anyhow::Result<()> {
     if matches!(log_dest, "" | "stdout" | "journal") {
         println!("  (audit log goes to the journal; set log_destination to a file path)");
     } else {
-        let entries = logging::read_recent(&Config::expand_path(log_dest)?, 10);
+        let entries = logging::read_recent(&config_runtime::expand_path(log_dest)?, 10);
         if entries.is_empty() {
             println!("  (no entries)");
         }
@@ -323,7 +324,7 @@ pub fn tail_log(config: &Config, n: usize, follow: bool) -> anyhow::Result<()> {
              Set log_destination to a path to enable `file-guard log`."
         );
     }
-    let path = Config::expand_path(dest)?;
+    let path = config_runtime::expand_path(dest)?;
 
     let initial = logging::read_recent_batch(&path, n)?;
     for entry in initial.entries {

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, RwLock};
 
 use crate::config::{Config, DefaultAction, RuleAction, RuleEntry};
+use crate::config_runtime;
 use crate::policy::rule::{Access, Action, Decision, IdentityPin, Rule, ScriptIdentity};
 use crate::policy::session::{ProcessId, SessionState};
 use crate::process::identify::ProcessInfo;
@@ -78,7 +79,7 @@ impl PolicyEngine {
         let mut file_defaults = HashMap::new();
         for watch in &config.watch {
             if let Some(default) = watch.default_action {
-                file_defaults.insert(Config::expand_path(&watch.path)?, default);
+                file_defaults.insert(config_runtime::expand_path(&watch.path)?, default);
             }
         }
 
@@ -498,7 +499,7 @@ fn normalize_hash(value: &mut Option<String>, field: &str) -> anyhow::Result<()>
 }
 
 fn rule_from_entry(entry: &RuleEntry) -> anyhow::Result<Rule> {
-    let file = Config::expand_path(&entry.file)?;
+    let file = config_runtime::expand_path(&entry.file)?;
     if !file.is_absolute() {
         anyhow::bail!("rule file path must be absolute: {}", entry.file);
     }
