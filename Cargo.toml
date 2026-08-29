@@ -23,7 +23,7 @@ everything else is denied or prompted via a desktop agent."""
 # fuse3 provides the fusermount3 setuid helper + libfuse3; $auto adds the
 # library deps dpkg-shlibdeps detects.
 depends = "fuse3, $auto"
-recommends = "zenity, libnotify-bin"
+recommends = "zenity (>= 3.16.2), libnotify-bin"
 conf-files = ["/etc/file-guard/config.toml", "/etc/default/file-guard"]
 maintainer-scripts = "packaging/debian"
 assets = [

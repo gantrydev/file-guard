@@ -59,7 +59,7 @@ just re-authorizes.)
 
 The root daemon has no terminal or display, so it doesn't draw prompts itself -
 it asks a small **session agent** (`file-guard agent`) running as you, over a
-unix socket. The agent renders the prompt (GUI via `zenity`/`kdialog`, a terminal
+unix socket. The agent renders the prompt (GUI via `zenity` 3.16.2+ / `kdialog`, a terminal
 fallback) and returns your choice. It can also send a desktop notification
 alongside any prompt. If the agent is
 unreachable, the daemon applies `default_action` (deny by default) - it never
