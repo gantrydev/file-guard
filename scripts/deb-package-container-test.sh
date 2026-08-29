@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 deb=${FILE_GUARD_DEB:-/tmp/file-guard.deb}
-expected_version=${FILE_GUARD_EXPECTED_VERSION:-0.1.18}
+expected_version=${FILE_GUARD_EXPECTED_VERSION:-0.1.19}
 require_fuse=${FILE_GUARD_REQUIRE_FUSE:-1}
 
 fail() {
