@@ -1,3 +1,4 @@
+mod record;
 pub mod sqlite;
 
 use std::path::{Path, PathBuf};
