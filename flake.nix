@@ -47,7 +47,7 @@
         default = pkgs.mkShell {
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.fuse3 ];
-          packages = with pkgs; [ actionlint cargo rustc clippy pinact rustfmt rust-analyzer ];
+          packages = with pkgs; [ actionlint cargo cargo-deny rustc clippy pinact rustfmt rust-analyzer ];
         };
       });
 

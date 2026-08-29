@@ -26,6 +26,8 @@ jobs:
         run: nix develop --command actionlint
       - name: pinned actions
         run: nix develop --command pinact run -fix=false -no-api
+      - name: cargo-deny
+        run: nix develop --command cargo-deny --locked check
       - name: clippy (deny warnings)
         run: nix develop --command cargo clippy --locked --all-targets -- -D warnings
       - name: test
