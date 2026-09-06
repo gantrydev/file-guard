@@ -23,7 +23,7 @@ jobs:
           install -Dm755 result/bin/file-guard "dist/file-guard"
           tar -C dist -czf "file-guard-${{ github.ref_name }}-x86_64-linux.tar.gz" file-guard
       - name: Publish release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: file-guard-*.tar.gz
           generate_release_notes: true
@@ -58,7 +58,7 @@ jobs:
           [[ "${#packages[@]}" -eq 1 ]]
           FILE_GUARD_DEB_PATH="${packages[0]}" scripts/test-deb-release.sh
       - name: Publish .deb
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: target/debian/*.deb
       - name: Test published .deb
