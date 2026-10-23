@@ -350,7 +350,18 @@ cargo fmt --check
 cargo test
 ```
 
-CI runs the above on Linux for every push/PR.
+CI runs the above on Linux for pushes to `main` and pull requests, along with
+actionlint, action pinning checks, zizmor, Semgrep's Rust rules, cargo-deny,
+FUSE integration tests, and a Nix package build. Run the security scanners locally
+with `nix develop --command zizmor --offline --strict-collection --min-severity low .github/workflows` and
+`nix develop --command semgrep scan --config p/rust --error --strict --metrics off`.
+
+Branch protection should require only `CI gate`. This job succeeds only when all
+jobs listed in its `needs` succeed; add every new CI job to that list so GitHub's
+required-check configuration stays unchanged.
+
+Zizmor blocks findings of low severity and above. Semgrep blocks every finding
+from `p/rust`; these registry rules are fetched at scan time.
 
 ## License
 

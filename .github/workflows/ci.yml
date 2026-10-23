@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 # Cancel superseded runs on the same ref.
 concurrency:
   group: ci-${{ github.ref }}
@@ -16,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
         with:
           extra_nix_config: |
@@ -26,6 +31,10 @@ jobs:
         run: nix develop --command actionlint
       - name: pinned actions
         run: nix develop --command pinact run --fix=false --no-api
+      - name: zizmor
+        run: nix develop --command zizmor --offline --strict-collection --min-severity low .github/workflows
+      - name: Semgrep
+        run: nix develop --command semgrep scan --config p/rust --error --strict --metrics off
       - name: cargo-deny
         run: nix develop --command cargo-deny --locked check
       - name: clippy (deny warnings)
@@ -38,3 +47,14 @@ jobs:
           nix develop --command cargo test --locked fuse_fs::integration_tests -- --ignored --test-threads=1
       - name: build package
         run: nix build .#file-guard
+
+  gate:
+    name: CI gate
+    if: ${{ always() }}
+    needs: [linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all jobs to succeed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$NEEDS"
