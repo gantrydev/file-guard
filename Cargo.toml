@@ -1,6 +1,6 @@
 [package]
 name = "file-guard"
-version = "0.1.21"
+version = "0.1.22"
 edition = "2024"
 description = "Per-process credential access control daemon for Linux (FUSE)"
 license = "MIT"
@@ -64,7 +64,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Path expansion
-dirs = "6.0"
+dirs = "7.0"
 
 # Error handling
 anyhow = "1.0"
