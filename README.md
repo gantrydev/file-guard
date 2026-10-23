@@ -350,7 +350,7 @@ cargo fmt --check
 cargo test
 ```
 
-CI runs the above on Linux for pushes to `main` and pull requests, along with
+CI runs the above on Linux x86_64 and ARM64 for pushes to `main` and pull requests, along with
 actionlint, action pinning checks, zizmor, Semgrep's Rust rules, cargo-deny,
 FUSE integration tests, and a Nix package build. Run the security scanners locally
 with `nix develop --command zizmor --offline --strict-collection --min-severity low .github/workflows` and

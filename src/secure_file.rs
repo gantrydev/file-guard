@@ -663,13 +663,18 @@ fn object_identity(stat: &Stat) -> io::Result<ObjectIdentity> {
             "filesystem returned a negative object size",
         ));
     }
+    #[allow(
+        clippy::useless_conversion,
+        reason = "st_nlink is u32 on aarch64 and u64 on x86_64"
+    )]
+    let links = u64::from(stat.st_nlink);
     Ok(ObjectIdentity {
         device: stat.st_dev,
         inode: stat.st_ino,
         ctime: stat_ctime(stat),
         mtime: stat_mtime(stat),
         size: stat.st_size as u64,
-        links: stat.st_nlink,
+        links,
         mode: stat.st_mode,
         uid: stat.st_uid,
         gid: stat.st_gid,

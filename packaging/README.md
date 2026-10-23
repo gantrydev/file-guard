@@ -63,8 +63,8 @@ After downloading an asset, verify it with the GitHub CLI before installing.
 Set `tag` to the release you intend to install and `asset` to its downloaded path:
 
 ```sh
-tag=v0.1.24
-asset=file-guard_0.1.24-1_arm64.deb
+tag=v0.2.0
+asset=file-guard_0.2.0-1_arm64.deb
 gh attestation verify "$asset" \
   --repo gantrydev/file-guard \
   --signer-workflow gantrydev/file-guard/.github/workflows/release.yml \
