@@ -142,7 +142,7 @@ fn bind_listener_at(path: PathBuf, guarded_gid: u32) -> anyhow::Result<ControlEn
 }
 
 pub async fn serve(listener: UnixListener, policy: Arc<PolicyEngine>, guarded_uid: u32) {
-    let daemon_uid = unsafe { libc::geteuid() };
+    let daemon_uid = rustix::process::geteuid().as_raw();
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut handlers = tokio::task::JoinSet::new();
     loop {
@@ -173,7 +173,7 @@ async fn request_at(path: &Path, command: ControlCommand) -> anyhow::Result<Cont
         .await
         .map_err(|_| anyhow::anyhow!("timed out connecting to {}", path.display()))??;
     let peer_uid = stream.peer_cred()?.uid();
-    let our_uid = unsafe { libc::geteuid() };
+    let our_uid = rustix::process::geteuid().as_raw();
     if peer_uid != 0 && peer_uid != our_uid {
         anyhow::bail!("control socket peer uid {peer_uid} is not trusted");
     }
@@ -255,7 +255,7 @@ async fn dispatch_without_endpoint(
                 return execute_offline(command, lease);
             }
             Ok(None) => {}
-            Err(error) if unsafe { libc::geteuid() } != 0 => {
+            Err(error) if rustix::process::geteuid().as_raw() != 0 => {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(error);
                 }
@@ -365,7 +365,7 @@ fn execute(rules: &RuleManager, command: ControlCommand) -> anyhow::Result<Contr
 }
 
 fn execute_offline(command: ControlCommand, lease: RuleLease) -> anyhow::Result<ControlPayload> {
-    if command.mutates() && unsafe { libc::geteuid() } != 0 {
+    if command.mutates() && rustix::process::geteuid().as_raw() != 0 {
         anyhow::bail!("offline rule mutations require root; re-run with sudo");
     }
     let config = crate::config_runtime::load()?;
@@ -399,7 +399,7 @@ fn remove_existing_socket(path: &Path) -> anyhow::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
+    if !metadata.file_type().is_socket() || metadata.uid() != rustix::process::geteuid().as_raw() {
         anyhow::bail!(
             "refusing to replace unsafe control socket path {}",
             path.display()
@@ -443,7 +443,7 @@ mod tests {
         let prompt = Arc::new(PromptClient::new(
             PathBuf::from("/nonexistent.sock"),
             Duration::from_secs(1),
-            unsafe { libc::getuid() },
+            rustix::process::getuid().as_raw(),
         ));
         Arc::new(PolicyEngine::new(&config, prompt, Arc::new(MemoryRuleStore::new())).unwrap())
     }
@@ -509,7 +509,7 @@ mod tests {
     async fn protocol_version_mismatch_returns_an_error_response() {
         let (client, server) = UnixStream::pair().unwrap();
         let policy = policy();
-        let uid = unsafe { libc::geteuid() };
+        let uid = rustix::process::geteuid().as_raw();
         let task = tokio::spawn(async move { handle_connection(server, &policy, uid, uid).await });
         let (read_half, mut write_half) = client.into_split();
         let mut bytes = serde_json::to_vec(&ControlRequest {
@@ -574,9 +574,10 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = directory.join("control.sock");
-        let endpoint = bind_listener_at(path.clone(), unsafe { libc::getegid() }).unwrap();
+        let endpoint = bind_listener_at(path.clone(), rustix::process::getegid().as_raw()).unwrap();
 
-        let error = bind_listener_at(path.clone(), unsafe { libc::getegid() }).unwrap_err();
+        let error =
+            bind_listener_at(path.clone(), rustix::process::getegid().as_raw()).unwrap_err();
         assert!(error.to_string().contains("already active"));
         assert!(path.exists());
 
@@ -594,7 +595,7 @@ mod tests {
         let path = directory.join("control.sock");
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
 
-        let endpoint = bind_listener_at(path.clone(), unsafe { libc::getegid() }).unwrap();
+        let endpoint = bind_listener_at(path.clone(), rustix::process::getegid().as_raw()).unwrap();
         std::os::unix::net::UnixStream::connect(&path).unwrap();
 
         drop(endpoint);

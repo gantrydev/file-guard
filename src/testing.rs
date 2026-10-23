@@ -13,6 +13,16 @@ use crate::store::{
     StoreResult, Timestamp, path_to_hex, sha256,
 };
 
+pub fn temp_dir(tag: &str) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+
+    tempfile::Builder::new()
+        .prefix(&format!("fg-{tag}-"))
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+}
+
 pub struct MemoryStore {
     state: Mutex<MemoryState>,
 }
@@ -141,12 +151,12 @@ pub fn mount_intent_record(path: &Path, contents: &[u8]) -> SnapshotRecord {
         size: contents.len() as u64,
         links: 1,
         mode: libc::S_IFREG | 0o600,
-        uid: unsafe { libc::geteuid() },
-        gid: unsafe { libc::getegid() },
+        uid: rustix::process::geteuid().as_raw(),
+        gid: rustix::process::getegid().as_raw(),
     };
     let metadata = RestoreMetadata {
-        uid: unsafe { libc::geteuid() },
-        gid: unsafe { libc::getegid() },
+        uid: rustix::process::geteuid().as_raw(),
+        gid: rustix::process::getegid().as_raw(),
         mode: 0o600,
         atime: timestamp.clone(),
         mtime: timestamp.clone(),

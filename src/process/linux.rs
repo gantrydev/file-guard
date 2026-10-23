@@ -12,14 +12,10 @@ pub fn start_time(pid: u32) -> anyhow::Result<u64> {
     let stat = me
         .stat()
         .map_err(|e| anyhow::anyhow!("reading /proc/{pid}/stat: {e}"))?;
-    // starttime is in clock ticks since boot; convert to nanosecond epoch
-    // approximation by scaling to seconds via sysconf(_SC_CLK_TCK) then nanos.
+    // starttime is in clock ticks since boot; scale to nanoseconds since boot.
     let ticks = stat.starttime;
-    let clock_ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if clock_ticks_per_sec <= 0 {
-        anyhow::bail!("sysconf(_SC_CLK_TCK) returned invalid value");
-    }
-    Ok(ticks * 1_000_000_000 / clock_ticks_per_sec as u64)
+    let clock_ticks_per_sec = rustix::param::clock_ticks_per_second();
+    Ok(ticks * 1_000_000_000 / clock_ticks_per_sec)
 }
 
 /// The process's argv, from `/proc/<pid>/cmdline` (NUL-separated).
@@ -52,7 +48,7 @@ mod tests {
 
     #[test]
     fn parent_info_labels_the_parent_process() {
-        let expected_pid = unsafe { libc::getppid() } as u32;
+        let expected_pid = rustix::process::getppid().unwrap().as_raw_pid() as u32;
         let expected_name = procfs::process::Process::new(expected_pid as i32)
             .unwrap()
             .stat()

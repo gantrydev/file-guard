@@ -200,21 +200,10 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_path(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "file-guard-integrity-{tag}-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
-
     #[test]
     fn hashes_and_caches() {
-        let tmp = temp_path("cache");
+        let tmp_directory = crate::testing::temp_dir("cache");
+        let tmp = tmp_directory.path().join("file");
         std::fs::File::create(&tmp)
             .unwrap()
             .write_all(b"hello")
@@ -234,7 +223,8 @@ mod tests {
 
     #[test]
     fn same_length_rewrite_with_restored_mtime_invalidates_cache() {
-        let tmp = temp_path("restored-mtime");
+        let tmp_directory = crate::testing::temp_dir("restored-mtime");
+        let tmp = tmp_directory.path().join("file");
         std::fs::write(&tmp, b"hello").unwrap();
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666)).unwrap();
         let original_mtime = std::fs::metadata(&tmp).unwrap().modified().unwrap();
@@ -254,9 +244,12 @@ mod tests {
 
     #[test]
     fn hashes_hardlinks_and_symlink_paths_by_opened_identity() {
-        let original = temp_path("linked-original");
-        let hardlink = temp_path("hardlink");
-        let symlink = temp_path("symlink");
+        let original_directory = crate::testing::temp_dir("linked-original");
+        let original = original_directory.path().join("file");
+        let hardlink_directory = crate::testing::temp_dir("hardlink");
+        let hardlink = hardlink_directory.path().join("file");
+        let symlink_directory = crate::testing::temp_dir("symlink");
+        let symlink = symlink_directory.path().join("file");
         std::fs::write(&original, b"linked-content").unwrap();
         std::fs::hard_link(&original, &hardlink).unwrap();
         std::os::unix::fs::symlink(&original, &symlink).unwrap();
@@ -275,6 +268,8 @@ mod tests {
         let pid = std::process::id();
         let start_time = crate::process::start_time(pid).unwrap();
         let process = capture_process_executable(pid, start_time).unwrap();
+        // A test assertion against the captured executable; never executes this path.
+        // nosemgrep: rust.lang.security.current-exe.current-exe
         let executable = std::env::current_exe().unwrap();
         assert_eq!(process.path, executable);
         assert_eq!(process.sha256, hash_file(&executable).unwrap());

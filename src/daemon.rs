@@ -312,8 +312,8 @@ mod tests {
 
     #[test]
     fn systemd_notification_supports_filesystem_socket() {
-        let path = std::env::temp_dir().join(format!("file-guard-notify-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let directory = crate::testing::temp_dir("notify");
+        let path = directory.path().join("notify.sock");
         let listener = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
 
         send_systemd_notification_to(path.to_str().unwrap(), b"READY=1").unwrap();

@@ -72,7 +72,7 @@ serde_json = "1.0"
 libc = "0.2"
 
 # File locking (config, log) via rustix::fs::flock
-rustix = { version = "1.1.4", features = ["event", "fs", "process"] }
+rustix = { version = "1.1.4", features = ["event", "fs", "mount", "param", "process"] }
 
 # Atomic snapshot journal
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
@@ -85,3 +85,6 @@ hex = "0.4"
 fuser = "0.18"
 # /proc filesystem reader (process info without whole-table scan)
 procfs = "0.18"
+
+[dev-dependencies]
+tempfile = "3.27"

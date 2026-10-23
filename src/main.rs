@@ -26,6 +26,9 @@ use cli::Cli;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
+    // SAFETY: SIG_DFL is a valid disposition; the initialized action and mask
+    // remain live for sigaction, and no previous disposition is requested.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = libc::SIG_DFL;

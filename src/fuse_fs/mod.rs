@@ -44,12 +44,6 @@ mod integration_tests {
         (mountpoint, session)
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("fg-it-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     fn unreachable_client() -> Arc<PromptClient> {
         Arc::new(PromptClient::new(
             PathBuf::from("/nonexistent.sock"),
@@ -80,7 +74,8 @@ mod integration_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let tmp = temp_dir("truncate-once");
+        let directory = crate::testing::temp_dir("truncate-once");
+        let tmp = directory.path();
         let socket = tmp.join("agent.sock");
         let listener = {
             let _runtime = rt.enter();
@@ -119,9 +114,11 @@ mod integration_tests {
         let policy = Arc::new(
             PolicyEngine::new(
                 &config,
-                Arc::new(PromptClient::new(socket, Duration::from_secs(1), unsafe {
-                    libc::geteuid()
-                })),
+                Arc::new(PromptClient::new(
+                    socket,
+                    Duration::from_secs(1),
+                    rustix::process::geteuid().as_raw(),
+                )),
                 Arc::new(MemoryRuleStore::new()),
             )
             .unwrap(),
@@ -134,7 +131,7 @@ mod integration_tests {
             rt.handle().clone(),
         )
         .unwrap();
-        let (mountpoint, session) = mount(fs, &tmp);
+        let (mountpoint, session) = mount(fs, tmp);
         let opened = std::fs::OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -143,7 +140,7 @@ mod integration_tests {
         drop(opened);
         drop(session);
         agent.abort();
-        std::fs::remove_dir_all(&tmp).unwrap();
+        std::fs::remove_dir_all(tmp).unwrap();
         assert!(
             succeeded,
             "a single allow-once must permit a truncating open"
@@ -156,13 +153,15 @@ mod integration_tests {
     #[ignore = "requires /dev/fuse; CI runs this suite explicitly"]
     fn allowed_binary_reads_real_contents() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let tmp = temp_dir("allow");
+        let directory = crate::testing::temp_dir("allow");
+        let tmp = directory.path();
         let watched = tmp.join("credential");
         let secret = b"super-secret-token\n";
 
         let store = memory_store(&watched, secret);
 
         // The caller the FUSE layer will see is this test process.
+        // nosemgrep: rust.lang.security.current-exe.current-exe
         let me = std::env::current_exe().unwrap();
         let config = Config {
             settings: settings("deny"),
@@ -181,10 +180,10 @@ mod integration_tests {
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
         let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
 
-        let (mountpoint, session) = mount(fs, &tmp);
+        let (mountpoint, session) = mount(fs, tmp);
         let got = std::fs::read(&mountpoint);
         drop(session);
-        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(tmp).ok();
 
         assert_eq!(
             got.unwrap(),
@@ -204,12 +203,15 @@ mod integration_tests {
         use std::os::unix::fs::PermissionsExt;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let tmp = temp_dir("shrink");
+        let directory = crate::testing::temp_dir("shrink");
+        let tmp = directory.path();
         let watched = tmp.join("credential");
         let old = b"OLD-LONGER-CREDENTIAL-CONTENTS\n";
         let new = b"new-short\n";
 
         let store = memory_store(&watched, old);
+        // Only names this test process in an in-memory rule; never executes the path.
+        // nosemgrep: rust.lang.security.current-exe.current-exe
         let me = std::env::current_exe().unwrap();
         let config = Config {
             settings: settings("deny"),
@@ -228,7 +230,7 @@ mod integration_tests {
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
         let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
 
-        let (mountpoint, session) = mount(fs, &tmp);
+        let (mountpoint, session) = mount(fs, tmp);
 
         // Open in place WITHOUT truncate, overwrite the head, then shrink — the
         // editor-save sequence that left a stale tail before the fix.
@@ -249,7 +251,7 @@ mod integration_tests {
             std::fs::metadata(&mountpoint).unwrap().permissions().mode() & 0o7777;
 
         drop(session);
-        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(tmp).ok();
 
         write_result.expect("authorized in-place write must succeed");
         assert_eq!(
@@ -267,7 +269,8 @@ mod integration_tests {
     #[ignore = "requires /dev/fuse; CI runs this suite explicitly"]
     fn unauthorized_open_is_denied() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let tmp = temp_dir("deny");
+        let directory = crate::testing::temp_dir("deny");
+        let tmp = directory.path();
         let watched = tmp.join("credential");
 
         let store = memory_store(&watched, b"secret");
@@ -280,10 +283,10 @@ mod integration_tests {
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
         let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
 
-        let (mountpoint, session) = mount(fs, &tmp);
+        let (mountpoint, session) = mount(fs, tmp);
         let got = std::fs::read(&mountpoint);
         drop(session);
-        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(tmp).ok();
 
         let err = got.expect_err("unauthorized read must fail");
         assert_eq!(
@@ -295,6 +298,8 @@ mod integration_tests {
 
     /// A single allow rule for this binary, scoped to `access`.
     fn rule_config(watched: &Path, access: Access) -> Config {
+        // Only names this test process in an in-memory rule; never executes the path.
+        // nosemgrep: rust.lang.security.current-exe.current-exe
         let me = std::env::current_exe().unwrap();
         Config {
             settings: settings("deny"),
@@ -318,7 +323,8 @@ mod integration_tests {
     #[ignore = "requires /dev/fuse; CI runs this suite explicitly"]
     fn write_only_grant_cannot_read_via_rdwr() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let tmp = temp_dir("wronly");
+        let directory = crate::testing::temp_dir("wronly");
+        let tmp = directory.path();
         let watched = tmp.join("credential");
         let store = memory_store(&watched, b"TOP-SECRET");
         let config = rule_config(&watched, Access::Write);
@@ -326,7 +332,7 @@ mod integration_tests {
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
         let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
 
-        let (mountpoint, session) = mount(fs, &tmp);
+        let (mountpoint, session) = mount(fs, tmp);
 
         let ro = std::fs::OpenOptions::new().read(true).open(&mountpoint);
         let rw = std::fs::OpenOptions::new()
@@ -338,7 +344,7 @@ mod integration_tests {
         drop(wo);
 
         drop(session);
-        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(tmp).ok();
 
         assert_eq!(
             ro.err().and_then(|e| e.raw_os_error()),
@@ -361,7 +367,8 @@ mod integration_tests {
         use std::os::unix::fs::FileExt;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let tmp = temp_dir("huge");
+        let directory = crate::testing::temp_dir("huge");
+        let tmp = directory.path();
         let watched = tmp.join("credential");
         let store = memory_store(&watched, b"intact");
         let config = rule_config(&watched, Access::Any);
@@ -369,7 +376,7 @@ mod integration_tests {
         let logger = Arc::new(AccessLogger::new("stdout").unwrap());
         let fs = CredentialFs::new(watched, store, policy, logger, rt.handle().clone()).unwrap();
 
-        let (mountpoint, session) = mount(fs, &tmp);
+        let (mountpoint, session) = mount(fs, tmp);
 
         let write_err = {
             let f = std::fs::OpenOptions::new()
@@ -384,7 +391,7 @@ mod integration_tests {
         let after = std::fs::read(&mountpoint);
 
         drop(session);
-        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(tmp).ok();
 
         assert_eq!(
             write_err,

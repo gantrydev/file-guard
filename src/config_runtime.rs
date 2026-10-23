@@ -28,7 +28,7 @@ pub fn load() -> anyhow::Result<Config> {
              at your config.",
                 path.display()
             ),
-            std::io::ErrorKind::PermissionDenied if unsafe { libc::geteuid() } != 0 => {
+            std::io::ErrorKind::PermissionDenied if rustix::process::geteuid().as_raw() != 0 => {
                 format!(
                     "config at {} is not readable by this user; re-run with sudo \
              (e.g. `sudo file-guard rules`).",
@@ -87,13 +87,13 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
 /// rendezvous dir. Mirrors `pid_file_path`'s root-vs-user split (the dev,
 /// user-mode daemon publishes into its own runtime dir).
 pub fn runtime_config_pointer_path() -> PathBuf {
-    if unsafe { libc::geteuid() == 0 } {
+    if rustix::process::geteuid().is_root() {
         return PathBuf::from("/run/file-guard/config");
     }
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(runtime).join("file-guard").join("config");
     }
-    let uid = unsafe { libc::getuid() };
+    let uid = rustix::process::getuid().as_raw();
     PathBuf::from(format!("/run/user/{uid}/file-guard/config"))
 }
 
@@ -101,7 +101,7 @@ pub fn control_socket_path() -> anyhow::Result<PathBuf> {
     if let Some(path) = std::env::var_os("FILE_GUARD_CONTROL_SOCKET") {
         return validate_env_path("FILE_GUARD_CONTROL_SOCKET", &path);
     }
-    if unsafe { libc::geteuid() == 0 } {
+    if rustix::process::geteuid().is_root() {
         return Ok(PathBuf::from("/run/file-guard/control.sock"));
     }
     user_control_socket_path()
@@ -112,7 +112,7 @@ pub fn control_socket_client_paths() -> anyhow::Result<Vec<PathBuf>> {
         return Ok(vec![validate_env_path("FILE_GUARD_CONTROL_SOCKET", &path)?]);
     }
     let system = PathBuf::from("/run/file-guard/control.sock");
-    if unsafe { libc::geteuid() == 0 } {
+    if rustix::process::geteuid().is_root() {
         return Ok(vec![system]);
     }
     Ok(default_client_control_sockets(user_control_socket_path()?))
@@ -126,7 +126,7 @@ fn user_control_socket_path() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
         return Ok(validate_env_path("XDG_RUNTIME_DIR", &runtime)?.join("file-guard-control.sock"));
     }
-    let uid = unsafe { libc::getuid() };
+    let uid = rustix::process::getuid().as_raw();
     Ok(PathBuf::from(format!(
         "/run/user/{uid}/file-guard-control.sock"
     )))
@@ -140,7 +140,9 @@ fn user_control_socket_path() -> anyhow::Result<PathBuf> {
 fn published_config_path() -> Option<PathBuf> {
     let user_runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })))
+        .unwrap_or_else(|| {
+            PathBuf::from(format!("/run/user/{}", rustix::process::getuid().as_raw()))
+        })
         .join("file-guard")
         .join("config");
     for candidate in [PathBuf::from("/run/file-guard/config"), user_runtime] {
@@ -176,7 +178,7 @@ fn read_operator_config(path: &Path) -> std::io::Result<String> {
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let metadata = file.metadata()?;
-    let effective_uid = unsafe { libc::geteuid() };
+    let effective_uid = rustix::process::geteuid().as_raw();
     if !metadata.is_file()
         || (metadata.uid() != 0 && metadata.uid() != effective_uid)
         || metadata.mode() & 0o022 != 0
@@ -224,6 +226,8 @@ fn lookup_user(name: &OsStr) -> anyhow::Result<Option<UserRecord>> {
         let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
         let mut result = std::ptr::null_mut();
         let mut buffer = vec![0_u8; buffer_len];
+        // SAFETY: the CString and writable record/buffer stay alive through getpwnam_r.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let status = unsafe {
             libc::getpwnam_r(
                 name.as_ptr(),
@@ -243,7 +247,11 @@ fn lookup_user(name: &OsStr) -> anyhow::Result<Option<UserRecord>> {
         if result.is_null() {
             return Ok(None);
         }
+        // SAFETY: success with a non-null result initializes record and its NUL-terminated
+        // pw_dir points into buffer, which stays alive until the home path is copied.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let record = unsafe { record.assume_init() };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let home = unsafe { std::ffi::CStr::from_ptr(record.pw_dir) };
         return Ok(Some(UserRecord {
             uid: record.pw_uid,
@@ -259,7 +267,12 @@ fn target_home() -> anyhow::Result<Option<PathBuf>> {
 
 pub fn target_identity() -> anyhow::Result<(u32, u32)> {
     Ok(target_user()?.map_or_else(
-        || (unsafe { libc::getuid() }, unsafe { libc::getgid() }),
+        || {
+            (
+                rustix::process::getuid().as_raw(),
+                rustix::process::getgid().as_raw(),
+            )
+        },
         |user| (user.uid, user.gid),
     ))
 }
@@ -271,13 +284,13 @@ pub fn pid_file_path() -> anyhow::Result<PathBuf> {
     if let Some(explicit) = std::env::var_os("FILE_GUARD_PID_FILE") {
         return validate_env_path("FILE_GUARD_PID_FILE", &explicit);
     }
-    if unsafe { libc::geteuid() == 0 } {
+    if rustix::process::geteuid().is_root() {
         return Ok(PathBuf::from("/run/file-guard/daemon.pid"));
     }
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
         return Ok(PathBuf::from(runtime).join("file-guard").join("daemon.pid"));
     }
-    let uid = unsafe { libc::getuid() };
+    let uid = rustix::process::getuid().as_raw();
     Ok(PathBuf::from(format!(
         "/run/user/{uid}/file-guard/daemon.pid"
     )))
@@ -293,7 +306,7 @@ pub fn agent_socket_path() -> anyhow::Result<PathBuf> {
     if let Some(explicit) = std::env::var_os("FILE_GUARD_AGENT_SOCKET") {
         return validate_env_path("FILE_GUARD_AGENT_SOCKET", &explicit);
     }
-    if unsafe { libc::geteuid() == 0 } {
+    if rustix::process::geteuid().is_root() {
         let (target_uid, _) = target_identity()?;
         return Ok(PathBuf::from(format!(
             "/run/user/{}/file-guard-agent.sock",
@@ -303,7 +316,7 @@ pub fn agent_socket_path() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
         return Ok(PathBuf::from(runtime).join("file-guard-agent.sock"));
     }
-    let uid = unsafe { libc::getuid() };
+    let uid = rustix::process::getuid().as_raw();
     Ok(PathBuf::from(format!(
         "/run/user/{uid}/file-guard-agent.sock"
     )))
@@ -312,16 +325,6 @@ pub fn agent_socket_path() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    fn temp_config() -> PathBuf {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-        std::env::temp_dir().join(format!(
-            "file-guard-config-{}-{}.toml",
-            std::process::id(),
-            NEXT_ID.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
 
     #[test]
     fn expand_path_leaves_absolute_paths_untouched() {
@@ -344,8 +347,9 @@ mod tests {
     fn operator_config_rejects_symlinks_and_writable_files() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
-        let target = temp_config();
-        let link = temp_config();
+        let directory = crate::testing::temp_dir("config");
+        let target = directory.path().join("config.toml");
+        let link = directory.path().join("link.toml");
         std::fs::write(&target, "[settings]\n").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444)).unwrap();
         assert_eq!(read_operator_config(&target).unwrap(), "[settings]\n");

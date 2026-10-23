@@ -165,12 +165,12 @@ impl RuleLease {
         let metadata = file.metadata()?;
         if !metadata.is_file()
             || metadata.nlink() != 1
-            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.uid() != rustix::process::geteuid().as_raw()
         {
             anyhow::bail!(
                 "rule owner lock {} must be a regular file owned by uid {}",
                 lock_path.display(),
-                unsafe { libc::geteuid() }
+                rustix::process::geteuid().as_raw()
             );
         }
         if metadata.mode() & 0o7777 != 0o600 {
@@ -353,12 +353,14 @@ fn prepare_database_file(path: &Path) -> anyhow::Result<()> {
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() }
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != rustix::process::geteuid().as_raw()
     {
         anyhow::bail!(
             "rule database {} must be a regular file owned by uid {}",
             path.display(),
-            unsafe { libc::geteuid() }
+            rustix::process::geteuid().as_raw()
         );
     }
     if metadata.mode() & 0o7777 != 0o600 {
@@ -373,17 +375,6 @@ mod tests {
     use super::*;
     use crate::config::RuleAction;
     use crate::policy::rule::Access;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    fn path() -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        std::env::temp_dir().join(format!(
-            "file-guard-rules-{}-{}.sqlite",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
-
     fn rule(hash: &str) -> RuleEntry {
         RuleEntry {
             file: "/credential".into(),
@@ -417,7 +408,8 @@ mod tests {
 
     #[test]
     fn inserts_deduplicates_replaces_and_removes_rules() {
-        let path = path();
+        let path_directory = crate::testing::temp_dir("path");
+        let path = path_directory.path().join("file");
         let lease = Arc::new(RuleLease::try_acquire(path.clone()).unwrap().unwrap());
         let store = RuleStore::open(Arc::clone(&lease)).unwrap();
         let stored = store.insert(&rule("one")).unwrap().unwrap();
@@ -444,7 +436,8 @@ mod tests {
     fn concurrent_connections_preserve_every_insert() {
         use std::sync::{Arc, Barrier};
 
-        let path = path();
+        let path_directory = crate::testing::temp_dir("path");
+        let path = path_directory.path().join("file");
         let lease = Arc::new(RuleLease::try_acquire(path.clone()).unwrap().unwrap());
         let stores = [
             RuleStore::open(Arc::clone(&lease)).unwrap(),
@@ -477,7 +470,8 @@ mod tests {
 
     #[test]
     fn owner_lease_is_exclusive_and_recoverable() {
-        let path = path();
+        let path_directory = crate::testing::temp_dir("path");
+        let path = path_directory.path().join("file");
         let first = RuleLease::try_acquire(path.clone()).unwrap().unwrap();
         assert!(RuleLease::try_acquire(path.clone()).unwrap().is_none());
 
@@ -489,7 +483,8 @@ mod tests {
 
     #[test]
     fn open_store_retains_its_owner_lease() {
-        let path = path();
+        let path_directory = crate::testing::temp_dir("path");
+        let path = path_directory.path().join("file");
         let lease = Arc::new(RuleLease::try_acquire(path.clone()).unwrap().unwrap());
         let store = RuleStore::open(Arc::clone(&lease)).unwrap();
         drop(lease);

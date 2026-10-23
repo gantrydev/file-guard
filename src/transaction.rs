@@ -1546,14 +1546,13 @@ fn object_matches(
 mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
     use crate::store::sqlite::SqliteStore;
 
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
     struct Fixture {
+        _directory: tempfile::TempDir,
         root: PathBuf,
         store: PathBuf,
         staging: PathBuf,
@@ -1574,11 +1573,8 @@ mod tests {
         }
 
         fn new(tag: &str) -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "file-guard-transaction-{tag}-{}-{}",
-                std::process::id(),
-                SEQUENCE.fetch_add(1, Ordering::Relaxed)
-            ));
+            let directory = crate::testing::temp_dir(tag);
+            let root = directory.path().to_path_buf();
             let watched_parent = root.join("watched");
             std::fs::create_dir_all(&watched_parent).unwrap();
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1587,6 +1583,7 @@ mod tests {
                 staging: root.join("staging"),
                 watched: watched_parent.join("credential"),
                 root,
+                _directory: directory,
             }
         }
 

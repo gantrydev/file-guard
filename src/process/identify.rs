@@ -172,8 +172,8 @@ mod tests {
 
     #[test]
     fn script_arguments_must_be_absolute_and_unambiguous() {
-        let dir = std::env::temp_dir().join(format!("fg-script-{}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap();
+        let directory = crate::testing::temp_dir("script");
+        let dir = directory.path();
         let script = dir.join("program.py");
         let option_value = dir.join("ignore");
         std::fs::write(&script, b"print('x')").unwrap();

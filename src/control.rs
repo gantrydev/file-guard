@@ -109,16 +109,16 @@ fn classify_unreadable_identity(probe: ProcessProbe) -> IdentityState {
 }
 
 fn probe_process(pid: u32) -> ProcessProbe {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
+    let Some(pid) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
         return ProcessProbe::Missing;
     };
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return ProcessProbe::Alive;
-    }
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(libc::EPERM) => ProcessProbe::Alive,
-        Some(libc::ESRCH) => ProcessProbe::Missing,
-        _ => ProcessProbe::Unknown,
+    match rustix::process::test_kill_process(pid) {
+        Ok(()) | Err(rustix::io::Errno::PERM) => ProcessProbe::Alive,
+        Err(rustix::io::Errno::SRCH) => ProcessProbe::Missing,
+        Err(_) => ProcessProbe::Unknown,
     }
 }
 
@@ -228,9 +228,8 @@ fn signal_linux_daemon(identity: DaemonIdentity) -> anyhow::Result<Option<rustix
                     identity.pid
                 )
             }
-            let pid = identity.pid as libc::pid_t;
-            if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-                let error = std::io::Error::last_os_error();
+            if let Err(error) = rustix::process::kill_process(raw_pid, Signal::TERM) {
+                let error = std::io::Error::from(error);
                 if error.kind() == std::io::ErrorKind::PermissionDenied {
                     anyhow::bail!(
                         "cannot signal daemon (pid {}): it runs as another user. \
@@ -261,10 +260,14 @@ fn signal_daemon(identity: DaemonIdentity) -> anyhow::Result<()> {
     if !identity_alive(identity) {
         anyhow::bail!("daemon pid {} was recycled", identity.pid)
     }
-    if unsafe { libc::kill(identity.pid as libc::pid_t, libc::SIGTERM) } == 0 {
+    let pid = i32::try_from(identity.pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or_else(|| anyhow::anyhow!("invalid daemon pid {}", identity.pid))?;
+    let Err(error) = rustix::process::kill_process(pid, rustix::process::Signal::TERM) else {
         return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
+    };
+    let error = std::io::Error::from(error);
     if error.kind() == std::io::ErrorKind::PermissionDenied {
         anyhow::bail!(
             "cannot signal daemon (pid {}): it runs as another user. \
@@ -292,7 +295,9 @@ pub fn status() -> anyhow::Result<()> {
     let config = match config_runtime::load() {
         Ok(config) => config,
         Err(error) => match error.downcast_ref::<std::io::Error>().map(|e| e.kind()) {
-            Some(std::io::ErrorKind::PermissionDenied) if unsafe { libc::geteuid() } != 0 => {
+            Some(std::io::ErrorKind::PermissionDenied)
+                if rustix::process::geteuid().as_raw() != 0 =>
+            {
                 println!(
                     "\nwatched files and recent access unavailable: config is not readable; \
                      run `sudo file-guard status` for details."

@@ -908,7 +908,7 @@ fn validate_trusted_ancestors(path: &Path) -> io::Result<()> {
 
 pub(crate) fn validate_trusted_directory(path: &Path) -> io::Result<()> {
     let path = absolute_lexical(path)?;
-    let effective_uid = unsafe { libc::geteuid() };
+    let effective_uid = rustix::process::geteuid().as_raw();
     let mut directory = File::from(open_at(
         libc::AT_FDCWD,
         c"/",
@@ -991,7 +991,7 @@ fn validate_private_directory(path: &Path, file: &File, expected_device: u64) ->
     let metadata = file.metadata()?;
     if !metadata.is_dir()
         || metadata.dev() != expected_device
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != rustix::process::geteuid().as_raw()
         || metadata.mode() & 0o777 != 0o700
     {
         return Err(io::Error::new(
@@ -999,7 +999,7 @@ fn validate_private_directory(path: &Path, file: &File, expected_device: u64) ->
             format!(
                 "staging directory {} must be a mode-0700 directory owned by uid {} on device {}",
                 path.display(),
-                unsafe { libc::geteuid() },
+                rustix::process::geteuid().as_raw(),
                 expected_device
             ),
         ));
@@ -1182,6 +1182,9 @@ fn rename_noreplace(
 }
 
 fn with_borrowed_fd<T>(fd: RawFd, operation: impl for<'fd> FnOnce(BorrowedFd<'fd>) -> T) -> T {
+    // SAFETY: callers keep the owning File/OwnedFd alive; the higher-ranked
+    // callback cannot return a borrow tied to this temporary descriptor.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     operation(unsafe { BorrowedFd::borrow_raw(fd) })
 }
 
@@ -1189,26 +1192,20 @@ fn with_borrowed_fd<T>(fd: RawFd, operation: impl for<'fd> FnOnce(BorrowedFd<'fd
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    fn fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "file-guard-secure-{tag}-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
+    fn fixture(tag: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let directory = crate::testing::temp_dir(tag);
+        let root = directory.path();
         let watched = root.join("watched");
         let staging = root.join("staging");
         std::fs::create_dir_all(&watched).unwrap();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        (root, watched.join("credential"), staging)
+        (directory, watched.join("credential"), staging)
     }
 
     #[test]
     fn mountpoint_descriptor_rejects_replacement_and_parent_rename() {
-        let (root, path, _) = fixture("mountpoint");
+        let (directory, path, _) = fixture("mountpoint");
+        let root = directory.path();
         std::fs::write(&path, b"").unwrap();
         let resolved = ResolvedPath::new(&path).unwrap();
         let expected = resolved.observe().unwrap().unwrap();
@@ -1230,7 +1227,8 @@ mod tests {
 
     #[test]
     fn capture_rejects_hardlinks_and_symlinked_parents() {
-        let (root, path, _) = fixture("validation");
+        let (directory, path, _) = fixture("validation");
+        let root = directory.path();
         std::fs::write(&path, b"secret").unwrap();
         std::fs::hard_link(&path, root.join("alias")).unwrap();
         assert_eq!(
@@ -1258,7 +1256,8 @@ mod tests {
 
     #[test]
     fn protected_exchange_preserves_the_detached_inode() {
-        let (root, path, staging_root) = fixture("exchange");
+        let (directory, path, staging_root) = fixture("exchange");
+        let root = directory.path();
         std::fs::write(&path, b"secret").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         let resolved = ResolvedPath::new(&path).unwrap();
@@ -1296,7 +1295,8 @@ mod tests {
 
     #[test]
     fn restoration_preserves_promised_metadata_and_xattrs() {
-        let (root, path, staging_root) = fixture("restore");
+        let (directory, path, staging_root) = fixture("restore");
+        let root = directory.path();
         std::fs::write(&path, b"secret").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         let resolved = ResolvedPath::new(&path).unwrap();
@@ -1328,7 +1328,8 @@ mod tests {
 
     #[test]
     fn construction_debris_is_replaced_before_atomic_installation() {
-        let (root, path, staging_root) = fixture("construction-debris");
+        let (directory, path, staging_root) = fixture("construction-debris");
+        let root = directory.path();
         std::fs::write(&path, b"complete-secret").unwrap();
         let resolved = ResolvedPath::new(&path).unwrap();
         let captured = resolved.capture().unwrap();
