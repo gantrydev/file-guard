@@ -16,12 +16,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Start the daemon (runs in the foreground; let systemd supervise it)
-    Start {
-        /// No-op: file-guard is supervised by systemd (Type=notify), not
-        /// self-daemonizing. Kept for compatibility; use `systemctl` to manage.
-        #[arg(short, long)]
-        daemon: bool,
-    },
+    Start,
     /// Run the user-session prompt agent. Renders access prompts (GUI/terminal)
     /// for the root daemon, which connects over a unix socket.
     Agent {

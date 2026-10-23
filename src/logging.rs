@@ -271,6 +271,8 @@ pub(crate) fn read_new(
     rustix::fs::flock(&*file, rustix::fs::FlockOperation::LockShared)?;
     let result = (|| -> anyhow::Result<AuditUpdate> {
         let metadata = file.metadata()?;
+        // TODO: support copy-truncate with an explicit log-generation protocol;
+        // polling length cannot distinguish rapid regrowth from an append.
         let truncated = metadata.len() < cursor.offset;
         if truncated {
             cursor.offset = 0;

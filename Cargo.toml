@@ -1,6 +1,6 @@
 [package]
 name = "file-guard"
-version = "0.1.22"
+version = "0.1.23"
 edition = "2024"
 description = "Per-process credential access control daemon for Linux (FUSE)"
 license = "MIT"
@@ -20,8 +20,7 @@ Per-process access control for on-disk credential files. file-guard mounts a \
 FUSE file over each watched secret and only lets binaries you have authorized \
 (pinned by content hash, and script path for interpreters) read or write it; \
 everything else is denied or prompted via a desktop agent."""
-# fuse3 provides the fusermount3 setuid helper + libfuse3; $auto adds the
-# library deps dpkg-shlibdeps detects.
+# fuse3 provides recovery utilities; $auto adds detected shared-library deps.
 depends = "fuse3, $auto"
 recommends = "zenity (>= 3.16.2), libnotify-bin"
 conf-files = ["/etc/file-guard/config.toml", "/etc/default/file-guard"]
@@ -51,10 +50,6 @@ toml = "1.1"
 
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
-
-# TUI prompting
-ratatui = "0.30"
-crossterm = "0.29"
 
 # Logging
 tracing = "0.1"

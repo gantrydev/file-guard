@@ -247,7 +247,6 @@ mod tests {
                 binary_path: "/usr/bin/tool".into(),
                 binary_name: "tool".into(),
                 script: None,
-                code_signature: None,
                 parents: Vec::new(),
             },
             timeout_ms: 60_000,

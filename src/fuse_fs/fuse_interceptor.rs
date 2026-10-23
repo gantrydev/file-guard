@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::ffi::OsString;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -128,19 +129,46 @@ fn verify_mount(path: &Path, token: &str) -> anyhow::Result<Option<MountInfo>> {
 }
 
 fn detach_stale_mount(path: &Path, token: &str) -> anyhow::Result<()> {
-    let Some(mount) = verify_mount(path, token)? else {
+    let expected = expected_source(token);
+    let mounts = mountinfo()?
+        .into_iter()
+        .filter(|mount| mount.source == expected.as_bytes())
+        .collect::<Vec<_>>();
+    if mounts.len() > 1 {
+        anyhow::bail!("multiple mounts have the file-guard token {token}");
+    }
+    let Some(mount) = mounts.into_iter().next() else {
+        verify_mount(path, token)?;
         return Ok(());
     };
+    if !mount.fs_type.starts_with("fuse") || mount.owner_uid != Some(unsafe { libc::geteuid() }) {
+        anyhow::bail!("mount {} does not belong to file-guard", mount.id);
+    }
+    let target = rustix::fs::open(
+        &mount.target,
+        rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )?;
+    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", target.as_raw_fd()))?;
+    let mount_id = fdinfo.lines().find_map(|line| {
+        line.strip_prefix("mnt_id:")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    });
+    if mount_id != Some(mount.id) {
+        anyhow::bail!("mount {} changed before detach", mount.id);
+    }
     tracing::warn!(
-        "detaching orphaned file-guard mount {} at {}",
+        "detaching file-guard mount {} at {}",
         mount.id,
-        path.display()
+        mount.target.display()
     );
-    let encoded_path = CString::new(path.as_os_str().as_bytes())?;
-    if unsafe { libc::umount2(encoded_path.as_ptr(), libc::MNT_DETACH) } != 0 {
+    let encoded_path = CString::new(format!("/proc/self/fd/{}", target.as_raw_fd()))?;
+    // Abort the FUSE connection so open handles cannot keep session.join alive.
+    if unsafe { libc::umount2(encoded_path.as_ptr(), libc::MNT_FORCE | libc::MNT_DETACH) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    if verify_mount(path, token)?.is_some() {
+    drop(target);
+    if mountinfo()?.iter().any(|current| current.id == mount.id) {
         anyhow::bail!("mount remained present after detach")
     }
     Ok(())
@@ -253,7 +281,43 @@ impl Interceptor for FuseInterceptor {
                     config.acl = SessionACL::All;
                 }
 
-                let session = match fuser::spawn_mount(credential_fs, watched_path, &config) {
+                let session = match (|| -> anyhow::Result<fuser::BackgroundSession> {
+                    let device = rustix::fs::open(
+                        "/dev/fuse",
+                        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC,
+                        rustix::fs::Mode::empty(),
+                    )?;
+                    let target = crate::secure_file::ResolvedPath::new(watched_path)?;
+                    let placeholder = record.header.placeholder.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("mount intent has no placeholder identity")
+                    })?;
+                    let mountpoint = target.open_mountpoint(placeholder)?;
+                    let target_path =
+                        CString::new(format!("/proc/self/fd/{}", mountpoint.as_raw_fd()))?;
+                    let source = CString::new(source.as_bytes())?;
+                    let options = CString::new(format!(
+                        "fd={},rootmode={:o},user_id={},group_id={},allow_other",
+                        device.as_raw_fd(),
+                        libc::S_IFREG | 0o600,
+                        unsafe { libc::geteuid() },
+                        unsafe { libc::getegid() },
+                    ))?;
+                    if unsafe {
+                        libc::mount(
+                            source.as_ptr(),
+                            target_path.as_ptr(),
+                            c"fuse".as_ptr(),
+                            libc::MS_NODEV | libc::MS_NOSUID,
+                            options.as_ptr().cast(),
+                        )
+                    } != 0
+                    {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                    let session =
+                        fuser::Session::from_fd(credential_fs, device, config.acl, config)?;
+                    Ok(session.spawn()?)
+                })() {
                     Ok(session) => session,
                     Err(error) => {
                         let rollback = (|| -> anyhow::Result<()> {
@@ -273,20 +337,17 @@ impl Interceptor for FuseInterceptor {
                         };
                     }
                 };
+                self.sessions.push(MountSession {
+                    watched_path: watched_path.clone(),
+                    token: record.header.mount_token.clone(),
+                    session: Some(session),
+                });
                 let Some(mount) = verify_mount(watched_path, &record.header.mount_token)? else {
-                    drop(session);
-                    detach_stale_mount(watched_path, &record.header.mount_token)?;
-                    manager.abort_mount(watched_path)?;
                     anyhow::bail!(
                         "FUSE mount at {} returned success but was not observable",
                         watched_path.display()
                     )
                 };
-                self.sessions.push(MountSession {
-                    watched_path: watched_path.clone(),
-                    token: record.header.mount_token,
-                    session: Some(session),
-                });
                 tracing::info!(
                     "FUSE mount {} active at {} ({source})",
                     mount.id,
@@ -343,16 +404,11 @@ impl Interceptor for FuseInterceptor {
                 retained.push(mount);
                 continue;
             }
-            if let Some(session) = mount.session.take()
-                && let Err(error) = session.umount_and_join()
-            {
-                tracing::warn!(
-                    "FUSE session unmount at {} returned {error}; reconciling against mountinfo",
-                    mount.watched_path.display()
-                );
-            }
             let recovery = (|| -> anyhow::Result<()> {
                 detach_stale_mount(&mount.watched_path, &mount.token)?;
+                if let Some(session) = mount.session.take() {
+                    session.join()?;
+                }
                 manager.reconcile_after_mount_absent(&mount.watched_path)?;
                 if self.restore_on_stop {
                     manager.restore(&mount.watched_path)?;
@@ -442,6 +498,7 @@ impl Drop for FuseInterceptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
 
     #[test]
     fn mountinfo_parser_preserves_identity_and_escapes() {

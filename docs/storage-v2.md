@@ -11,8 +11,9 @@ revision.
 SQLite owns snapshot transactions. One snapshot row contains the serialized
 header and credential bytes. Updates use an immediate transaction and a
 generation/revision compare-and-swap. The database uses a rollback journal,
-`synchronous=FULL`, `secure_delete=ON`, a format application ID, and an exact
+`synchronous=EXTRA`, `secure_delete=ON`, a format application ID, and an exact
 strict schema. Contents and restoration metadata never commit independently.
+Each commit also syncs the rollback journal's directory after journal deletion.
 Initial creation fsyncs the store root, database file, and containing
 directories before the database can become authoritative.
 
@@ -64,7 +65,9 @@ installation.
 
 Mounted writes replace the whole SQLite row with CAS before FUSE reports
 success. Unmount first changes the revision to `unmounting`, fencing late
-writes. Restore starts only after the owned mount is absent. It prepares and
+writes. The verified FUSE connection is then aborted and detached, invalidating
+old handles so held descriptors cannot block shutdown. Restore starts only
+after the owned mount is absent. It prepares and
 fsyncs the restoration inode under a reserved construction name, atomically
 promotes it to its committed staging name, commits its identity, renames,
 verifies the restored bytes and metadata, syncs both namespaces, and commits

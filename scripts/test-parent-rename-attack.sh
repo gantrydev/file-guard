@@ -44,6 +44,9 @@ trap cleanup EXIT
 
 fail() {
     printf 'FAIL: %s\n' "$1" >&2
+    if [[ -f "$DAEMON_LOG" ]]; then
+        tail -n 80 "$DAEMON_LOG" >&2
+    fi
     exit 1
 }
 
@@ -54,6 +57,7 @@ printf '=== Parent-directory rename adversarial test ===\n'
 printf 'Test root: %s\n' "$TEST_ROOT"
 
 mkdir -p "$CREDDIR" "$STORE" "$STAGING"
+chmod 700 "$STORE" "$STAGING"
 printf '%s\n' "original-credential-content" > "$CREDFILE"
 chmod 600 "$CREDFILE"
 
@@ -75,7 +79,7 @@ FILE_GUARD_RULES_DB="$RULES_DB" \
 FILE_GUARD_PID_FILE="$PIDFILE" \
 FILE_GUARD_AGENT_SOCKET="$AGENT_SOCKET" \
 FILE_GUARD_CONTROL_SOCKET="$CONTROL_SOCKET" \
-"$BINARY" start > "$DAEMON_LOG" 2>&1 &
+timeout --kill-after=2 30 "$BINARY" start > "$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 
 for _ in {1..100}; do
@@ -110,16 +114,25 @@ printf '%s\n' "updated-credential-content" > "$DISPLACED_FILE"
 [[ "$(<"$CREDFILE")" == "attacker-content" ]] \
     || fail "a mounted write reached the attacker's replacement file"
 
+printf '%s\n' "attacker-content" > "$TEST_ROOT/replacement-source"
+mount --bind "$TEST_ROOT/replacement-source" "$CREDFILE"
+
 printf '%s\n' '--- stopping daemon under the mismatched parent binding ---'
+exec 9< "$DISPLACED_FILE"
 set +e
 kill -TERM "$DAEMON_PID"
 wait "$DAEMON_PID"
 STOP_STATUS=$?
+exec 9<&-
 set -e
 DAEMON_PID=""
 
+[[ "$STOP_STATUS" -ne 124 && "$STOP_STATUS" -ne 137 ]] \
+    || fail "shutdown hung while a credential descriptor remained open"
 [[ "$STOP_STATUS" -ne 0 ]] \
     || fail "daemon reported a clean restore despite the replaced parent"
+mountpoint -q "$CREDFILE" \
+    || fail "shutdown unmounted the replacement filesystem"
 [[ "$(<"$CREDFILE")" == "attacker-content" ]] \
     || fail "shutdown overwrote the attacker's replacement file"
 grep -Eiq 'parent.*(changed|renamed|replaced)|binding' "$DAEMON_LOG" \
@@ -133,6 +146,7 @@ mountpoint -q "$DISPLACED_FILE" 2>/dev/null \
     && fail "the displaced FUSE mount remained after daemon exit"
 
 printf '%s\n' '--- restoring the original parent identity for recovery inspection ---'
+umount "$CREDFILE"
 mv "$CREDDIR" "$ATTACKER_DIR"
 mv "$DISPLACED_DIR" "$CREDDIR"
 [[ "$(<"$ATTACKER_DIR/secret")" == "attacker-content" ]] \

@@ -29,8 +29,8 @@ pub fn cmdline(pid: u32) -> anyhow::Result<Vec<String>> {
     Ok(raw
         .split(|&b| b == 0)
         .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).into_owned())
-        .collect())
+        .map(|s| String::from_utf8(s.to_vec()))
+        .collect::<Result<_, _>>()?)
 }
 
 /// Read the immediate parent's identity from `/proc`.

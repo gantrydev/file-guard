@@ -117,10 +117,8 @@ Linux abstract sockets. The Debian and NixOS service definitions use
 
 ## 12. ~~`notification` prompt method is a no-op from the user's perspective~~ ✅ RESOLVED
 
-Renamed `PromptMethod::Notification` → `PromptMethod::LogOnly`. Settings
-deserialization migrates the legacy `notification` value to `log_only` with
-notifications enabled, so existing configs keep their visible behavior. Added
-a separate `notify: bool` setting (default `false`) that fires a
+Use `PromptMethod::LogOnly` for non-interactive requests. A separate
+`notify: bool` setting (default `false`) fires a
 `notify-send` desktop notification alongside any prompt method. This decouples
 "how to prompt" from "whether to notify": `log_only` is now an explicit choice
 to skip interactive prompts, and `notify = true` adds a visible heads-up on

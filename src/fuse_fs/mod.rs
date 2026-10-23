@@ -69,8 +69,89 @@ mod integration_tests {
         )
     }
 
-    /// An "allow always" rule for this test binary lets the same binary read the
-    /// real stored contents straight back through the mount.
+    #[test]
+    #[ignore = "requires /dev/fuse; CI runs this suite explicitly"]
+    fn truncating_open_uses_one_allow_once_decision() {
+        use crate::prompt::protocol::{
+            AgentRequest, AgentResponse, PROTOCOL_VERSION, PromptOutcome, read_json_line,
+            write_json_line,
+        };
+        use crate::prompt::types::UserChoice;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tmp = temp_dir("truncate-once");
+        let socket = tmp.join("agent.sock");
+        let listener = {
+            let _runtime = rt.enter();
+            tokio::net::UnixListener::bind(&socket).unwrap()
+        };
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let count = prompts.clone();
+        let agent = rt.spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request: AgentRequest = read_json_line(&mut stream).await.unwrap();
+                let choice = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    UserChoice::AllowOnce
+                } else {
+                    UserChoice::DenyOnce
+                };
+                write_json_line(
+                    &mut stream,
+                    &AgentResponse {
+                        v: PROTOCOL_VERSION,
+                        id: request.id,
+                        outcome: PromptOutcome::Decided(choice),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let watched = tmp.join("credential");
+        let store = memory_store(&watched, b"old-credential");
+        let config = Config {
+            settings: settings("deny"),
+            watch: vec![],
+            rule: vec![],
+        };
+        let policy = Arc::new(
+            PolicyEngine::new(
+                &config,
+                Arc::new(PromptClient::new(socket, Duration::from_secs(1), unsafe {
+                    libc::geteuid()
+                })),
+                Arc::new(MemoryRuleStore::new()),
+            )
+            .unwrap(),
+        );
+        let fs = CredentialFs::new(
+            watched.clone(),
+            store.clone(),
+            policy,
+            Arc::new(AccessLogger::new("stdout").unwrap()),
+            rt.handle().clone(),
+        )
+        .unwrap();
+        let (mountpoint, session) = mount(fs, &tmp);
+        let opened = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&mountpoint);
+        let succeeded = opened.is_ok();
+        drop(opened);
+        drop(session);
+        agent.abort();
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert!(
+            succeeded,
+            "a single allow-once must permit a truncating open"
+        );
+        assert_eq!(prompts.load(Ordering::SeqCst), 1);
+        assert!(store.contents(&watched).is_empty());
+    }
+
     #[test]
     #[ignore = "requires /dev/fuse; CI runs this suite explicitly"]
     fn allowed_binary_reads_real_contents() {
@@ -92,7 +173,6 @@ mod integration_tests {
                 action: RuleAction::Allow,
                 access: Access::Any,
                 sha256: None, // unpinned → path match (this exact binary)
-                signature: None,
                 script: None,
                 script_sha256: None,
             }],
@@ -140,7 +220,6 @@ mod integration_tests {
                 action: RuleAction::Allow,
                 access: Access::Any,
                 sha256: None,
-                signature: None,
                 script: None,
                 script_sha256: None,
             }],
@@ -226,7 +305,6 @@ mod integration_tests {
                 action: RuleAction::Allow,
                 access,
                 sha256: None,
-                signature: None,
                 script: None,
                 script_sha256: None,
             }],

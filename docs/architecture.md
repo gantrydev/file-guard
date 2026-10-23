@@ -19,12 +19,9 @@ Declarative `[[rule]]` entries are administrator-owned inputs. Rules learned
 from an interactive prompt are runtime state and must not rewrite the operator's
 configuration.
 
-Seed reconciliation also handles the legacy representation. Rules present only
-in an older live TOML are durably inserted into the learned repository while the
-owner lease and config lock are held, before the complete declarative seed
-replaces that file. Repeating the migration is idempotent; a crash between the
-database commit and config rename can create only a temporary duplicate, not a
-lost authorization.
+The daemon reads the operator configuration directly and never rewrites it.
+Declarative rules are not copied into the learned repository, so removing an
+allow from the configuration revokes it on the next daemon start.
 
 ## Invariants
 

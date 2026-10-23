@@ -9,7 +9,7 @@
 //!
 //! # Shared-content buffer
 //!
-//! All open handles share a single [`Content`] buffer (POSIX shared-inode
+//! All open handles share a single [`SnapshotRecord`] buffer (POSIX shared-inode
 //! semantics). This prevents the classic "truncate reverted by stale handle
 //! buffer" corruption and ensures concurrent writers see each other's edits.
 //! The buffer is capped at [`MAX_CONTENT_LEN`] (16 MiB) — credential files
@@ -108,22 +108,13 @@ fn checked_write_end(offset: u64, len: usize) -> Result<usize, Errno> {
     Ok(end as usize)
 }
 
-/// The single, authoritative live content of the guarded file. Every open
-/// handle reads and writes *this* buffer (POSIX shared-inode semantics), rather
-/// than a private per-handle copy — so concurrent writers can't lose each
-/// other's edits and a truncate can't be reverted by a stale handle buffer.
-struct Content {
-    bytes: Vec<u8>,
-    record: SnapshotRecord,
-}
-
 #[derive(Debug)]
 enum MutationError {
     Invalid(Errno),
     Commit(anyhow::Error),
 }
 
-/// Per-open-handle bookkeeping. The buffer lives in `Content`, shared across
+/// Per-open-handle bookkeeping. The committed snapshot is shared across
 /// handles; a handle only records what it was authorized to do.
 struct OpenHandle {
     access: Access,
@@ -140,7 +131,7 @@ struct OpenHandle {
 /// loop.
 struct Shared {
     mutation: Mutex<()>,
-    content: Mutex<Content>,
+    content: Mutex<SnapshotRecord>,
     handles: Mutex<HashMap<u64, OpenHandle>>,
     next_fh: AtomicU64,
 }
@@ -170,23 +161,19 @@ impl Shared {
 
         let (candidate, record) = {
             let content = self.content.lock().unwrap();
-            let mut candidate = content.bytes.clone();
+            let mut candidate = content.contents.clone();
             if candidate.len() < end {
                 candidate.resize(end, 0);
             }
             candidate[start..end].copy_from_slice(data);
-            (candidate, content.record.clone())
+            (candidate, content.clone())
         };
 
         let next = manager
-            .update_contents(&record, candidate.clone())
+            .update_contents(&record, candidate)
             .map_err(MutationError::Commit)?;
 
-        {
-            let mut content = self.content.lock().unwrap();
-            content.bytes = candidate;
-            content.record = next;
-        }
+        *self.content.lock().unwrap() = next;
         Ok(data.len() as u32)
     }
 
@@ -202,20 +189,16 @@ impl Shared {
 
         let (candidate, record) = {
             let content = self.content.lock().unwrap();
-            let mut candidate = content.bytes.clone();
+            let mut candidate = content.contents.clone();
             candidate.resize(new_size as usize, 0);
-            (candidate, content.record.clone())
+            (candidate, content.clone())
         };
 
         let next = manager
-            .update_contents(&record, candidate.clone())
+            .update_contents(&record, candidate)
             .map_err(MutationError::Commit)?;
 
-        {
-            let mut content = self.content.lock().unwrap();
-            content.bytes = candidate;
-            content.record = next;
-        }
+        *self.content.lock().unwrap() = next;
         Ok(())
     }
 
@@ -224,7 +207,7 @@ impl Shared {
     }
 
     fn current_size(&self) -> u64 {
-        self.content.lock().unwrap().bytes.len() as u64
+        self.content.lock().unwrap().contents.len() as u64
     }
 }
 
@@ -267,7 +250,6 @@ impl CredentialFs {
                 watched_path.display()
             )
         }
-        let bytes = record.contents.clone();
         let presentation = record.header.original.metadata().clone();
         let owner_uid = record.header.parent.uid;
 
@@ -281,7 +263,7 @@ impl CredentialFs {
             presentation,
             shared: Arc::new(Shared {
                 mutation: Mutex::new(()),
-                content: Mutex::new(Content { bytes, record }),
+                content: Mutex::new(record),
                 handles: Mutex::new(HashMap::new()),
                 next_fh: AtomicU64::new(1),
             }),
@@ -363,6 +345,12 @@ async fn decide_open(
 }
 
 impl Filesystem for CredentialFs {
+    fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
+        config
+            .add_capabilities(fuser::InitFlags::FUSE_ATOMIC_O_TRUNC)
+            .map_err(|_| std::io::Error::other("kernel does not support atomic truncating opens"))
+    }
+
     fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         if ino != INodeNo::ROOT {
             reply.error(Errno::ENOENT);
@@ -514,7 +502,7 @@ impl Filesystem for CredentialFs {
         }
 
         let content = self.shared.content.lock().unwrap();
-        reply.data(slice_content(&content.bytes, offset, size));
+        reply.data(slice_content(&content.contents, offset, size));
     }
 
     fn write(
@@ -1048,7 +1036,7 @@ mod tests {
             fs.apply_write(fh, 0, b"X"),
             Err(MutationError::Commit(_))
         ));
-        assert_eq!(fs.shared.content.lock().unwrap().bytes, b"abc");
+        assert_eq!(fs.shared.content.lock().unwrap().contents, b"abc");
         assert_eq!(store.contents(&watched), b"abc");
 
         fs.apply_write(fh, 1, b"Z").unwrap();
@@ -1063,7 +1051,7 @@ mod tests {
         let fh = write_handle(&fs);
 
         assert_eq!(fs.apply_write(fh, 0, b"X").unwrap(), 1);
-        assert_eq!(fs.shared.content.lock().unwrap().bytes, b"Xbc");
+        assert_eq!(fs.shared.content.lock().unwrap().contents, b"Xbc");
         assert_eq!(store.contents(&watched), b"Xbc");
     }
 

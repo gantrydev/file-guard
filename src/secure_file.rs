@@ -110,6 +110,24 @@ impl ResolvedPath {
         observe_at(self.parent.as_raw_fd(), &self.name)
     }
 
+    pub fn open_mountpoint(&self, expected: &ObjectIdentity) -> io::Result<OwnedFd> {
+        self.verify_parent_binding()?;
+        let file = open_at(
+            self.parent.as_raw_fd(),
+            &self.name,
+            libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        )?;
+        let actual = object_identity(&stat_fd(file.as_raw_fd())?)?;
+        if &actual != expected {
+            return Err(io::Error::other(
+                "mountpoint is not the committed placeholder",
+            ));
+        }
+        self.verify_parent_binding()?;
+        Ok(file)
+    }
+
     pub fn verify_restoration(
         &self,
         contents: &[u8],
@@ -776,7 +794,7 @@ fn stat_ctime(stat: &Stat) -> Timestamp {
     }
 }
 
-fn absolute_lexical(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn absolute_lexical(path: &Path) -> io::Result<PathBuf> {
     let input = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1186,6 +1204,28 @@ mod tests {
         std::fs::create_dir_all(&watched).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         (root, watched.join("credential"), staging)
+    }
+
+    #[test]
+    fn mountpoint_descriptor_rejects_replacement_and_parent_rename() {
+        let (root, path, _) = fixture("mountpoint");
+        std::fs::write(&path, b"").unwrap();
+        let resolved = ResolvedPath::new(&path).unwrap();
+        let expected = resolved.observe().unwrap().unwrap();
+        let descriptor = resolved.open_mountpoint(&expected).unwrap();
+        std::fs::rename(&path, path.with_extension("old")).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        assert!(resolved.open_mountpoint(&expected).is_err());
+        assert!(same_object(
+            &object_identity(&stat_fd(descriptor.as_raw_fd()).unwrap()).unwrap(),
+            &expected
+        ));
+        let replacement = resolved.observe().unwrap().unwrap();
+        std::fs::rename(path.parent().unwrap(), root.join("renamed")).unwrap();
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        assert!(resolved.open_mountpoint(&replacement).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

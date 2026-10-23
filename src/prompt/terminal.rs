@@ -27,9 +27,6 @@ pub async fn prompt(req: &AgentRequest) -> Option<UserChoice> {
     if !parent_chain.is_empty() {
         eprintln!("║  Chain:   {parent_chain}");
     }
-    if let Some(ref sig) = req.process.code_signature {
-        eprintln!("║  Signed:  {sig}");
-    }
     eprintln!("║  File:    {}", req.file);
     eprintln!("╠══════════════════════════════════════════════════════╣");
     eprintln!("║  [1] Allow once                                      ║");

@@ -217,7 +217,8 @@ else
 [settings]
 default_action = "allow"
 prompt_timeout = 1
-prompt_method = "notification"
+prompt_method = "log_only"
+notify = true
 log_destination = "$fuse_dir/access.log"
 restore_on_stop = true
 

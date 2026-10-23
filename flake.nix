@@ -69,8 +69,6 @@
           inherit (lib) mkEnableOption mkOption mkIf types mapAttrsToList;
           cfg = config.services.file-guard;
           socketPath = "/run/file-guard/agent.sock";
-          agentMethod = if cfg.promptMethod == "notification" then "log-only" else cfg.promptMethod;
-          agentNotify = cfg.notify || cfg.promptMethod == "notification";
         in
         {
           options.services.file-guard = {
@@ -107,36 +105,21 @@
               type = types.path;
               example = "/etc/file-guard/config.toml";
               description = ''
-                Path to the live config.toml the daemon reads. When `seedFile`
-                is set this is an atomically refreshed copy of that complete
-                declarative file; learned rules are stored separately in the
-                daemon's rule database. Its parent directory must already
-                exist and be root-owned.
-              '';
-            };
-
-            seedFile = mkOption {
-              type = types.nullOr types.path;
-              default = null;
-              example = "config.toml from pkgs.writeText";
-              description = ''
-                Optional declarative source of truth. On every start the daemon
-                validates it and atomically replaces `configFile` with the
-                complete seed. Interactive rules remain in the separate SQLite
-                rule store. Leave null to manage `configFile` yourself.
+                Path to the read-only operator configuration. This may point
+                directly to a file produced by pkgs.writeText. Learned rules
+                are stored separately in the daemon's SQLite rule database.
               '';
             };
 
             promptMethod = mkOption {
-              type = types.enum [ "terminal" "gui" "log-only" "notification" ];
+              type = types.enum [ "terminal" "gui" "log-only" ];
               default = "gui";
               description = ''
                 How the session agent renders prompts. `gui` works out of the
                 box on a single-user graphical session (zenity is bundled via
                 `guiPackages` and the session env is filled from `uid`).
                 `log-only` skips interaction and applies `default_action` after
-                the timeout. `notification` is retained as a compatibility
-                alias for `log-only` with `notify = true`.
+                the timeout. Set `notify = true` for desktop notifications.
               '';
             };
 
@@ -215,7 +198,7 @@
               # zenity / notify-send on PATH so GUI prompts work out of the box.
               path = cfg.guiPackages;
               serviceConfig = {
-                ExecStart = "${cfg.package}/bin/file-guard agent --method ${agentMethod}${lib.optionalString agentNotify " --notify"}";
+                ExecStart = "${cfg.package}/bin/file-guard agent --method ${cfg.promptMethod}${lib.optionalString cfg.notify " --notify"}";
                 User = cfg.user;
                 Environment = mapAttrsToList (k: v: "${k}=${v}") cfg.agentEnvironment;
               };
@@ -251,7 +234,7 @@
                   "FILE_GUARD_CONFIG=${cfg.configFile}"
                   "FILE_GUARD_STORE_DIR=/var/lib/file-guard/store"
                   "FILE_GUARD_AGENT_SOCKET=${socketPath}"
-                ] ++ lib.optional (cfg.seedFile != null) "FILE_GUARD_SEED_CONFIG=${cfg.seedFile}";
+                ];
               };
             };
           };

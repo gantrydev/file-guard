@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 use super::linux as platform;
@@ -59,21 +59,27 @@ fn interpreter_script(pid: u32, binary_name: &str) -> Option<PathBuf> {
         return None;
     }
     let args = platform::cmdline(pid).ok()?;
-    extract_script(&args)
+    extract_script(&args, binary_name)
 }
 
 /// Names we treat as interpreters whose argv carries the real program identity.
-fn is_interpreter(name: &str) -> bool {
+pub(crate) fn is_interpreter(name: &str) -> bool {
+    let stem = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
     name.starts_with("python")
         || matches!(
-            name,
-            "node"
+            stem,
+            "pypy"
+                | "node"
                 | "nodejs"
                 | "deno"
                 | "bun"
                 | "ruby"
                 | "perl"
                 | "php"
+                | "lua"
+                | "luajit"
+                | "tclsh"
+                | "wish"
                 | "bash"
                 | "sh"
                 | "dash"
@@ -84,36 +90,36 @@ fn is_interpreter(name: &str) -> bool {
         )
 }
 
-/// Pull the script path out of an interpreter's argv (argv[0] is the
-/// interpreter). `-c`/`-m`/`-e` mean inline code/module with no script file;
-/// `-jar` (java) names the jar. Otherwise the script is the first argument that
-/// names an existing file - this skips flags *and* their values (e.g. the
-/// `ignore` in `python -W ignore script.py`) without enumerating which flags
-/// take a value.
-fn extract_script(args: &[String]) -> Option<PathBuf> {
+// A process can change cwd after loading its script. Only absolute paths and
+// recognized argument forms can narrow an automatic permanent grant.
+fn extract_script(args: &[String], binary_name: &str) -> Option<PathBuf> {
     let mut it = args.iter().skip(1);
+    if binary_name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.') == "java" {
+        if it.next()? != "-jar" {
+            return None;
+        }
+        return it.next().and_then(|path| canonical_file(path));
+    }
+    let python = binary_name.starts_with("python") || binary_name.starts_with("pypy");
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "-jar" => return it.next().and_then(|v| canonical_file(v)),
-            "-cp" | "-classpath" | "--class-path" => {
-                it.next(); // classpath value; the main class is not a file
-                return None;
+            "--" => return it.next().and_then(|path| canonical_file(path)),
+            "-B" | "-E" | "-I" | "-P" | "-s" | "-S" | "-u" | "-O" | "-OO" if python => {}
+            "-W" | "-X" if python => {
+                it.next()?;
             }
-            "-c" | "-m" | "-e" => return None,
-            other => {
-                if let Some(script) = canonical_file(other) {
-                    return Some(script);
-                }
-            }
+            value if python && (value.starts_with("-W") || value.starts_with("-X")) => {}
+            value if value.starts_with('-') => return None,
+            path => return canonical_file(path),
         }
     }
     None
 }
 
 fn canonical_file(path: &str) -> Option<PathBuf> {
-    let p = std::path::Path::new(path);
-    if p.is_file() {
-        std::fs::canonicalize(p).ok()
+    let path = Path::new(path);
+    if path.is_absolute() && path.is_file() {
+        std::fs::canonicalize(path).ok()
     } else {
         None
     }
@@ -149,44 +155,81 @@ mod tests {
         assert!(is_interpreter("python3.14"));
         assert!(is_interpreter("node"));
         assert!(is_interpreter("bash"));
+        for name in [
+            "perl5.36.0",
+            "ruby3.2",
+            "php8.2",
+            "lua5.4",
+            "tclsh8.6",
+            "pypy3",
+        ] {
+            assert!(is_interpreter(name), "{name}");
+        }
+        assert!(!is_interpreter("ruby-tool"));
         assert!(!is_interpreter("terraform"));
         assert!(!is_interpreter("gcloud"));
     }
 
     #[test]
-    fn extract_script_skips_flags_and_finds_file() {
-        let mut tmp = std::env::temp_dir();
-        tmp.push(format!("fg-script-{}.py", std::process::id()));
-        std::fs::write(&tmp, b"print('x')").unwrap();
-        let canon = std::fs::canonicalize(&tmp).unwrap();
-
-        // Mirrors gcloud's real argv: value-taking flags (`-W ignore`) precede
-        // the script and must not be mistaken for it.
-        let args = vec![
-            "python".to_string(),
-            "-S".to_string(),
-            "-B".to_string(),
-            "-W".to_string(),
-            "ignore".to_string(),
-            tmp.to_string_lossy().into_owned(),
-            "version".to_string(),
-        ];
-        assert_eq!(extract_script(&args), Some(canon));
-
-        // Inline code / module → no script file.
-        let inline = [
-            "python".to_string(),
-            "-c".to_string(),
-            "print(1)".to_string(),
-        ];
-        assert_eq!(extract_script(&inline), None);
-        let module = [
-            "python".to_string(),
-            "-m".to_string(),
-            "http.server".to_string(),
-        ];
-        assert_eq!(extract_script(&module), None);
-
-        std::fs::remove_file(&tmp).ok();
+    fn script_arguments_must_be_absolute_and_unambiguous() {
+        let dir = std::env::temp_dir().join(format!("fg-script-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let script = dir.join("program.py");
+        let option_value = dir.join("ignore");
+        std::fs::write(&script, b"print('x')").unwrap();
+        std::fs::write(&option_value, b"not a script").unwrap();
+        let script_path = script.to_str().unwrap().to_owned();
+        let value_path = option_value.to_str().unwrap().to_owned();
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            extract_script(
+                &args(&[
+                    "python",
+                    "-S",
+                    "-B",
+                    "-W",
+                    &value_path,
+                    &script_path,
+                    "version"
+                ]),
+                "python3.14"
+            ),
+            Some(script.clone())
+        );
+        for values in [
+            vec!["python", "program.py"],
+            vec!["python", "-c", &script_path],
+            vec!["python", "-m", &script_path],
+            vec!["python", "-unknown", &value_path, &script_path],
+            vec!["python", "-W", "ignore", "program.py"],
+            vec!["python", "/nonexistent/script.py", &script_path],
+        ] {
+            assert_eq!(extract_script(&args(&values), "python3"), None);
+        }
+        assert_eq!(
+            extract_script(
+                &args(&["node", "--require", &value_path, &script_path]),
+                "node"
+            ),
+            None
+        );
+        assert_eq!(
+            extract_script(&args(&["node", &script_path]), "node"),
+            Some(script.clone())
+        );
+        assert_eq!(
+            extract_script(&args(&["java", "-jar", &script_path]), "java"),
+            Some(script.clone())
+        );
+        assert_eq!(
+            extract_script(&args(&["java", "-cp", &value_path, &script_path]), "java"),
+            None
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

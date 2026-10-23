@@ -86,7 +86,6 @@ pub struct ProcessDesc {
     pub binary_path: String,
     pub binary_name: String,
     pub script: Option<String>,
-    pub code_signature: Option<String>,
     pub parents: Vec<ParentDesc>,
 }
 
@@ -107,7 +106,6 @@ impl From<&ProcessInfo> for ProcessDesc {
                 .script
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
-            code_signature: None,
             parents: info
                 .parent_chain
                 .iter()

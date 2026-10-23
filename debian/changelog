@@ -1,3 +1,11 @@
+file-guard (0.1.23-1) unstable; urgency=medium
+
+  * Harden persistent process grants and credential snapshot durability.
+  * Fix shutdown with open credential descriptors and preserve mount identity.
+  * Read operator configuration directly and simplify rule management.
+
+ -- File-Guard Contributors <noreply@example.com>  Fri, 23 Oct 2026 12:41:19 +0000
+
 file-guard (0.1.1-1) unstable; urgency=medium
 
   * Initial Debian package for file-guard.

@@ -193,8 +193,7 @@ The agent's socket is created by **root** (systemd socket activation) in a
 root-owned directory, so a same-uid attacker can neither hijack the socket name
 nor connect to it. With `promptMethod = "log-only"`, prompts are non-interactive
 and unknown accesses use `default_action` on timeout. Set `notify = true` for an
-informational desktop notification in that mode. The old `"notification"`
-value remains a compatibility alias for this combination.
+informational desktop notification in that mode.
 
 To try the GUI prompt path by hand, run the agent in your graphical session and
 point the root development daemon at the same socket and private store:
@@ -222,14 +221,18 @@ The config is administrator-owned and read-only at runtime. Rules created via
 `/var/lib/file-guard/rules.sqlite`. Rule CLI mutations use the daemon control
 socket while it is running and the same database transactions while offline.
 A sidecar owner lease prevents daemon startup and an offline command from
-opening divergent views of that state. On the first seeded startup after an
-upgrade, rules that existed only in the old live TOML are committed to SQLite
-before the declarative file is replaced.
+opening divergent views of that state. The daemon reads the configured TOML
+directly; NixOS configurations can point `configFile` at a `pkgs.writeText` file.
 
 ## CLI
 
+For file audit logs, rotate by renaming the log and creating a new file with the
+same secure ownership and permissions. The writer reopens the pathname for each
+entry. Copy-truncate rotation is unsupported: a polling `log -f` cannot reliably
+detect truncation when the file regrows past its cursor between polls.
+
 ```
-file-guard start [-d]                  # run the daemon (foreground; -d is a no-op)
+file-guard start                       # run the daemon in the foreground
 file-guard agent [--method M] [--socket P]   # run the session prompt agent
 file-guard stop                        # SIGTERM the running daemon (unmounts cleanly)
 file-guard status                      # daemon state, mount status, recent access
@@ -289,10 +292,16 @@ Known limitations - read before relying on this:
   lookup of its pathname. For interpreters (python/node/…) it also pins the
   **script path** from argv and the **script's content hash** - so "python running gcloud"
   doesn't authorize "python running something else", and an in-place edit of the
-  script re-prompts. Two caveats remain: the script *path* comes from argv, which
+  script re-prompts. The script *path* comes from argv, which
   a *deliberate* impersonator can forge (it's defense-in-depth, strongest against
-  opportunistic disk-scanning malware, not a hard boundary); and nothing can stop
-  a compromised dependency *inside* the legitimate tool from reading the secret
+  opportunistic disk-scanning malware, not a hard boundary). The script hash
+  describes its current on-disk contents, not necessarily the code already
+  loaded by the interpreter; replacing a writable script after loading can
+  impersonate the pinned contents. Automatic permanent grants require a
+  resolved absolute script path in a recognized argument form. Relative paths,
+  ambiguous options, and inline code can receive only transient grants; invoke
+  scripts by absolute path to create permanent rules. Nothing can stop a
+  compromised dependency *inside* the legitimate tool from reading the secret
   that tool is authorized to use. Strongest for compiled tools, where the binary
   *is* the identity.
 - **Nix/home-manager:** the resolved path is a `/nix/store/<hash>` path that

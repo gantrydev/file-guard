@@ -394,7 +394,7 @@ fn load_record(connection: &Connection, file_id: &Path) -> StoreResult<Entry> {
 fn configure(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         "PRAGMA journal_mode = DELETE;
-         PRAGMA synchronous = FULL;
+         PRAGMA synchronous = EXTRA;
          PRAGMA foreign_keys = ON;
          PRAGMA trusted_schema = OFF;
          PRAGMA secure_delete = ON;

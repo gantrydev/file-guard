@@ -391,7 +391,6 @@ mod tests {
             action: RuleAction::Allow,
             access: Access::Any,
             sha256: Some(hash.into()),
-            signature: None,
             script: None,
             script_sha256: None,
         }

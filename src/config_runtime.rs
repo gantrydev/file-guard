@@ -1,4 +1,4 @@
-use crate::config::{Config, RuleEntry};
+use crate::config::Config;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -40,42 +40,6 @@ pub fn load() -> anyhow::Result<Config> {
     Ok(config)
 }
 
-/// Copy the operator-owned declarative seed to the live config path. A
-/// caller-provided migration runs before replacement so rules captured by
-/// older versions can be committed to the learned-rule database first.
-/// An existing live file keeps its ownership and permissions. A newly
-/// created file is mode 0644 because it contains policy, not credentials.
-pub fn reconcile_seed(
-    migrate_rules: impl FnOnce(Vec<RuleEntry>, Vec<RuleEntry>) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    let Some(seed_path) = std::env::var_os("FILE_GUARD_SEED_CONFIG") else {
-        return Ok(());
-    };
-    let seed_path = validate_env_path("FILE_GUARD_SEED_CONFIG", &seed_path)?;
-    let live_path = config_path()?;
-
-    let seed = read_operator_config(&seed_path)
-        .map_err(|e| anyhow::anyhow!("failed to read seed config {}: {e}", seed_path.display()))?;
-    let seed_config: Config = toml::from_str(&seed).map_err(|error| {
-        anyhow::anyhow!("seed config {} is invalid: {error}", seed_path.display())
-    })?;
-    update_config(&live_path, true, |current| {
-        let previous_rules = current
-            .map(toml::from_str::<Config>)
-            .transpose()
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "live config {} is invalid; refusing to replace it before legacy-rule migration: {error}",
-                    live_path.display()
-                )
-            })?
-            .map(|config| config.rule)
-            .unwrap_or_default();
-        migrate_rules(previous_rules, seed_config.rule)?;
-        Ok((seed, ()))
-    })
-}
-
 /// Expand a leading `~/` to the watched user's home directory.
 ///
 /// When file-guard runs as a privileged system daemon it is not the owner of
@@ -83,12 +47,16 @@ pub fn reconcile_seed(
 /// not root's. Resolution order: `FILE_GUARD_USER`, then `SUDO_USER`, then the
 /// running user's home.
 pub fn expand_path(path: &str) -> anyhow::Result<PathBuf> {
-    if let Some(rest) = path.strip_prefix("~/")
+    expand_file_path(Path::new(path))
+}
+
+pub fn expand_file_path(path: &Path) -> anyhow::Result<PathBuf> {
+    if let Ok(rest) = path.strip_prefix("~")
         && let Some(home) = target_home()?
     {
         return Ok(home.join(rest));
     }
-    Ok(PathBuf::from(path))
+    Ok(path.to_path_buf())
 }
 
 pub fn watched_paths(config: &Config) -> anyhow::Result<Vec<PathBuf>> {
@@ -223,199 +191,6 @@ fn read_operator_config(path: &Path) -> std::io::Result<String> {
     Ok(contents)
 }
 
-fn update_config<T>(
-    path: &Path,
-    allow_missing: bool,
-    update: impl FnOnce(Option<&str>) -> anyhow::Result<(String, T)>,
-) -> anyhow::Result<T> {
-    let _lock = lock_config(path)?;
-    let current = match read_config_for_update(path) {
-        Ok(value) => Some(value),
-        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    let (rendered, result) = update(current.as_ref().map(|(contents, _)| contents.as_str()))?;
-    if current
-        .as_ref()
-        .is_some_and(|(contents, _)| contents == &rendered)
-    {
-        return Ok(result);
-    }
-    write_atomic(
-        path,
-        &rendered,
-        current.as_ref().map(|(_, metadata)| metadata),
-    )?;
-    Ok(result)
-}
-
-fn lock_config(path: &Path) -> anyhow::Result<std::fs::File> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("config path {} has no parent", path.display()))?;
-    crate::secure_file::ensure_trusted_directory(parent, 0o700)?;
-
-    let lock_path = config_lock_path(path)?;
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(&lock_path)
-        .map_err(|error| anyhow::anyhow!("opening config lock {}: {error}", lock_path.display()))?;
-    let metadata = lock.metadata()?;
-    if !metadata.is_file()
-        || metadata.nlink() != 1
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
-    {
-        anyhow::bail!(
-            "config lock {} must be a regular file owned by uid {}",
-            lock_path.display(),
-            unsafe { libc::geteuid() }
-        );
-    }
-    if metadata.mode() & 0o7777 != 0o600 {
-        lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)?;
-    Ok(lock)
-}
-
-fn config_lock_path(path: &Path) -> anyhow::Result<PathBuf> {
-    let mut name = path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("config path {} has no file name", path.display()))?
-        .to_os_string();
-    name.push(".lock");
-    Ok(path.with_file_name(name))
-}
-
-fn read_config_for_update(path: &Path) -> std::io::Result<(String, std::fs::Metadata)> {
-    use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() }
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "config {} must be a singly-linked regular file owned by uid {} and not writable by group or others",
-                path.display(),
-                unsafe { libc::geteuid() }
-            ),
-        ));
-    }
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-    Ok((contents, metadata))
-}
-
-fn write_atomic(
-    path: &Path,
-    contents: &str,
-    expected: Option<&std::fs::Metadata>,
-) -> anyhow::Result<()> {
-    use std::io::Write;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
-
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("config path {} has no parent", path.display()))?;
-    let mut name = path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("config path {} has no file name", path.display()))?
-        .to_os_string();
-    name.push(format!(
-        ".tmp.{}.{}",
-        std::process::id(),
-        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-    ));
-    let tmp = path.with_file_name(name);
-    let result = (|| -> anyhow::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&tmp)?;
-
-        if let Some(metadata) = expected {
-            let actual = file.metadata()?;
-            if actual.uid() != metadata.uid() || actual.gid() != metadata.gid() {
-                let rc = unsafe {
-                    libc::fchown(
-                        file.as_raw_fd(),
-                        metadata.uid() as libc::uid_t,
-                        metadata.gid() as libc::gid_t,
-                    )
-                };
-                if rc != 0 {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-            }
-            file.set_permissions(std::fs::Permissions::from_mode(metadata.mode() & 0o7777))?;
-        } else {
-            file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
-        }
-
-        file.write_all(contents.as_bytes())?;
-        file.flush()?;
-        file.sync_all()?;
-        verify_config_target(path, expected)?;
-        std::fs::rename(&tmp, path)?;
-
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(parent)?
-            .sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
-}
-
-fn verify_config_target(path: &Path, expected: Option<&std::fs::Metadata>) -> anyhow::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    match (expected, std::fs::symlink_metadata(path)) {
-        (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        (None, Ok(_)) => anyhow::bail!("config {} appeared during update", path.display()),
-        (None, Err(error)) => Err(error.into()),
-        (Some(expected), Ok(actual))
-            if actual.is_file()
-                && actual.dev() == expected.dev()
-                && actual.ino() == expected.ino()
-                && actual.ctime() == expected.ctime()
-                && actual.ctime_nsec() == expected.ctime_nsec()
-                && actual.len() == expected.len() =>
-        {
-            Ok(())
-        }
-        (Some(_), Ok(_)) => anyhow::bail!("config {} changed during update", path.display()),
-        (Some(_), Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            anyhow::bail!("config {} disappeared during update", path.display())
-        }
-        (Some(_), Err(error)) => Err(error.into()),
-    }
-}
-
 #[derive(Clone)]
 struct UserRecord {
     uid: u32,
@@ -534,10 +309,7 @@ pub fn agent_socket_path() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DefaultAction, RuleAction};
-    use crate::policy::rule::Access;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Barrier};
 
     fn temp_config() -> PathBuf {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -546,80 +318,6 @@ mod tests {
             std::process::id(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ))
-    }
-
-    fn remove_temp_config(path: &Path) {
-        std::fs::remove_file(path).unwrap();
-        std::fs::remove_file(config_lock_path(path).unwrap()).unwrap();
-    }
-
-    fn pinned_rule(hash: &str) -> RuleEntry {
-        RuleEntry {
-            file: "/home/a/.config/x".into(),
-            binary: "/usr/bin/x".into(),
-            action: RuleAction::Allow,
-            access: Access::Any,
-            sha256: Some(hash.into()),
-            signature: None,
-            script: None,
-            script_sha256: None,
-        }
-    }
-
-    #[test]
-    fn reconcile_seed_replaces_the_complete_declarative_config() {
-        let dir = std::env::temp_dir().join(format!("fg-reconcile-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let seed = dir.join("seed.toml");
-        let live = dir.join("live.toml");
-        std::fs::write(
-            &seed,
-            "[settings]\ndefault_action = \"deny\"\n\
-             [[watch]]\npath = \"~/.config/new/creds\"\n\
-             [[rule]]\nfile = \"~/.config/new/creds\"\n\
-             binary = \"/usr/bin/new\"\naction = \"allow\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            &live,
-            "[settings]\ndefault_action = \"allow\"\n\
-             [[watch]]\npath = \"~/.config/OLD/creds\"\n\
-             [[rule]]\nfile = \"~/.config/new/creds\"\n\
-             binary = \"/usr/bin/x\"\naction = \"allow\"\n",
-        )
-        .unwrap();
-
-        // SAFETY: set/remove process env around a self-contained reconcile; no
-        // other test reads these vars.
-        unsafe {
-            std::env::set_var("FILE_GUARD_SEED_CONFIG", &seed);
-            std::env::set_var("FILE_GUARD_CONFIG", &live);
-        }
-        let migrated = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let captured = Arc::clone(&migrated);
-        reconcile_seed(move |previous, declarative| {
-            *captured.lock().unwrap() = previous
-                .into_iter()
-                .filter(|rule| !declarative.contains(rule))
-                .collect();
-            Ok(())
-        })
-        .unwrap();
-        unsafe {
-            std::env::remove_var("FILE_GUARD_SEED_CONFIG");
-            std::env::remove_var("FILE_GUARD_CONFIG");
-        }
-
-        let merged: Config = toml::from_str(&std::fs::read_to_string(&live).unwrap()).unwrap();
-        assert_eq!(merged.settings.default_action, DefaultAction::Deny);
-        assert_eq!(merged.watch.len(), 1);
-        assert_eq!(merged.watch[0].path, "~/.config/new/creds");
-        assert_eq!(merged.rule.len(), 1);
-        assert_eq!(merged.rule[0].binary, "/usr/bin/new");
-        assert_eq!(migrated.lock().unwrap().len(), 1);
-        assert_eq!(migrated.lock().unwrap()[0].binary, "/usr/bin/x");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -631,49 +329,12 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_config_updates_are_linearized_by_the_sidecar_lock() {
-        let path = temp_config();
-        std::fs::write(&path, "[settings]\n").unwrap();
-        let writers = 16;
-        let barrier = Arc::new(Barrier::new(writers));
-        let mut threads = Vec::new();
-        for writer in 0..writers {
-            let path = path.clone();
-            let barrier = Arc::clone(&barrier);
-            threads.push(std::thread::spawn(move || {
-                let rule = pinned_rule(&format!("hash-{writer}"));
-                barrier.wait();
-                update_config(&path, false, |current| {
-                    let mut config: Config = toml::from_str(current.unwrap())?;
-                    config.rule.push(rule);
-                    Ok((toml::to_string(&config)?, ()))
-                })
-                .unwrap();
-            }));
-        }
-        for thread in threads {
-            thread.join().unwrap();
-        }
-
-        let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(config.rule.len(), writers);
-        remove_temp_config(&path);
-    }
-
-    #[test]
-    fn atomic_config_update_preserves_permissions() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-        let path = temp_config();
-        std::fs::write(&path, "[settings]\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-
-        update_config(&path, false, |current| {
-            Ok((format!("{}\n# updated\n", current.unwrap()), ()))
-        })
-        .unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o7777, 0o640);
-        remove_temp_config(&path);
+    fn cli_path_expansion_preserves_non_utf8_names() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(OsStr::from_bytes(b"/tmp/credential-\xff"));
+        assert_eq!(expand_file_path(path).unwrap(), path);
+        let relative = Path::new(OsStr::from_bytes(b"credential-\xff"));
+        assert_eq!(expand_file_path(relative).unwrap(), relative);
     }
 
     #[test]
@@ -683,6 +344,8 @@ mod tests {
         let target = temp_config();
         let link = temp_config();
         std::fs::write(&target, "[settings]\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert_eq!(read_operator_config(&target).unwrap(), "[settings]\n");
         symlink(&target, &link).unwrap();
         assert!(read_operator_config(&link).is_err());
         std::fs::remove_file(&link).unwrap();

@@ -22,7 +22,8 @@ cargo deb                                            # -> target/debian/file-gua
 | `/etc/file-guard/config.toml` | config (conffile; guards nothing by default) |
 | `/etc/default/file-guard` | daemon environment (set `FILE_GUARD_USER`) |
 
-Runtime deps: `fuse3` (provides the `fusermount3` helper + `libfuse3`).
+Runtime deps: `fuse3` for manual unmount and recovery utilities. The root daemon
+mounts FUSE directly through `mount(2)`.
 Recommends: `zenity` 3.16.2+ and `libnotify-bin` for GUI prompts / notifications.
 
 Nothing is enabled or started on install - guarding real credentials is an

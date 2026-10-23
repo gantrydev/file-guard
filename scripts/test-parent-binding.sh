@@ -33,9 +33,8 @@ echo "Running the specific parent-replacement test..."
 echo ""
 
 # Run the existing unit test that exercises this exact scenario
-cargo test --release parent_replacement_during_restore_keeps_the_snapshot -- --nocapture 2>&1
-
-EXIT_CODE=$?
+EXIT_CODE=0
+cargo test --release parent_replacement_during_restore_keeps_the_snapshot -- --nocapture 2>&1 || EXIT_CODE=$?
 
 echo ""
 if [ $EXIT_CODE -eq 0 ]; then
@@ -48,7 +47,7 @@ if [ $EXIT_CODE -eq 0 ]; then
     echo "  4. Did NOT write to the attacker-controlled directory"
 else
     echo "=== TEST FAILED ==="
-    echo "Parent directory replacement was not detected!"
+    echo "The parent binding test failed; review the output above."
 fi
 
 exit $EXIT_CODE

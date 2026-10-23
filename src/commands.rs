@@ -4,16 +4,13 @@ use crate::policy::engine::{ManagedRule, RulePinUpdate};
 
 pub(super) async fn execute(command: Command) -> anyhow::Result<()> {
     match command {
-        Command::Start { daemon: _daemonize } => {
+        Command::Start => {
             let database_path = crate::rule_store::rule_store_path()?;
             let rule_lease = std::sync::Arc::new(
                 crate::rule_store::RuleLease::try_acquire(database_path)?.ok_or_else(|| {
                     anyhow::anyhow!("another learned-rule owner is already active")
                 })?,
             );
-            crate::config_runtime::reconcile_seed(|previous, declarative| {
-                migrate_legacy_rules(&rule_lease, previous, declarative)
-            })?;
             let config = crate::config_runtime::load()?;
             let mut d = crate::daemon::Daemon::new(config, rule_lease)?;
             d.start().await?;
@@ -61,6 +58,9 @@ pub(super) async fn execute(command: Command) -> anyhow::Result<()> {
                 access,
                 no_pin,
             }) => {
+                let binary_name = binary.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("rule binary path must be valid UTF-8: {}", binary.display())
+                })?;
                 let sha256 = if no_pin {
                     None
                 } else {
@@ -74,14 +74,13 @@ pub(super) async fn execute(command: Command) -> anyhow::Result<()> {
                 };
                 let entry = crate::config::RuleEntry {
                     file: file.clone(),
-                    binary: binary.to_string_lossy().into_owned(),
+                    binary: binary_name.to_owned(),
                     action: match action {
                         crate::cli::RuleAction::Allow => crate::config::RuleAction::Allow,
                         crate::cli::RuleAction::Deny => crate::config::RuleAction::Deny,
                     },
                     access,
                     sha256,
-                    signature: None,
                     script: None,
                     script_sha256: None,
                 };
@@ -199,7 +198,7 @@ pub(super) async fn execute(command: Command) -> anyhow::Result<()> {
             }
         },
         Command::Store { file } => {
-            let expanded = crate::config_runtime::expand_path(&file.to_string_lossy())?;
+            let expanded = crate::config_runtime::expand_file_path(&file)?;
 
             // A live mount means the daemon already guards this path (it
             // captured the original itself); storing again and removing the
@@ -217,7 +216,7 @@ pub(super) async fn execute(command: Command) -> anyhow::Result<()> {
             println!("moved {} into the backing store", expanded.display());
         }
         Command::Restore { file } => {
-            let expanded = crate::config_runtime::expand_path(&file.to_string_lossy())?;
+            let expanded = crate::config_runtime::expand_file_path(&file)?;
 
             // A live mount means the daemon still owns this path; writing under
             // it fights the daemon and is overwritten when it stops (with
@@ -255,38 +254,6 @@ pub(super) async fn execute(command: Command) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-fn migrate_legacy_rules(
-    lease: &std::sync::Arc<crate::rule_store::RuleLease>,
-    previous: Vec<crate::config::RuleEntry>,
-    declarative: Vec<crate::config::RuleEntry>,
-) -> anyhow::Result<()> {
-    let legacy = legacy_rules(previous, declarative)?;
-    if legacy.is_empty() {
-        return Ok(());
-    }
-    let store = crate::rule_store::RuleStore::open(std::sync::Arc::clone(lease))?;
-    let migrated = store.insert_many(&legacy)?.len();
-    tracing::info!(target: "file_guard", "migrated {migrated} legacy learned rule(s) into the rule store");
-    Ok(())
-}
-
-fn legacy_rules(
-    previous: Vec<crate::config::RuleEntry>,
-    declarative: Vec<crate::config::RuleEntry>,
-) -> anyhow::Result<Vec<crate::config::RuleEntry>> {
-    let declarative = declarative
-        .into_iter()
-        .map(crate::policy::engine::normalize_rule_entry)
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(previous
-        .into_iter()
-        .map(crate::policy::engine::normalize_rule_entry)
-        .collect::<anyhow::Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|entry| !declarative.contains(entry))
-        .collect())
 }
 
 async fn list_managed_rules() -> anyhow::Result<Vec<ManagedRule>> {
@@ -356,36 +323,5 @@ async fn wait_for_shutdown() -> anyhow::Result<()> {
     {
         tokio::signal::ctrl_c().await?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod startup_tests {
-    use super::*;
-
-    fn rule(binary: &str, hash: &str) -> crate::config::RuleEntry {
-        crate::config::RuleEntry {
-            file: "/credential".into(),
-            binary: binary.into(),
-            action: crate::config::RuleAction::Allow,
-            access: crate::policy::rule::Access::Any,
-            sha256: Some(hash.repeat(64)),
-            signature: None,
-            script: None,
-            script_sha256: None,
-        }
-    }
-
-    #[test]
-    fn seed_migration_keeps_only_legacy_rules() {
-        let seed_in_live = rule("/usr/bin/seed", "A");
-        let legacy = rule("/usr/bin/legacy", "b");
-        let selected = legacy_rules(
-            vec![seed_in_live, legacy.clone()],
-            vec![rule("/usr/bin/seed", "a")],
-        )
-        .unwrap();
-
-        assert_eq!(selected, vec![legacy]);
     }
 }

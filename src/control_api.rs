@@ -9,7 +9,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 
 use crate::config::{RuleAction, RuleEntry};
-use crate::policy::engine::{ManagedRule, PolicyEngine, RulePinUpdate};
+use crate::policy::engine::{ManagedRule, PolicyEngine, RuleManager, RulePinUpdate};
 use crate::policy::rule::Access;
 use crate::rule_store::{RuleLease, RuleStore};
 
@@ -307,7 +307,12 @@ async fn handle_connection(
                 message: "rule mutations require root; re-run with sudo".to_string(),
             }
         }
-        Ok(request) => execute(policy, request.command),
+        Ok(request) => match execute(&policy.rules, request.command) {
+            Ok(payload) => ControlResponse::Ok { payload },
+            Err(error) => ControlResponse::Error {
+                message: error.to_string(),
+            },
+        },
         Err(error) => ControlResponse::Error {
             message: format!("invalid control request: {error}"),
         },
@@ -336,13 +341,13 @@ fn encode_response(response: ControlResponse) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn execute(policy: &PolicyEngine, command: ControlCommand) -> ControlResponse {
-    let result = match command {
-        ControlCommand::ListRules => Ok(ControlPayload::Rules(policy.managed_rules())),
+fn execute(rules: &RuleManager, command: ControlCommand) -> anyhow::Result<ControlPayload> {
+    match command {
+        ControlCommand::ListRules => Ok(ControlPayload::Rules(rules.managed_rules())),
         ControlCommand::AddRule { entry } => {
-            policy.add_managed_rule(entry).map(ControlPayload::Added)
+            rules.add_managed_rule(entry).map(ControlPayload::Added)
         }
-        ControlCommand::ImportRules { entries } => policy
+        ControlCommand::ImportRules { entries } => rules
             .import_managed_rules(entries)
             .map(ControlPayload::Imported),
         ControlCommand::EditRule {
@@ -350,18 +355,12 @@ fn execute(policy: &PolicyEngine, command: ControlCommand) -> ControlResponse {
             action,
             access,
             pin,
-        } => policy
+        } => rules
             .edit_managed_rule(id, action, access, pin)
             .map(|_| ControlPayload::Replaced),
         ControlCommand::RemoveRule { id } => {
-            policy.remove_managed_rule(id).map(ControlPayload::Removed)
+            rules.remove_managed_rule(id).map(ControlPayload::Removed)
         }
-    };
-    match result {
-        Ok(payload) => ControlResponse::Ok { payload },
-        Err(error) => ControlResponse::Error {
-            message: error.to_string(),
-        },
     }
 }
 
@@ -369,92 +368,10 @@ fn execute_offline(command: ControlCommand, lease: RuleLease) -> anyhow::Result<
     if command.mutates() && unsafe { libc::geteuid() } != 0 {
         anyhow::bail!("offline rule mutations require root; re-run with sudo");
     }
-    let store = RuleStore::open(Arc::new(lease))?;
-    match command {
-        ControlCommand::ListRules => {
-            let mut rules = normalized_declarative_rules()?
-                .into_iter()
-                .map(|entry| ManagedRule {
-                    entry,
-                    learned_id: None,
-                })
-                .collect::<Vec<_>>();
-            rules.extend(
-                store
-                    .list()?
-                    .into_iter()
-                    .map(|stored| {
-                        Ok(ManagedRule {
-                            entry: crate::policy::engine::normalize_rule_entry(stored.entry)?,
-                            learned_id: Some(stored.id),
-                        })
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?,
-            );
-            Ok(ControlPayload::Rules(rules))
-        }
-        ControlCommand::AddRule { entry } => {
-            let entry = crate::policy::engine::normalize_rule_entry(entry)?;
-            let declarative = normalized_declarative_rules()?;
-            if declarative.contains(&entry) {
-                return Ok(ControlPayload::Added(false));
-            }
-            Ok(ControlPayload::Added(store.insert(&entry)?.is_some()))
-        }
-        ControlCommand::ImportRules { entries } => {
-            let entries = entries
-                .into_iter()
-                .map(crate::policy::engine::normalize_rule_entry)
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            let declarative = normalized_declarative_rules()?;
-            let entries = entries
-                .into_iter()
-                .filter(|entry| !declarative.contains(entry))
-                .collect::<Vec<_>>();
-            Ok(ControlPayload::Imported(store.insert_many(&entries)?.len()))
-        }
-        ControlCommand::EditRule {
-            id,
-            action,
-            access,
-            pin,
-        } => {
-            let current = store
-                .list()?
-                .into_iter()
-                .find(|stored| stored.id == id)
-                .ok_or_else(|| anyhow::anyhow!("learned rule {id} does not exist"))?;
-            let entry = crate::policy::engine::edit_rule_entry(current.entry, action, access, pin)?;
-            if normalized_declarative_rules()?.contains(&entry)
-                || store
-                    .list()?
-                    .iter()
-                    .any(|stored| stored.id != id && stored.entry == entry)
-            {
-                anyhow::bail!("an identical rule already exists");
-            }
-            store.replace(id, &entry)?;
-            Ok(ControlPayload::Replaced)
-        }
-        ControlCommand::RemoveRule { id } => {
-            let entry = store
-                .list()?
-                .into_iter()
-                .find(|stored| stored.id == id)
-                .ok_or_else(|| anyhow::anyhow!("learned rule {id} does not exist"))?
-                .entry;
-            store.remove(id)?;
-            Ok(ControlPayload::Removed(entry))
-        }
-    }
-}
-
-fn normalized_declarative_rules() -> anyhow::Result<Vec<RuleEntry>> {
-    crate::config_runtime::load()?
-        .rule
-        .into_iter()
-        .map(crate::policy::engine::normalize_rule_entry)
-        .collect()
+    let config = crate::config_runtime::load()?;
+    let store = Arc::new(RuleStore::open(Arc::new(lease))?);
+    let rules = RuleManager::new(&config, store)?;
+    execute(&rules, command)
 }
 
 async fn read_message(read_half: tokio::net::unix::OwnedReadHalf) -> anyhow::Result<Vec<u8>> {
@@ -538,7 +455,6 @@ mod tests {
             action: RuleAction::Allow,
             access: Access::Any,
             sha256: None,
-            signature: None,
             script: None,
             script_sha256: None,
         }
@@ -548,20 +464,16 @@ mod tests {
     fn commands_mutate_the_policy_repository() {
         let policy = policy();
         assert!(matches!(
-            execute(&policy, ControlCommand::AddRule { entry: entry() }),
-            ControlResponse::Ok {
-                payload: ControlPayload::Added(true)
-            }
+            execute(&policy.rules, ControlCommand::AddRule { entry: entry() }),
+            Ok(ControlPayload::Added(true))
         ));
-        let id = match execute(&policy, ControlCommand::ListRules) {
-            ControlResponse::Ok {
-                payload: ControlPayload::Rules(rules),
-            } => rules[0].learned_id.unwrap(),
+        let id = match execute(&policy.rules, ControlCommand::ListRules) {
+            Ok(ControlPayload::Rules(rules)) => rules[0].learned_id.unwrap(),
             _ => panic!("unexpected list response"),
         };
         assert!(matches!(
             execute(
-                &policy,
+                &policy.rules,
                 ControlCommand::EditRule {
                     id,
                     action: Some(RuleAction::Deny),
@@ -569,13 +481,11 @@ mod tests {
                     pin: RulePinUpdate::Keep,
                 }
             ),
-            ControlResponse::Ok {
-                payload: ControlPayload::Replaced
-            }
+            Ok(ControlPayload::Replaced)
         ));
         assert!(matches!(
             execute(
-                &policy,
+                &policy.rules,
                 ControlCommand::EditRule {
                     id,
                     action: None,
@@ -583,20 +493,16 @@ mod tests {
                     pin: RulePinUpdate::Keep,
                 }
             ),
-            ControlResponse::Ok {
-                payload: ControlPayload::Replaced
-            }
+            Ok(ControlPayload::Replaced)
         ));
-        let edited = policy.managed_rules();
+        let edited = policy.rules.managed_rules();
         assert_eq!(edited[0].entry.action, RuleAction::Deny);
         assert_eq!(edited[0].entry.access, Access::Read);
         assert!(matches!(
-            execute(&policy, ControlCommand::RemoveRule { id }),
-            ControlResponse::Ok {
-                payload: ControlPayload::Removed(_)
-            }
+            execute(&policy.rules, ControlCommand::RemoveRule { id }),
+            Ok(ControlPayload::Removed(_))
         ));
-        assert!(policy.managed_rules().is_empty());
+        assert!(policy.rules.managed_rules().is_empty());
     }
 
     #[tokio::test]

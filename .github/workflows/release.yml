@@ -18,7 +18,7 @@ jobs:
             experimental-features = nix-command flakes
       - name: Build
         run: nix build .#file-guard
-      - name: Package (x86_64-linux, dynamically links libfuse3)
+      - name: Package (x86_64-linux)
         run: |
           install -Dm755 result/bin/file-guard "dist/file-guard"
           tar -C dist -czf "file-guard-${{ github.ref_name }}-x86_64-linux.tar.gz" file-guard
@@ -28,8 +28,7 @@ jobs:
           files: file-guard-*.tar.gz
           generate_release_notes: true
           body: |
-            Linux x86_64 build. The binary dynamically links **libfuse3** - the
-            target host must provide it (Debian/Ubuntu: `fuse3`; Nix: use the flake).
+            Linux x86_64 build. Requires Linux FUSE support.
             A Debian/Ubuntu `.deb` is attached as well.
 
   # Debian/Ubuntu .deb, built natively and attached to the same release.

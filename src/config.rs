@@ -1,5 +1,5 @@
 use crate::policy::rule::Access;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
@@ -11,7 +11,7 @@ pub struct Config {
     pub rule: Vec<RuleEntry>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Settings {
     #[serde(default)]
     pub default_action: DefaultAction,
@@ -22,61 +22,12 @@ pub struct Settings {
     /// Fire a desktop notification alongside every prompt, even for
     /// `log_only` (which otherwise has no visible feedback). On Linux
     /// this calls `notify-send` from the user's session agent.
+    #[serde(default)]
     pub notify: bool,
     #[serde(default)]
     pub restore_on_stop: bool,
     #[serde(default = "default_log_dest")]
     pub log_destination: String,
-}
-
-#[derive(Deserialize)]
-struct SettingsInput {
-    #[serde(default)]
-    default_action: DefaultAction,
-    #[serde(default = "default_timeout")]
-    prompt_timeout: u64,
-    #[serde(default)]
-    prompt_method: PromptMethodInput,
-    #[serde(default)]
-    notify: Option<bool>,
-    #[serde(default)]
-    restore_on_stop: bool,
-    #[serde(default = "default_log_dest")]
-    log_destination: String,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PromptMethodInput {
-    #[default]
-    Terminal,
-    Gui,
-    LogOnly,
-    Notification,
-}
-
-impl<'de> Deserialize<'de> for Settings {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let input = SettingsInput::deserialize(deserializer)?;
-        let legacy_notification = matches!(input.prompt_method, PromptMethodInput::Notification);
-        let prompt_method = match input.prompt_method {
-            PromptMethodInput::Terminal => PromptMethod::Terminal,
-            PromptMethodInput::Gui => PromptMethod::Gui,
-            PromptMethodInput::LogOnly | PromptMethodInput::Notification => PromptMethod::LogOnly,
-        };
-
-        Ok(Self {
-            default_action: input.default_action,
-            prompt_timeout: input.prompt_timeout,
-            prompt_method,
-            notify: input.notify.unwrap_or(legacy_notification),
-            restore_on_stop: input.restore_on_stop,
-            log_destination: input.log_destination,
-        })
-    }
 }
 
 fn default_timeout() -> u64 {
@@ -121,17 +72,11 @@ pub struct RuleEntry {
     pub file: String,
     pub binary: String,
     pub action: RuleAction,
-    /// Direction the rule authorizes. Absent in legacy configs → `read`, so
-    /// every previously-written rule keeps its read-only meaning.
     #[serde(default, skip_serializing_if = "access_is_read")]
     pub access: Access,
     /// sha256 of the binary when the rule was captured (binary-identity pin).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
-    /// Legacy field retained so older rule files continue to round-trip.
-    /// Ignored by the Linux policy engine.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signature: Option<String>,
     /// For interpreter rules, the pinned script path (narrows the interpreter
     /// to a specific program).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -208,24 +153,6 @@ default_action = "deny"
     }
 
     #[test]
-    fn legacy_notification_method_keeps_notifications_enabled() {
-        let config: Config = toml::from_str(
-            r#"
-[settings]
-prompt_method = "notification"
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(config.settings.prompt_method, PromptMethod::LogOnly);
-        assert!(config.settings.notify);
-
-        let serialized = toml::to_string(&config).unwrap();
-        assert!(serialized.contains("prompt_method = \"log_only\""));
-        assert!(serialized.contains("notify = true"));
-    }
-
-    #[test]
     fn log_only_defaults_to_no_desktop_notification() {
         let config: Config = toml::from_str(
             r#"
@@ -263,7 +190,7 @@ prompt_method = "log_only"
     }
 
     #[test]
-    fn legacy_rule_defaults_to_unpinned_read() {
+    fn rule_defaults_to_unpinned_read() {
         let toml = r#"
 [settings]
 [[watch]]
@@ -276,7 +203,6 @@ action = "allow"
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.rule[0].access, Access::Read);
         assert!(config.rule[0].sha256.is_none());
-        assert!(config.rule[0].signature.is_none());
     }
 
     #[test]
@@ -287,14 +213,12 @@ action = "allow"
             action: RuleAction::Allow,
             access: Access::Write,
             sha256: Some("deadbeef".into()),
-            signature: None,
             script: None,
             script_sha256: None,
         };
         let serialized = toml::to_string(&entry).unwrap();
         assert!(serialized.contains("access = \"write\""));
         assert!(serialized.contains("sha256 = \"deadbeef\""));
-        assert!(!serialized.contains("signature"));
 
         let back: RuleEntry = toml::from_str(&serialized).unwrap();
         assert_eq!(back.access, Access::Write);
@@ -309,7 +233,6 @@ action = "allow"
             action: RuleAction::Allow,
             access: Access::Any,
             sha256: Some("hash".into()),
-            signature: None,
             script: None,
             script_sha256: None,
         };

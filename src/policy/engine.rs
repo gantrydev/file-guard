@@ -13,14 +13,18 @@ use crate::rule_store::RuleRepository;
 use std::sync::Arc;
 
 pub struct PolicyEngine {
-    rules: RwLock<Vec<ActiveRule>>,
-    rule_store: Arc<dyn RuleRepository>,
+    pub rules: RuleManager,
     session: SessionState,
     prompter: Arc<PromptClient>,
     /// Action applied when a prompt times out / the agent is unreachable.
     global_default: DefaultAction,
     /// Per-watched-file overrides of `global_default`.
     file_defaults: HashMap<PathBuf, DefaultAction>,
+}
+
+pub struct RuleManager {
+    rules: RwLock<Vec<ActiveRule>>,
+    rule_store: Arc<dyn RuleRepository>,
 }
 
 struct ActiveRule {
@@ -49,43 +53,20 @@ impl PolicyEngine {
         prompter: Arc<PromptClient>,
         rule_store: Arc<dyn RuleRepository>,
     ) -> anyhow::Result<Self> {
-        let mut rules = config
-            .rule
-            .iter()
-            .cloned()
-            .map(|entry| {
-                let (entry, compiled) = prepare_rule_entry(entry)?;
-                Ok(ActiveRule {
-                    compiled,
-                    entry,
-                    learned_id: None,
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let learned = rule_store
-            .list()?
-            .into_iter()
-            .map(|stored| {
-                let (entry, compiled) = prepare_rule_entry(stored.entry)?;
-                Ok(ActiveRule {
-                    compiled,
-                    entry,
-                    learned_id: Some(stored.id),
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        rules.extend(learned);
-
         let mut file_defaults = HashMap::new();
         for watch in &config.watch {
             if let Some(default) = watch.default_action {
-                file_defaults.insert(config_runtime::expand_path(&watch.path)?, default);
+                file_defaults.insert(
+                    crate::secure_file::absolute_lexical(&config_runtime::expand_path(
+                        &watch.path,
+                    )?)?,
+                    default,
+                );
             }
         }
 
         Ok(Self {
-            rules: RwLock::new(rules),
-            rule_store,
+            rules: RuleManager::new(config, rule_store)?,
             session: SessionState::new(),
             prompter,
             global_default: config.settings.default_action,
@@ -126,7 +107,7 @@ impl PolicyEngine {
             if !needed {
                 continue;
             }
-            match self.lookup_rule(process, watched_file, access) {
+            match self.rules.lookup_rule(process, watched_file, access) {
                 // A persistent deny on any required direction denies the open.
                 Some(Action::Deny) => return Decision::DenyAlways,
                 Some(Action::Allow) => continue,
@@ -212,6 +193,85 @@ impl PolicyEngine {
         }
     }
 
+    fn persist_rule(
+        &self,
+        process: &ProcessInfo,
+        file: &Path,
+        access: Access,
+        action: Action,
+    ) -> anyhow::Result<()> {
+        if crate::process::identify::is_interpreter(&process.binary_name)
+            && process.script.is_none()
+        {
+            anyhow::bail!("cannot create a permanent interpreter rule without a resolved script");
+        }
+        let script = process
+            .script
+            .as_ref()
+            .map(|path| -> anyhow::Result<ScriptIdentity> {
+                let script_path = path.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("rule script path must be valid UTF-8: {}", path.display())
+                })?;
+                crate::process::integrity::hash_file(path)
+                    .map(|sha256| ScriptIdentity {
+                        path: script_path.to_owned(),
+                        pin: IdentityPin::Sha256(sha256),
+                    })
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "cannot hash script {} to create a permanent rule: {error}",
+                            path.display()
+                        )
+                    })
+            })
+            .transpose()?;
+
+        self.rules.add_persistent_rule(Rule {
+            file: file.to_path_buf(),
+            binary: process.binary_path.clone(),
+            action,
+            access,
+            identity: IdentityPin::Sha256(process.binary_sha256.clone()),
+            script,
+        })
+    }
+}
+
+impl RuleManager {
+    pub fn new(config: &Config, rule_store: Arc<dyn RuleRepository>) -> anyhow::Result<Self> {
+        let mut rules = config
+            .rule
+            .iter()
+            .cloned()
+            .map(|entry| {
+                let (entry, compiled) = prepare_rule_entry(entry)?;
+                Ok(ActiveRule {
+                    compiled,
+                    entry,
+                    learned_id: None,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let learned = rule_store
+            .list()?
+            .into_iter()
+            .map(|stored| {
+                let (entry, compiled) = prepare_rule_entry(stored.entry)?;
+                Ok(ActiveRule {
+                    compiled,
+                    entry,
+                    learned_id: Some(stored.id),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        rules.extend(learned);
+
+        Ok(Self {
+            rules: RwLock::new(rules),
+            rule_store,
+        })
+    }
+
     fn lookup_rule(&self, process: &ProcessInfo, file: &Path, req: Access) -> Option<Action> {
         let rules = self.rules.read().unwrap();
         let mut matched_allow = false;
@@ -235,7 +295,7 @@ impl PolicyEngine {
     ///
     /// A pin **mismatch is a non-match (re-prompt), not a deny** - so a
     /// legitimately rebuilt/upgraded binary re-authorizes interactively instead
-    /// of being hard-blocked. An unpinned (legacy) rule matches on path alone.
+    /// of being hard-blocked. An explicitly unpinned rule matches on path alone.
     fn identity_matches(&self, rule: &Rule, process: &ProcessInfo) -> bool {
         match &rule.identity {
             IdentityPin::Unpinned => warn_unpinned_once(&rule.binary),
@@ -250,8 +310,8 @@ impl PolicyEngine {
         }
 
         if let Some(expected) = &rule.script {
-            let actual = process.script.as_ref().map(|p| p.to_string_lossy());
-            if actual.as_deref() != Some(expected.path.as_str()) {
+            let actual = process.script.as_deref().and_then(Path::to_str);
+            if actual != Some(expected.path.as_str()) {
                 tracing::info!(
                     "interpreter {} is running a different script than its rule pinned - re-prompting",
                     process.binary_path.display()
@@ -289,53 +349,25 @@ impl PolicyEngine {
         true
     }
 
-    fn persist_rule(
-        &self,
-        process: &ProcessInfo,
-        file: &Path,
-        access: Access,
-        action: Action,
-    ) -> anyhow::Result<()> {
-        let script = process
-            .script
-            .as_ref()
-            .map(|path| {
-                crate::process::integrity::hash_file(path)
-                    .map(|sha256| ScriptIdentity {
-                        path: path.to_string_lossy().into_owned(),
-                        pin: IdentityPin::Sha256(sha256),
-                    })
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "cannot hash script {} to create a permanent rule: {error}",
-                            path.display()
-                        )
-                    })
-            })
-            .transpose()?;
-
-        self.add_persistent_rule(Rule {
-            file: file.to_path_buf(),
-            binary: process.binary_path.clone(),
-            action,
-            access,
-            identity: IdentityPin::Sha256(process.binary_sha256.clone()),
-            script,
-        })
-    }
-
     /// Add a new persistent rule to the daemon-owned learned-rule store.
     pub fn add_persistent_rule(&self, rule: Rule) -> anyhow::Result<()> {
         let entry = crate::config::RuleEntry {
-            file: rule.file.to_string_lossy().to_string(),
-            binary: rule.binary.to_string_lossy().to_string(),
+            file: rule
+                .file
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("rule file path must be valid UTF-8"))?
+                .to_owned(),
+            binary: rule
+                .binary
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("rule binary path must be valid UTF-8"))?
+                .to_owned(),
             action: match rule.action {
                 Action::Allow => RuleAction::Allow,
                 Action::Deny => RuleAction::Deny,
             },
             access: rule.access,
             sha256: rule.identity.sha256().map(str::to_owned),
-            signature: None,
             script: rule.script.as_ref().map(|identity| identity.path.clone()),
             script_sha256: rule
                 .script
@@ -445,19 +477,6 @@ impl PolicyEngine {
     }
 }
 
-pub(crate) fn normalize_rule_entry(entry: RuleEntry) -> anyhow::Result<RuleEntry> {
-    prepare_rule_entry(entry).map(|(entry, _)| entry)
-}
-
-pub(crate) fn edit_rule_entry(
-    entry: RuleEntry,
-    action: Option<RuleAction>,
-    access: Option<Access>,
-    pin: RulePinUpdate,
-) -> anyhow::Result<RuleEntry> {
-    prepare_rule_entry(apply_rule_edit(entry, action, access, pin)).map(|(entry, _)| entry)
-}
-
 fn apply_rule_edit(
     mut entry: RuleEntry,
     action: Option<RuleAction>,
@@ -485,6 +504,12 @@ fn prepare_rule_entry(mut entry: RuleEntry) -> anyhow::Result<(RuleEntry, Rule)>
     normalize_hash(&mut entry.sha256, "sha256")?;
     normalize_hash(&mut entry.script_sha256, "script_sha256")?;
     let compiled = rule_from_entry(&entry)?;
+    entry.file = compiled
+        .file
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("rule file path must be valid UTF-8"))?
+        .to_owned();
+    entry.script = compiled.script.as_ref().map(|script| script.path.clone());
     Ok((entry, compiled))
 }
 
@@ -503,6 +528,7 @@ fn rule_from_entry(entry: &RuleEntry) -> anyhow::Result<Rule> {
     if !file.is_absolute() {
         anyhow::bail!("rule file path must be absolute: {}", entry.file);
     }
+    let file = crate::secure_file::absolute_lexical(&file)?;
     let binary = PathBuf::from(&entry.binary);
     if !binary.is_absolute() {
         anyhow::bail!("rule binary path must be absolute: {}", entry.binary);
@@ -516,7 +542,10 @@ fn rule_from_entry(entry: &RuleEntry) -> anyhow::Result<Rule> {
                 anyhow::bail!("rule script path must be absolute: {path}");
             }
             Some(ScriptIdentity {
-                path: path.clone(),
+                path: crate::secure_file::absolute_lexical(Path::new(path))?
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("rule script path must be valid UTF-8"))?
+                    .to_owned(),
                 pin: identity_pin(hash, "script_sha256")?,
             })
         }
@@ -554,7 +583,7 @@ fn warn_unpinned_once(binary: &Path) {
         .unwrap();
     if warned.insert(binary.to_path_buf()) {
         tracing::warn!(
-            "rule for {} is not identity-pinned (legacy/path-only); it authorizes \
+            "rule for {} is not identity-pinned (path-only); it authorizes \
              any binary at that path",
             binary.display()
         );
@@ -625,7 +654,6 @@ mod tests {
             action,
             access: Access::Read,
             sha256: None,
-            signature: None,
             script: None,
             script_sha256: None,
         }
@@ -644,7 +672,10 @@ mod tests {
         let pinned = crate::process::integrity::hash_file(&bin).unwrap();
 
         // Correct pin → matches.
-        assert!(eng.identity_matches(&rule_for(&bin, Some(pinned.clone())), &info_for(&bin)));
+        assert!(
+            eng.rules
+                .identity_matches(&rule_for(&bin, Some(pinned.clone())), &info_for(&bin))
+        );
 
         // Binary changed (different length busts the hash cache) → the rule no
         // longer matches, so evaluate() falls through to a fresh prompt. This is
@@ -655,10 +686,13 @@ mod tests {
             .write_all(b"v2-longer")
             .unwrap();
         let changed = info_for(&bin);
-        assert!(!eng.identity_matches(&rule_for(&bin, Some(pinned)), &changed));
+        assert!(
+            !eng.rules
+                .identity_matches(&rule_for(&bin, Some(pinned)), &changed)
+        );
 
-        // Unpinned (legacy) rule matches on path alone.
-        assert!(eng.identity_matches(&rule_for(&bin, None), &changed));
+        // Unpinned rule matches on path alone.
+        assert!(eng.rules.identity_matches(&rule_for(&bin, None), &changed));
 
         std::fs::remove_file(&bin).ok();
     }
@@ -691,14 +725,17 @@ mod tests {
         };
 
         // Matching script content → matches.
-        assert!(eng.identity_matches(&rule(Some(script_hash.clone())), &info));
+        assert!(
+            eng.rules
+                .identity_matches(&rule(Some(script_hash.clone())), &info)
+        );
 
         // Edited in place at the same path → no match (re-prompt).
         std::fs::write(&script, b"print('v2-longer')").unwrap();
-        assert!(!eng.identity_matches(&rule(Some(script_hash)), &info));
+        assert!(!eng.rules.identity_matches(&rule(Some(script_hash)), &info));
 
         // No script pin → content is not checked (path pin still holds).
-        assert!(eng.identity_matches(&rule(None), &info));
+        assert!(eng.rules.identity_matches(&rule(None), &info));
 
         std::fs::remove_file(&bin).ok();
         std::fs::remove_file(&script).ok();
@@ -729,7 +766,7 @@ mod tests {
         };
 
         std::fs::write(&script, b"print('v2-longer')").unwrap();
-        assert!(!eng.identity_matches(&rule, &info));
+        assert!(!eng.rules.identity_matches(&rule, &info));
 
         std::fs::remove_file(&bin).ok();
         std::fs::remove_file(&script).ok();
@@ -749,7 +786,95 @@ mod tests {
             eng.persist_rule(&process, Path::new("/f"), Access::Any, Action::Allow)
                 .is_err()
         );
-        assert!(eng.rules.read().unwrap().is_empty());
+        assert!(eng.rules.rules.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unresolved_interpreter_does_not_create_a_permanent_grant() {
+        let eng = engine();
+        let mut process = info_for(Path::new("/usr/bin/tool"));
+        for name in [
+            "python3",
+            "perl5.36.0",
+            "ruby3.2",
+            "php8.2",
+            "lua5.4",
+            "tclsh8.6",
+        ] {
+            process.binary_name = name.into();
+            assert!(
+                eng.persist_rule(&process, Path::new("/f"), Access::Any, Action::Allow)
+                    .is_err(),
+                "{name}"
+            );
+        }
+        assert!(eng.rules.managed_rules().is_empty());
+    }
+
+    #[test]
+    fn non_utf8_paths_do_not_create_permanent_rules() {
+        use std::os::unix::ffi::OsStrExt;
+        let eng = engine();
+        let invalid = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/tool-\xff"));
+        let mut process = info_for(Path::new("/usr/bin/tool"));
+        process.binary_path = invalid.to_path_buf();
+        assert!(
+            eng.persist_rule(&process, Path::new("/f"), Access::Any, Action::Allow)
+                .is_err()
+        );
+        process.binary_path = PathBuf::from("/usr/bin/tool");
+        assert!(
+            eng.persist_rule(&process, invalid, Access::Any, Action::Allow)
+                .is_err()
+        );
+        process.script = Some(invalid.to_path_buf());
+        assert!(
+            eng.persist_rule(&process, Path::new("/f"), Access::Any, Action::Allow)
+                .is_err()
+        );
+        assert!(eng.rules.managed_rules().is_empty());
+        let mut rule = rule_for(&process.binary_path, None);
+        rule.script = Some(ScriptIdentity {
+            path: "/tmp/tool-\u{fffd}".into(),
+            pin: IdentityPin::Unpinned,
+        });
+        assert!(!eng.rules.identity_matches(&rule, &process));
+    }
+
+    #[test]
+    fn normalized_paths_are_persisted_and_deduplicated() {
+        let eng = engine();
+        let mut entry = entry_for(Path::new("/usr/bin/tool"), RuleAction::Allow);
+        entry.file = "/tmp/../tmp/credential".into();
+        entry.script = Some("/scripts/../program.py".into());
+        assert!(eng.rules.add_managed_rule(entry.clone()).unwrap());
+        entry.file = "/tmp/credential".into();
+        entry.script = Some("/program.py".into());
+        assert!(!eng.rules.add_managed_rule(entry.clone()).unwrap());
+        assert_eq!(eng.rules.managed_rules()[0].entry, entry);
+        assert_eq!(eng.rules.rule_store.list().unwrap()[0].entry, entry);
+    }
+
+    #[test]
+    fn normalized_mount_paths_retain_denies_and_watch_defaults() {
+        let config: Config = toml::from_str(
+            "[settings]\ndefault_action = \"allow\"\n\
+             [[watch]]\npath = \"/tmp/../tmp/credential\"\ndefault_action = \"deny\"\n\
+             [[rule]]\nfile = \"/tmp/../tmp/credential\"\nbinary = \"/usr/bin/tool\"\naction = \"deny\"\n",
+        ).unwrap();
+        let client = Arc::new(PromptClient::new(
+            PathBuf::from("/nonexistent.sock"),
+            Duration::from_millis(50),
+            0,
+        ));
+        let eng = PolicyEngine::new(&config, client, Arc::new(MemoryRuleStore::new())).unwrap();
+        let file = Path::new("/tmp/credential");
+        assert_eq!(eng.default_for(file), DefaultAction::Deny);
+        let process = info_for(Path::new("/usr/bin/tool"));
+        assert_eq!(
+            eng.rules.lookup_rule(&process, file, Access::Read),
+            Some(Action::Deny)
+        );
     }
 
     #[test]
@@ -762,10 +887,15 @@ mod tests {
         ] {
             let eng = engine();
             for action in actions {
-                assert!(eng.add_managed_rule(entry_for(binary, action)).unwrap());
+                assert!(
+                    eng.rules
+                        .add_managed_rule(entry_for(binary, action))
+                        .unwrap()
+                );
             }
             assert_eq!(
-                eng.lookup_rule(&process, Path::new("/f"), Access::Read),
+                eng.rules
+                    .lookup_rule(&process, Path::new("/f"), Access::Read),
                 Some(Action::Deny)
             );
         }
@@ -788,32 +918,34 @@ mod tests {
         let declarative = entry_for(Path::new("/usr/bin/tool"), RuleAction::Allow);
 
         assert_eq!(
-            eng.managed_rules(),
+            eng.rules.managed_rules(),
             vec![ManagedRule {
                 entry: declarative.clone(),
                 learned_id: None,
             }]
         );
-        assert!(!eng.add_managed_rule(declarative).unwrap());
+        assert!(!eng.rules.add_managed_rule(declarative).unwrap());
 
         let learned = entry_for(Path::new("/usr/bin/tool"), RuleAction::Deny);
-        assert!(eng.add_managed_rule(learned.clone()).unwrap());
+        assert!(eng.rules.add_managed_rule(learned.clone()).unwrap());
         let id = store.list().unwrap()[0].id;
-        assert_eq!(eng.managed_rules()[1].learned_id, Some(id));
+        assert_eq!(eng.rules.managed_rules()[1].learned_id, Some(id));
 
-        eng.edit_managed_rule(id, None, Some(Access::Write), RulePinUpdate::Keep)
+        eng.rules
+            .edit_managed_rule(id, None, Some(Access::Write), RulePinUpdate::Keep)
             .unwrap();
         let replacement = eng
+            .rules
             .edit_managed_rule(id, Some(RuleAction::Allow), None, RulePinUpdate::Keep)
             .unwrap();
         assert_eq!(replacement.action, RuleAction::Allow);
         assert_eq!(replacement.access, Access::Write);
         assert_eq!(store.list().unwrap()[0].entry, replacement);
 
-        assert_eq!(eng.remove_managed_rule(id).unwrap().file, "/f");
+        assert_eq!(eng.rules.remove_managed_rule(id).unwrap().file, "/f");
         assert!(store.list().unwrap().is_empty());
-        assert_eq!(eng.managed_rules().len(), 1);
-        assert!(eng.managed_rules()[0].learned_id.is_none());
+        assert_eq!(eng.rules.managed_rules().len(), 1);
+        assert!(eng.rules.managed_rules()[0].learned_id.is_none());
     }
 
     #[test]
@@ -830,9 +962,13 @@ mod tests {
         let mut invalid = entry_for(Path::new("/usr/bin/other"), RuleAction::Allow);
         invalid.script_sha256 = Some("0".repeat(64));
 
-        assert!(eng.import_managed_rules(vec![valid, invalid]).is_err());
+        assert!(
+            eng.rules
+                .import_managed_rules(vec![valid, invalid])
+                .is_err()
+        );
         assert!(store.list().unwrap().is_empty());
-        assert!(eng.managed_rules().is_empty());
+        assert!(eng.rules.managed_rules().is_empty());
     }
 
     #[test]
@@ -850,8 +986,8 @@ mod tests {
         let mut lowercase = uppercase.clone();
         lowercase.sha256 = Some("a".repeat(64));
 
-        assert!(eng.add_managed_rule(uppercase).unwrap());
-        assert!(!eng.add_managed_rule(lowercase.clone()).unwrap());
+        assert!(eng.rules.add_managed_rule(uppercase).unwrap());
+        assert!(!eng.rules.add_managed_rule(lowercase.clone()).unwrap());
         assert_eq!(store.list().unwrap()[0].entry, lowercase);
     }
 
