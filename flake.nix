@@ -15,7 +15,7 @@
     {
       # ── Package (Linux) ───────────────────────────────────────────────────
       packages = forAllSystems (system: pkgs:
-        lib.optionalAttrs pkgs.stdenv.isLinux (
+        lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
           let
             file-guard = pkgs.rustPlatform.buildRustPackage {
               pname = "file-guard";
