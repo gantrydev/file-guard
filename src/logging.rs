@@ -24,20 +24,47 @@ pub struct AccessLogEntry {
 
 impl std::fmt::Display for AccessLogEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let timestamp = if f.alternate() {
+            chrono::DateTime::parse_from_rfc3339(&self.timestamp)
+                .map(|timestamp| {
+                    timestamp
+                        .with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M:%S %:z")
+                        .to_string()
+                })
+                .unwrap_or_else(|_| self.timestamp.clone())
+        } else {
+            self.timestamp.clone()
+        };
+        let decision = format!("{:<5}", self.decision);
+        let extra = self
+            .detail
+            .as_deref()
+            .map(|detail| format!(" [{detail}]"))
+            .unwrap_or_default();
+        let secondary = format!("(pid {}){extra}", self.pid);
+        let (timestamp, decision, secondary) = if f.alternate() {
+            let decision = match self.decision.as_str() {
+                "ALLOW" => crate::cli::styled(decision, 32),
+                "DENY" => crate::cli::styled(decision, 31),
+                _ => decision,
+            };
+            (
+                crate::cli::styled(timestamp, 2),
+                decision,
+                crate::cli::styled(secondary, 2),
+            )
+        } else {
+            (timestamp, decision, secondary)
+        };
         write!(
             f,
-            "{ts}  {dec:<5} {acc:<5} {file} ← {bin} (pid {pid}){extra}",
-            ts = self.timestamp,
-            dec = self.decision,
+            "{ts}  {dec} {acc:<5} {file} ← {bin} {secondary}",
+            ts = timestamp,
+            dec = decision,
             acc = self.access,
             file = self.file,
             bin = self.binary,
-            pid = self.pid,
-            extra = self
-                .detail
-                .as_deref()
-                .map(|d| format!(" [{d}]"))
-                .unwrap_or_default(),
         )
     }
 }
@@ -399,6 +426,28 @@ mod tests {
             pid,
             detail: None,
         }
+    }
+
+    #[test]
+    fn terminal_display_formats_local_time_without_changing_audit_data() {
+        let mut entry = entry(1);
+        entry.timestamp = "2026-10-23T08:05:18.570205685+00:00".into();
+        let timestamp = chrono::DateTime::parse_from_rfc3339(&entry.timestamp).unwrap();
+        let local = timestamp.with_timezone(&chrono::Local);
+
+        assert!(format!("{entry:#}").contains(&local.format("%Y-%m-%d %H:%M:%S %:z").to_string()));
+        assert!(format!("{entry}").starts_with(&entry.timestamp));
+        assert_eq!(
+            serde_json::to_value(&entry).unwrap()["timestamp"],
+            "2026-10-23T08:05:18.570205685+00:00"
+        );
+    }
+
+    #[test]
+    fn terminal_display_preserves_unrecognized_timestamps() {
+        let mut entry = entry(1);
+        entry.timestamp = "unknown".into();
+        assert!(format!("{entry:#}").contains("unknown"));
     }
 
     #[test]

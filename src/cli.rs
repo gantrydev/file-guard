@@ -3,6 +3,18 @@ use crate::policy::rule::Access;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+pub fn styled(value: impl std::fmt::Display, code: u8) -> String {
+    use std::io::IsTerminal;
+
+    if std::io::stdout().is_terminal()
+        && !std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
+    {
+        format!("\x1b[{code}m{value}\x1b[0m")
+    } else {
+        value.to_string()
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "file-guard",

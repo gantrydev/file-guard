@@ -38,8 +38,7 @@ pub(super) async fn execute(command: Command) -> anyhow::Result<()> {
             crate::control::stop()?;
         }
         Command::Status => {
-            let config = crate::config_runtime::load()?;
-            crate::control::status(&config)?;
+            crate::control::status()?;
         }
         Command::Log { lines, follow } => {
             let config = crate::config_runtime::load()?;

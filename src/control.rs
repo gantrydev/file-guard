@@ -5,6 +5,7 @@
 use crate::config::Config;
 use crate::config_runtime;
 use crate::logging;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -278,24 +279,50 @@ fn signal_daemon(identity: DaemonIdentity) -> anyhow::Result<()> {
 }
 
 /// Print daemon state, each watched file's mount status, and recent accesses.
-pub fn status(config: &Config) -> anyhow::Result<()> {
+pub fn status() -> anyhow::Result<()> {
     match running_pid()? {
-        Some(pid) => println!("daemon:  running (pid {pid})"),
-        None => println!("daemon:  not running"),
+        Some(pid) => println!(
+            "daemon:  {} {}",
+            crate::cli::styled("running", 32),
+            crate::cli::styled(format_args!("(pid {pid})"), 2),
+        ),
+        None => println!("daemon:  {}", crate::cli::styled("not running", 31)),
     }
+
+    let config = match config_runtime::load() {
+        Ok(config) => config,
+        Err(error) => match error.downcast_ref::<std::io::Error>().map(|e| e.kind()) {
+            Some(std::io::ErrorKind::PermissionDenied) if unsafe { libc::geteuid() } != 0 => {
+                println!(
+                    "\nwatched files and recent access unavailable: config is not readable; \
+                     run `sudo file-guard status` for details."
+                );
+                return Ok(());
+            }
+            Some(std::io::ErrorKind::NotFound) => {
+                println!("\nwatched files and recent access unavailable: {error}");
+                return Ok(());
+            }
+            _ => return Err(error),
+        },
+    };
 
     let mounts = fuse_mounts();
     println!("\nwatched files:");
     if config.watch.is_empty() {
         println!("  (none configured)");
     }
-    for path in config_runtime::watched_paths(config)? {
-        let state = if mounts.contains(&path) {
-            "mounted"
+    for path in config_runtime::watched_paths(&config)? {
+        let (state, color) = if mounts.contains(&path) {
+            ("mounted", 32)
         } else {
-            "not mounted"
+            ("not mounted", 31)
         };
-        println!("  [{state:>11}]  {}", path.display());
+        println!(
+            "  [{}]  {}",
+            crate::cli::styled(format_args!("{state:>11}"), color),
+            path.display(),
+        );
     }
 
     let log_dest = config.settings.log_destination.trim();
@@ -308,7 +335,11 @@ pub fn status(config: &Config) -> anyhow::Result<()> {
             println!("  (no entries)");
         }
         for e in entries {
-            println!("  {e}");
+            if std::io::stdout().is_terminal() {
+                println!("  {e:#}");
+            } else {
+                println!("  {e}");
+            }
         }
     }
     Ok(())
@@ -327,8 +358,13 @@ pub fn tail_log(config: &Config, n: usize, follow: bool) -> anyhow::Result<()> {
     let path = config_runtime::expand_path(dest)?;
 
     let initial = logging::read_recent_batch(&path, n)?;
+    let terminal = std::io::stdout().is_terminal();
     for entry in initial.entries {
-        println!("{entry}");
+        if terminal {
+            println!("{entry:#}");
+        } else {
+            println!("{entry}");
+        }
     }
     if !follow {
         return Ok(());
@@ -343,7 +379,11 @@ pub fn tail_log(config: &Config, n: usize, follow: bool) -> anyhow::Result<()> {
                 break;
             }
             for entry in batch.entries {
-                println!("{entry}");
+                if terminal {
+                    println!("{entry:#}");
+                } else {
+                    println!("{entry}");
+                }
             }
         }
     }

@@ -20,21 +20,24 @@ fn validate_env_path(var: &str, value: &OsStr) -> anyhow::Result<PathBuf> {
 
 pub fn load() -> anyhow::Result<Config> {
     let path = config_path()?;
-    let contents = read_operator_config(&path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => anyhow::anyhow!(
-            "no config found at {}. If the daemon should be running, check \
+    let contents = read_operator_config(&path).map_err(|e| {
+        let message = match e.kind() {
+            std::io::ErrorKind::NotFound => format!(
+                "no config found at {}. If the daemon should be running, check \
              `systemctl status file-guard`; otherwise point FILE_GUARD_CONFIG \
              at your config.",
-            path.display()
-        ),
-        std::io::ErrorKind::PermissionDenied if unsafe { libc::geteuid() } != 0 => {
-            anyhow::anyhow!(
-                "config at {} is not readable by this user; re-run with sudo \
-             (e.g. `sudo file-guard rules`).",
                 path.display()
-            )
-        }
-        _ => anyhow::anyhow!("failed to read config at {}: {e}", path.display()),
+            ),
+            std::io::ErrorKind::PermissionDenied if unsafe { libc::geteuid() } != 0 => {
+                format!(
+                    "config at {} is not readable by this user; re-run with sudo \
+             (e.g. `sudo file-guard rules`).",
+                    path.display()
+                )
+            }
+            _ => format!("failed to read config at {}: {e}", path.display()),
+        };
+        anyhow::Error::new(e).context(message)
     })?;
     let config: Config = toml::from_str(&contents)?;
     Ok(config)
