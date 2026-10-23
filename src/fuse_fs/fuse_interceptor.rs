@@ -318,7 +318,7 @@ impl Interceptor for FuseInterceptor {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
-        let sessions: Vec<_> = self.sessions.drain(..).collect();
+        let sessions = std::mem::take(&mut self.sessions);
         let mut errors = Vec::new();
         let mut retained = Vec::new();
         let manager = self
