@@ -94,7 +94,7 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn new() -> StoreResult<Self> {
-        if unsafe { libc::geteuid() } != 0 {
+        if rustix::process::geteuid().as_raw() != 0 {
             return Err(StoreError::UnsafeConfiguration(
                 "the snapshot database must be opened by the root daemon".to_string(),
             ));
@@ -554,13 +554,13 @@ fn prepare_private_root(path: &Path) -> StoreResult<PathBuf> {
     };
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != rustix::process::geteuid().as_raw()
         || metadata.mode() & 0o7777 != 0o700
     {
         return Err(StoreError::UnsafeConfiguration(format!(
             "snapshot root {} must be a mode-0700 directory owned by uid {}",
             path.display(),
-            unsafe { libc::geteuid() }
+            rustix::process::geteuid().as_raw()
         )));
     }
     if created {
@@ -596,7 +596,7 @@ fn validate_private_file(file: &File, label: &str) -> StoreResult<()> {
     let metadata = file.metadata()?;
     if !metadata.is_file()
         || metadata.nlink() != 1
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != rustix::process::geteuid().as_raw()
         || metadata.mode() & 0o7777 != 0o600
     {
         return Err(StoreError::UnsafeConfiguration(format!(
@@ -656,8 +656,7 @@ pub fn random_token() -> StoreResult<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::super::record::validate_snapshot;
     use super::*;
@@ -665,8 +664,6 @@ mod tests {
         FORMAT_VERSION, ObjectIdentity, OriginalState, RecordHeader, RestoreMetadata,
         RestoreOrigin, Timestamp, path_from_hex, path_to_hex, sha256,
     };
-
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     struct FailAt {
         point: StorePoint,
@@ -691,17 +688,6 @@ mod tests {
             }
             Ok(())
         }
-    }
-
-    fn directory(tag: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "file-guard-sqlite-{tag}-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        path
     }
 
     fn identity(inode: u64) -> ObjectIdentity {
@@ -824,7 +810,8 @@ mod tests {
 
     #[test]
     fn snapshot_and_metadata_commit_as_one_row() {
-        let root = directory("commit");
+        let directory = crate::testing::temp_dir("commit");
+        let root = directory.path().to_path_buf();
         let store = SqliteStore::open(root.clone()).unwrap();
         let path = Path::new("/credential");
         let initial = record(path);
@@ -848,7 +835,8 @@ mod tests {
             (StorePoint::BeforeCommit, false),
             (StorePoint::AfterCommit, true),
         ] {
-            let root = directory("fault");
+            let directory = crate::testing::temp_dir("fault");
+            let root = directory.path().to_path_buf();
             let hook = Arc::new(FailAt::new(point));
             let store = SqliteStore::open_with_hook(root.clone(), hook.clone()).unwrap();
             let path = Path::new("/credential");
@@ -871,7 +859,8 @@ mod tests {
 
     #[test]
     fn finalization_requires_a_durable_deletion_intent() {
-        let root = directory("delete");
+        let directory = crate::testing::temp_dir("delete");
+        let root = directory.path().to_path_buf();
         let store = SqliteStore::open(root.clone()).unwrap();
         let path = Path::new("/credential");
         let initial = record(path);
@@ -891,7 +880,8 @@ mod tests {
             (StorePoint::BeforeFinalization, false),
             (StorePoint::AfterFinalization, true),
         ] {
-            let root = directory("delete-fault");
+            let directory = crate::testing::temp_dir("delete-fault");
+            let root = directory.path().to_path_buf();
             let hook = Arc::new(FailAt::new(point));
             let store = SqliteStore::open_with_hook(root.clone(), hook.clone()).unwrap();
             let path = Path::new("/credential");
@@ -924,7 +914,8 @@ mod tests {
             (StorePoint::BeforeMarkerDelete, false),
             (StorePoint::AfterMarkerDelete, true),
         ] {
-            let root = directory("marker-delete-fault");
+            let directory = crate::testing::temp_dir("marker-delete-fault");
+            let root = directory.path().to_path_buf();
             let store = SqliteStore::open(root.clone()).unwrap();
             let path = Path::new("/credential");
             let deleting = deleting_record(path);
@@ -954,7 +945,8 @@ mod tests {
 
     #[test]
     fn malformed_absent_snapshot_is_rejected() {
-        let root = directory("absent");
+        let directory = crate::testing::temp_dir("absent");
+        let root = directory.path().to_path_buf();
         let store = SqliteStore::open(root.clone()).unwrap();
         let path = Path::new("/credential");
         let mut malformed = record(path);
@@ -972,7 +964,8 @@ mod tests {
 
     #[test]
     fn detached_inode_bindings_cannot_change() {
-        let root = directory("detached-binding");
+        let directory = crate::testing::temp_dir("detached-binding");
+        let root = directory.path().to_path_buf();
         let store = SqliteStore::open(root.clone()).unwrap();
         let path = Path::new("/credential");
         let captured = record(path);
@@ -1028,7 +1021,8 @@ mod tests {
 
     #[test]
     fn roots_are_exclusively_locked() {
-        let root = directory("lock");
+        let directory = crate::testing::temp_dir("lock");
+        let root = directory.path().to_path_buf();
         let store = SqliteStore::open(root.clone()).unwrap();
         assert!(matches!(
             SqliteStore::open(root.clone()),
@@ -1040,7 +1034,8 @@ mod tests {
 
     #[test]
     fn matching_version_without_snapshot_table_is_rejected() {
-        let root = directory("missing-table");
+        let directory = crate::testing::temp_dir("missing-table");
+        let root = directory.path().to_path_buf();
         drop(SqliteStore::open(root.clone()).unwrap());
         let connection = Connection::open(root.join(DATABASE_NAME)).unwrap();
         connection.execute_batch("DROP TABLE snapshots;").unwrap();

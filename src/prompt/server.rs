@@ -84,7 +84,7 @@ impl PromptServer {
 
     async fn handle_conn(&self, stream: UnixStream) -> anyhow::Result<()> {
         let peer = stream.peer_cred()?.uid();
-        let our_uid = unsafe { libc::getuid() };
+        let our_uid = rustix::process::getuid().as_raw();
         if peer != 0 && peer != our_uid {
             anyhow::bail!("rejecting prompt request from uid {peer}");
         }
@@ -226,6 +226,9 @@ fn systemd_listener() -> anyhow::Result<Option<std::os::unix::net::UnixListener>
 
     // SD_LISTEN_FDS_START - systemd passes the first listener as fd 3.
     const SD_LISTEN_FDS_START: i32 = 3;
+    // SAFETY: matching LISTEN_PID/FDS transfers this live descriptor from
+    // systemd to this process; this function is called once during agent startup.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(SD_LISTEN_FDS_START) };
     Ok(Some(listener))
 }

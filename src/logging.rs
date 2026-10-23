@@ -177,7 +177,7 @@ fn open_audit_append(path: &Path) -> anyhow::Result<std::fs::File> {
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let metadata = file.metadata()?;
-    let effective_uid = unsafe { libc::geteuid() };
+    let effective_uid = rustix::process::geteuid().as_raw();
     if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != effective_uid {
         anyhow::bail!(
             "audit log {} must be a singly-linked regular file owned by uid {effective_uid}",
@@ -405,17 +405,6 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    fn path() -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        std::env::temp_dir().join(format!(
-            "file-guard-audit-{}-{}.log",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
-
     fn entry(pid: u32) -> AccessLogEntry {
         AccessLogEntry {
             timestamp: "2026-01-01T00:00:00Z".into(),
@@ -452,7 +441,8 @@ mod tests {
 
     #[test]
     fn cursor_advances_only_past_complete_records() {
-        let path = path();
+        let path_directory = crate::testing::temp_dir("path");
+        let path = path_directory.path().join("file");
         let mut file = std::fs::File::create(&path).unwrap();
         writeln!(file, "{}", serde_json::to_string(&entry(1)).unwrap()).unwrap();
         let partial = serde_json::to_string(&entry(2)).unwrap();
@@ -477,7 +467,8 @@ mod tests {
 
     #[test]
     fn cursor_detects_file_replacement_even_when_the_new_file_is_larger() {
-        let path = path();
+        let path_directory = crate::testing::temp_dir("path");
+        let path = path_directory.path().join("file");
         std::fs::write(
             &path,
             format!("{}\n", serde_json::to_string(&entry(1)).unwrap()),
@@ -503,9 +494,12 @@ mod tests {
 
     #[test]
     fn audit_sink_rejects_symlinks_and_hard_links() {
-        let target = path();
-        let symlink_path = path();
-        let hardlink_path = path();
+        let target_directory = crate::testing::temp_dir("target");
+        let target = target_directory.path().join("file");
+        let symlink_path_directory = crate::testing::temp_dir("symlink_path");
+        let symlink_path = symlink_path_directory.path().join("file");
+        let hardlink_path_directory = crate::testing::temp_dir("hardlink_path");
+        let hardlink_path = hardlink_path_directory.path().join("file");
         std::fs::write(&target, b"").unwrap();
         symlink(&target, &symlink_path).unwrap();
         assert!(AccessLogger::new(symlink_path.to_str().unwrap()).is_err());
@@ -526,7 +520,8 @@ mod tests {
 
     #[test]
     fn audit_sink_rejects_group_or_world_writable_files() {
-        let path = path();
+        let path_directory = crate::testing::temp_dir("path");
+        let path = path_directory.path().join("file");
         std::fs::write(&path, b"").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
 

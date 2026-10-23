@@ -104,7 +104,7 @@ fn expected_source(token: &str) -> String {
 
 fn verify_mount(path: &Path, token: &str) -> anyhow::Result<Option<MountInfo>> {
     let expected = expected_source(token);
-    let expected_uid = unsafe { libc::geteuid() };
+    let expected_uid = rustix::process::geteuid().as_raw();
     let mounts = mounts_at(path)?;
     if let Some(unexpected) = mounts.iter().find(|mount| {
         mount.source != expected.as_bytes()
@@ -141,7 +141,9 @@ fn detach_stale_mount(path: &Path, token: &str) -> anyhow::Result<()> {
         verify_mount(path, token)?;
         return Ok(());
     };
-    if !mount.fs_type.starts_with("fuse") || mount.owner_uid != Some(unsafe { libc::geteuid() }) {
+    if !mount.fs_type.starts_with("fuse")
+        || mount.owner_uid != Some(rustix::process::geteuid().as_raw())
+    {
         anyhow::bail!("mount {} does not belong to file-guard", mount.id);
     }
     let target = rustix::fs::open(
@@ -164,9 +166,10 @@ fn detach_stale_mount(path: &Path, token: &str) -> anyhow::Result<()> {
     );
     let encoded_path = CString::new(format!("/proc/self/fd/{}", target.as_raw_fd()))?;
     // Abort the FUSE connection so open handles cannot keep session.join alive.
-    if unsafe { libc::umount2(encoded_path.as_ptr(), libc::MNT_FORCE | libc::MNT_DETACH) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
+    rustix::mount::unmount(
+        encoded_path.as_c_str(),
+        rustix::mount::UnmountFlags::FORCE | rustix::mount::UnmountFlags::DETACH,
+    )?;
     drop(target);
     if mountinfo()?.iter().any(|current| current.id == mount.id) {
         anyhow::bail!("mount remained present after detach")
@@ -277,7 +280,7 @@ impl Interceptor for FuseInterceptor {
                 let source = expected_source(&record.header.mount_token);
                 let mut config = Config::default();
                 config.mount_options = vec![MountOption::FSName(source.clone())];
-                if unsafe { libc::geteuid() == 0 } {
+                if rustix::process::geteuid().is_root() {
                     config.acl = SessionACL::All;
                 }
 
@@ -299,21 +302,16 @@ impl Interceptor for FuseInterceptor {
                         "fd={},rootmode={:o},user_id={},group_id={},allow_other",
                         device.as_raw_fd(),
                         libc::S_IFREG | 0o600,
-                        unsafe { libc::geteuid() },
-                        unsafe { libc::getegid() },
+                        rustix::process::geteuid().as_raw(),
+                        rustix::process::getegid().as_raw(),
                     ))?;
-                    if unsafe {
-                        libc::mount(
-                            source.as_ptr(),
-                            target_path.as_ptr(),
-                            c"fuse".as_ptr(),
-                            libc::MS_NODEV | libc::MS_NOSUID,
-                            options.as_ptr().cast(),
-                        )
-                    } != 0
-                    {
-                        return Err(std::io::Error::last_os_error().into());
-                    }
+                    rustix::mount::mount(
+                        source.as_c_str(),
+                        target_path.as_c_str(),
+                        c"fuse",
+                        rustix::mount::MountFlags::NODEV | rustix::mount::MountFlags::NOSUID,
+                        options.as_c_str(),
+                    )?;
                     let session =
                         fuser::Session::from_fd(credential_fs, device, config.acl, config)?;
                     Ok(session.spawn()?)

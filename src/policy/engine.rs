@@ -661,8 +661,8 @@ mod tests {
 
     #[test]
     fn sha256_mismatch_is_a_nonmatch_not_a_deny() {
-        let mut bin = std::env::temp_dir();
-        bin.push(format!("file-guard-engine-{}", std::process::id()));
+        let directory = crate::testing::temp_dir("engine");
+        let bin = directory.path().join("binary");
         std::fs::File::create(&bin)
             .unwrap()
             .write_all(b"v1")
@@ -699,7 +699,8 @@ mod tests {
 
     #[test]
     fn script_content_change_is_a_nonmatch() {
-        let dir = std::env::temp_dir();
+        let directory = crate::testing::temp_dir("script-pin");
+        let dir = directory.path();
         let bin = dir.join(format!("fg-interp-{}", std::process::id()));
         let script = dir.join(format!("fg-prog-{}.py", std::process::id()));
         std::fs::write(&bin, b"interp").unwrap();
@@ -743,7 +744,8 @@ mod tests {
 
     #[test]
     fn unpinned_interpreter_rule_still_checks_its_script_pin() {
-        let dir = std::env::temp_dir();
+        let directory = crate::testing::temp_dir("unpinned-interpreter");
+        let dir = directory.path();
         let bin = dir.join(format!("fg-unpinned-interp-{}", std::process::id()));
         let script = dir.join(format!("fg-unpinned-prog-{}.py", std::process::id()));
         std::fs::write(&bin, b"interp").unwrap();

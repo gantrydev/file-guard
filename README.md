@@ -361,7 +361,9 @@ jobs listed in its `needs` succeed; add every new CI job to that list so GitHub'
 required-check configuration stays unchanged.
 
 Zizmor blocks findings of low severity and above. Semgrep blocks every finding
-from `p/rust`; these registry rules are fetched at scan time.
+from `p/rust`; these registry rules are fetched at scan time. Reviewed FFI and
+test-only executable-path lookups have rule-specific `nosemgrep` annotations
+with their safety rationale beside the code.
 
 ## License
 
