@@ -36,7 +36,7 @@ package_upstream=${package_without_epoch%-*}
 [[ "$package_name" == file-guard ]] || fail "metadata Package is $package_name"
 [[ "$package_upstream" == "$expected_version" ]] || \
     fail "metadata upstream version is $package_upstream (expected $expected_version)"
-[[ "$package_arch" == amd64 ]] || fail "metadata Architecture is $package_arch"
+[[ "$package_arch" == "$(dpkg --print-architecture)" ]] || fail "metadata Architecture is $package_arch"
 [[ "$package_depends" == *fuse3* ]] || \
     fail "metadata Depends omits direct fuse3 dependency: $package_depends"
 pass "package metadata: $package_name $package_version $package_arch"

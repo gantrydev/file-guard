@@ -70,10 +70,12 @@ socket is root-anchored.
 
 ### Debian / Ubuntu
 
-Grab the `.deb` from a [release](https://github.com/gantrydev/file-guard/releases):
+Grab the `.deb` matching your architecture (`amd64` or `arm64`) from a
+[release](https://github.com/gantrydev/file-guard/releases).
+[Verify its provenance](packaging/README.md#verify-release-provenance) before installing:
 
 ```sh
-sudo apt install ./file-guard_*_amd64.deb
+sudo apt install ./file-guard_*_"$(dpkg --print-architecture)".deb
 ```
 
 It installs the binary, a root `file-guard.service`, and a socket-activated

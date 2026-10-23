@@ -7,6 +7,12 @@ local_deb=${FILE_GUARD_DEB_PATH:-}
 docker_bin=${DOCKER:-docker}
 require_fuse=${FILE_GUARD_REQUIRE_FUSE:-1}
 
+case $(uname -m) in
+    x86_64) deb_arch=amd64 ;;
+    aarch64|arm64) deb_arch=arm64 ;;
+    *) echo "error: unsupported host architecture $(uname -m)" >&2; exit 1 ;;
+esac
+
 command -v "$docker_bin" >/dev/null || {
     echo "error: Docker is required (set DOCKER to its executable)" >&2
     exit 1
@@ -53,7 +59,7 @@ else
         --retry 3 --retry-delay 1 \
         "$api_url" >"$release_json"
 
-    mapfile -t asset_info < <(python3 - "$release_json" <<'PY'
+    mapfile -t asset_info < <(python3 - "$release_json" "$deb_arch" <<'PY'
 import json
 import sys
 
@@ -64,10 +70,10 @@ assets = [
     asset
     for asset in release.get("assets", [])
     if asset.get("name", "").startswith("file-guard_")
-    and asset.get("name", "").endswith("_amd64.deb")
+    and asset.get("name", "").endswith(f"_{sys.argv[2]}.deb")
 ]
 if len(assets) != 1:
-    raise SystemExit(f"expected exactly one amd64 Debian asset, found {len(assets)}")
+    raise SystemExit(f"expected exactly one {sys.argv[2]} Debian asset, found {len(assets)}")
 
 asset = assets[0]
 print(release["tag_name"])
@@ -78,7 +84,7 @@ PY
     )
 
     if [[ "${#asset_info[@]}" -ne 4 || -z "${asset_info[0]}" || -z "${asset_info[1]}" || -z "${asset_info[2]}" ]]; then
-        echo "error: GitHub release did not contain a usable amd64 .deb asset" >&2
+        echo "error: GitHub release did not contain a usable $deb_arch .deb asset" >&2
         exit 1
     fi
 
@@ -108,7 +114,7 @@ fi
 echo "Building integration-test image $image"
 "$docker_bin" build \
     --pull \
-    --platform linux/amd64 \
+    --platform "linux/$deb_arch" \
     --file "$repo_root/Dockerfile.deb.test" \
     --tag "$image" \
     "$repo_root"
@@ -116,7 +122,7 @@ echo "Building integration-test image $image"
 echo "Running package integration checks"
 docker_args=(
     --rm
-    --platform linux/amd64
+    --platform "linux/$deb_arch"
     --security-opt=no-new-privileges
     --mount "type=bind,src=$deb_path,dst=/tmp/file-guard.deb,readonly"
     --env "FILE_GUARD_EXPECTED_VERSION=${release_tag#v}"

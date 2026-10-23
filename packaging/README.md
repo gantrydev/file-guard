@@ -2,7 +2,8 @@
 
 A `.deb` is built with [`cargo-deb`](https://github.com/kornelski/cargo-deb)
 from the `[package.metadata.deb]` block in `Cargo.toml` plus the files in this
-directory. CI builds and attaches it to each `v*` release; to build locally:
+directory. CI builds native amd64 and arm64 packages and attaches both to each
+`v*` release; to build locally:
 
 ```sh
 sudo apt-get install -y pkg-config libfuse3-dev      # build deps
@@ -38,8 +39,9 @@ scripts/test-deb-release.sh
 ```
 
 The runner resolves the latest GitHub release, verifies its published SHA-256
-digest, installs the amd64 package with `apt`, and checks its metadata, runtime
-dependencies, files, modes, systemd units, tmpfiles rule, CLI behavior, and a
+digest, installs the package matching the host architecture (amd64 or arm64)
+with `apt`, and checks its metadata, runtime dependencies, files, modes, systemd
+units, tmpfiles rule, CLI behavior, and a
 real SQLite/FUSE write, crash-restart, and restore lifecycle. Set
 `FILE_GUARD_RELEASE_TAG=v0.1.22` to test a specific release. The FUSE test passes
 `/dev/fuse` and `CAP_SYS_ADMIN` into the disposable container; set
@@ -48,6 +50,38 @@ FUSE. Before publishing, set `FILE_GUARD_DEB_PATH` and
 `FILE_GUARD_RELEASE_TAG` to run the same checks against a local package.
 Starting the units under systemd still requires a systemd PID 1 and is reported
 as an explicit skip.
+
+## Verify release provenance
+
+Releases include SHA256SUMS and signed SLSA build provenance for every archive
+and Debian package, generated with [GitHub artifact attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations).
+Both architectures must pass local package tests and provenance verification
+before the workflow publishes the release. The workflow then downloads and tests
+the published packages on both architectures.
+
+After downloading an asset, verify it with the GitHub CLI before installing.
+Set `tag` to the release you intend to install and `asset` to its downloaded path:
+
+```sh
+tag=v0.1.24
+asset=file-guard_0.1.24-1_arm64.deb
+gh attestation verify "$asset" \
+  --repo gantrydev/file-guard \
+  --signer-workflow gantrydev/file-guard/.github/workflows/release.yml \
+  --source-ref "refs/tags/$tag" \
+  --deny-self-hosted-runners
+```
+
+Use the exact asset filename from the release. The same command verifies an
+amd64 package or either architecture's `.tar.gz`. Add `--source-digest COMMIT_SHA`
+to require a specific source commit. To use the attached bundle instead of
+fetching the attestation from GitHub, add
+`--bundle file-guard-aarch64-linux.sigstore.json` for ARM64 or
+`--bundle file-guard-x86_64-linux.sigstore.json` for x86_64.
+
+`sha256sum --ignore-missing --check SHA256SUMS` checks downloaded asset integrity;
+it does not replace provenance verification. Releases published before this
+workflow change do not have these attestations.
 
 ## Setup
 
