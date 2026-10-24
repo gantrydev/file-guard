@@ -30,6 +30,16 @@ Recommends: `zenity` 3.16.2+ and `libnotify-bin` for GUI prompts / notifications
 Nothing is enabled or started on install - guarding real credentials is an
 explicit opt-in.
 
+## Linux archives
+
+The `x86_64-linux` and `aarch64-linux` release tarballs contain the native
+Ubuntu 24.04 build also used by the Debian package. They require glibc 2.39 or
+newer and do not require Nix. They contain only the executable; use the Debian
+package or NixOS module for the systemd services and configuration.
+
+Release CI extracts each archive and checks the CLI in a clean Ubuntu 24.04
+container without Nix before publishing it.
+
 ## Release package integration test
 
 Run the published `.deb` in a clean Ubuntu container:

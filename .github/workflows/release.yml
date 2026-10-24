@@ -23,20 +23,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-      - name: Build
-        run: nix build .#file-guard
-      - name: Package archive
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-          SYSTEM: ${{ matrix.system }}
-        run: |
-          install -Dm755 result/bin/file-guard "dist/file-guard"
-          mkdir -p release
-          tar -C dist -czf "release/file-guard-${RELEASE_TAG}-${SYSTEM}.tar.gz" file-guard
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
@@ -46,6 +32,28 @@ jobs:
         run: cargo install cargo-deb --version 3.8.0 --locked
       - name: Build .deb
         run: cargo deb --locked
+      - name: Package archive
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          SYSTEM: ${{ matrix.system }}
+        run: |
+          install -Dm755 target/release/file-guard "dist/file-guard"
+          mkdir -p release
+          tar -C dist -czf "release/file-guard-${RELEASE_TAG}-${SYSTEM}.tar.gz" file-guard
+      - name: Test built archive without Nix
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          SYSTEM: ${{ matrix.system }}
+        run: |
+          docker run --rm --network none --security-opt=no-new-privileges \
+            --mount "type=bind,src=$PWD/release/file-guard-${RELEASE_TAG}-${SYSTEM}.tar.gz,dst=/tmp/file-guard.tar.gz,readonly" \
+            ubuntu:24.04 sh -ec '
+              test ! -e /nix
+              mkdir /tmp/extracted
+              tar -xzf /tmp/file-guard.tar.gz -C /tmp/extracted
+              /tmp/extracted/file-guard --help
+              /tmp/extracted/file-guard agent --help
+            '
       - name: Test built .deb
         env:
           FILE_GUARD_RELEASE_TAG: ${{ github.ref_name }}
