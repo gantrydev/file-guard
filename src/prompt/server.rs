@@ -221,11 +221,11 @@ fn systemd_listener() -> anyhow::Result<Option<std::os::unix::net::UnixListener>
         anyhow::bail!("systemd agent listener must be a Unix socket");
     }
 
+    let fd = descriptor.into_raw_fd();
     // SAFETY: libsystemd validated this inherited descriptor; it is adopted
     // once during agent startup and owned by the listener from here on.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let listener =
-        unsafe { std::os::unix::net::UnixListener::from_raw_fd(descriptor.into_raw_fd()) };
+    let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
     Ok(Some(listener))
 }
 

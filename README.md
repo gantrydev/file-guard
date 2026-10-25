@@ -73,9 +73,6 @@ use the arrow keys to select an option and press **Enter** to confirm. Keyboard
 instructions are shown in both dialogs. In terminal mode, type the displayed
 choice number and press **Enter**.
 
-TODO: add SQLite-backed access history with aggregates such as counts and last
-allowed access, and support time-limited grants. Prompts do not scan audit logs.
-
 ## Install
 
 ### Debian / Ubuntu

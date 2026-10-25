@@ -260,6 +260,8 @@ mod tests {
         let path = directory.path().join("notify.sock");
         let listener = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
 
+        // This path only launches the test harness; it does not authorize access.
+        // nosemgrep: rust.lang.security.current-exe.current-exe
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -291,6 +293,8 @@ mod tests {
         let address = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
         let listener = std::os::unix::net::UnixDatagram::bind_addr(&address).unwrap();
 
+        // This path only launches the test harness; it does not authorize access.
+        // nosemgrep: rust.lang.security.current-exe.current-exe
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
