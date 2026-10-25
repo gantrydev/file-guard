@@ -196,14 +196,7 @@ fn read_operator_config(path: &Path) -> std::io::Result<String> {
     Ok(contents)
 }
 
-#[derive(Clone)]
-struct UserRecord {
-    uid: u32,
-    gid: u32,
-    home: PathBuf,
-}
-
-fn target_user() -> anyhow::Result<Option<UserRecord>> {
+fn target_user() -> anyhow::Result<Option<nix::unistd::User>> {
     for variable in ["FILE_GUARD_USER", "SUDO_USER"] {
         if let Some(name) = std::env::var_os(variable) {
             return lookup_user(&name)?.map(Some).ok_or_else(|| {
@@ -217,52 +210,15 @@ fn target_user() -> anyhow::Result<Option<UserRecord>> {
     Ok(None)
 }
 
-fn lookup_user(name: &OsStr) -> anyhow::Result<Option<UserRecord>> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let name = std::ffi::CString::new(name.as_bytes())?;
-    let mut buffer_len = 16 * 1024;
-    loop {
-        let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
-        let mut result = std::ptr::null_mut();
-        let mut buffer = vec![0_u8; buffer_len];
-        // SAFETY: the CString and writable record/buffer stay alive through getpwnam_r.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let status = unsafe {
-            libc::getpwnam_r(
-                name.as_ptr(),
-                record.as_mut_ptr(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &mut result,
-            )
-        };
-        if status == libc::ERANGE && buffer_len < 1024 * 1024 {
-            buffer_len *= 2;
-            continue;
-        }
-        if status != 0 {
-            return Err(std::io::Error::from_raw_os_error(status).into());
-        }
-        if result.is_null() {
-            return Ok(None);
-        }
-        // SAFETY: success with a non-null result initializes record and its NUL-terminated
-        // pw_dir points into buffer, which stays alive until the home path is copied.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let record = unsafe { record.assume_init() };
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let home = unsafe { std::ffi::CStr::from_ptr(record.pw_dir) };
-        return Ok(Some(UserRecord {
-            uid: record.pw_uid,
-            gid: record.pw_gid,
-            home: PathBuf::from(OsStr::from_bytes(home.to_bytes())),
-        }));
-    }
+fn lookup_user(name: &OsStr) -> anyhow::Result<Option<nix::unistd::User>> {
+    let name = name
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("user name must be valid UTF-8"))?;
+    Ok(nix::unistd::User::from_name(name)?)
 }
 
 fn target_home() -> anyhow::Result<Option<PathBuf>> {
-    Ok(target_user()?.map(|user| user.home).or_else(dirs::home_dir))
+    Ok(target_user()?.map(|user| user.dir).or_else(dirs::home_dir))
 }
 
 pub fn target_identity() -> anyhow::Result<(u32, u32)> {
@@ -273,7 +229,7 @@ pub fn target_identity() -> anyhow::Result<(u32, u32)> {
                 rustix::process::getgid().as_raw(),
             )
         },
-        |user| (user.uid, user.gid),
+        |user| (user.uid.as_raw(), user.gid.as_raw()),
     ))
 }
 
@@ -325,6 +281,23 @@ pub fn agent_socket_path() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_lookup_preserves_account_identity_and_home() {
+        let expected = nix::unistd::User::from_uid(nix::unistd::getuid())
+            .unwrap()
+            .unwrap();
+        let actual = lookup_user(OsStr::new(&expected.name)).unwrap().unwrap();
+        assert_eq!(
+            (actual.uid, actual.gid, actual.dir),
+            (expected.uid, expected.gid, expected.dir)
+        );
+        assert!(
+            lookup_user(OsStr::new("file-guard-test-missing-account"))
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn expand_path_leaves_absolute_paths_untouched() {
