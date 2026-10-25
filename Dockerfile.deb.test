@@ -7,10 +7,10 @@ RUN apt-get update \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo install cargo-deb --locked
+RUN cargo install cargo-deb --version 3.8.0 --locked
 
 WORKDIR /src
-COPY Cargo.toml Cargo.lock README.md LICENSE build.rs ./
+COPY Cargo.toml Cargo.lock README.md LICENSE THIRD_PARTY_NOTICES ./
 COPY configs ./configs
 COPY docs ./docs
 COPY packaging ./packaging
@@ -23,6 +23,8 @@ COPY --from=deb-builder /src/target/debian/*.deb /
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+
+RUN printf '%s\n' 'path-include=/usr/share/doc/file-guard/*' >> /etc/dpkg/dpkg.cfg.d/excludes
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \

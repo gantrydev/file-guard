@@ -3,7 +3,7 @@
 !Cargo.toml
 !LICENSE
 !README.md
-!build.rs
+!THIRD_PARTY_NOTICES
 !configs/
 !configs/**
 !docs/
