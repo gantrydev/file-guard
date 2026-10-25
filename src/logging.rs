@@ -83,6 +83,14 @@ pub struct AccessLogger {
     sink: Sink,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AccessHistory {
+    pub file_allowed: u64,
+    pub file_denied: u64,
+    pub binary_allowed: u64,
+    pub binary_denied: u64,
+}
+
 impl AccessLogger {
     /// `destination`: `"stdout"` (tracing/journal only) or a filesystem path
     /// (NDJSON audit file; `~` is expanded and the parent directory created).
@@ -96,6 +104,34 @@ impl AccessLogger {
             }
         };
         Ok(Self { sink })
+    }
+
+    pub fn history(&self, file: &Path, binary: &Path) -> anyhow::Result<Option<AccessHistory>> {
+        let Sink::File(path) = &self.sink else {
+            return Ok(None);
+        };
+        let audit = open_audit_read(path)?;
+        rustix::fs::flock(&audit, rustix::fs::FlockOperation::LockShared)?;
+        let mut history = AccessHistory::default();
+        scan_entries(std::io::BufReader::new(&audit), |entry| {
+            if entry.file != file.to_string_lossy() {
+                return;
+            }
+            let same_binary = entry.binary == binary.to_string_lossy();
+            match entry.decision.as_str() {
+                "ALLOW" => {
+                    history.file_allowed += 1;
+                    history.binary_allowed += u64::from(same_binary);
+                }
+                "DENY" => {
+                    history.file_denied += 1;
+                    history.binary_denied += u64::from(same_binary);
+                }
+                _ => {}
+            }
+        })?;
+        rustix::fs::flock(&audit, rustix::fs::FlockOperation::Unlock)?;
+        Ok(Some(history))
     }
 
     /// Log an access attempt.
@@ -243,11 +279,19 @@ pub(crate) fn read_recent_batch(path: &Path, n: usize) -> anyhow::Result<AuditBa
         Err(error) => return Err(error.into()),
     };
     rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared)?;
-    let result = scan_recent(std::io::BufReader::new(&file), n);
+    let mut recent = VecDeque::with_capacity(n);
+    let result = scan_entries(std::io::BufReader::new(&file), |entry| {
+        if n > 0 {
+            if recent.len() == n {
+                recent.pop_front();
+            }
+            recent.push_back(entry);
+        }
+    });
     rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock)?;
-    let (entries, offset) = result?;
+    let offset = result?;
     Ok(AuditBatch {
-        entries,
+        entries: recent.into_iter().collect(),
         cursor: AuditCursor {
             file: Some(file),
             offset,
@@ -346,11 +390,10 @@ pub(crate) fn read_new(
     }
 }
 
-fn scan_recent(
+fn scan_entries(
     mut reader: impl BufRead,
-    limit: usize,
-) -> anyhow::Result<(Vec<AccessLogEntry>, u64)> {
-    let mut recent = VecDeque::with_capacity(limit);
+    mut on_entry: impl FnMut(AccessLogEntry),
+) -> anyhow::Result<u64> {
     let mut line = Vec::new();
     let mut discarding = false;
     let mut consumed = 0_u64;
@@ -380,14 +423,8 @@ fn scan_recent(
             if newline.is_some() {
                 position += 1;
                 complete_offset = consumed + position as u64;
-                if !discarding
-                    && let Ok(entry) = serde_json::from_slice(&line)
-                    && limit > 0
-                {
-                    if recent.len() == limit {
-                        recent.pop_front();
-                    }
-                    recent.push_back(entry);
+                if !discarding && let Ok(entry) = serde_json::from_slice(&line) {
+                    on_entry(entry);
                 }
                 line.clear();
                 discarding = false;
@@ -397,7 +434,7 @@ fn scan_recent(
         consumed += available_len as u64;
     }
 
-    Ok((recent.into_iter().collect(), complete_offset))
+    Ok(complete_offset)
 }
 
 #[cfg(test)]
@@ -415,6 +452,93 @@ mod tests {
             pid,
             detail: None,
         }
+    }
+
+    #[test]
+    fn history_counts_decisions_for_the_file_and_executable_from_disk() {
+        let directory = crate::testing::temp_dir("history");
+        let path = directory.path().join("access.log");
+        let logger = AccessLogger::new(path.to_str().unwrap()).unwrap();
+        let mut denied = entry(2);
+        denied.decision = "DENY".into();
+        let mut other_binary = entry(3);
+        other_binary.binary = "/usr/bin/other".into();
+        let mut other_file = entry(4);
+        other_file.file = "/other-credential".into();
+        let mut unknown = entry(5);
+        unknown.decision = "UNKNOWN".into();
+        for entry in [entry(1), denied, other_binary, other_file, unknown] {
+            append_entry(&path, &entry).unwrap();
+        }
+        drop(logger);
+        let logger = AccessLogger::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            logger
+                .history(Path::new("/credential"), Path::new("/usr/bin/tool"))
+                .unwrap(),
+            Some(AccessHistory {
+                file_allowed: 2,
+                file_denied: 1,
+                binary_allowed: 1,
+                binary_denied: 1,
+            })
+        );
+        assert_eq!(
+            logger
+                .history(Path::new("/new-file"), Path::new("/usr/bin/tool"))
+                .unwrap(),
+            Some(AccessHistory::default())
+        );
+    }
+
+    #[test]
+    fn history_ignores_invalid_oversized_and_incomplete_records() {
+        let directory = crate::testing::temp_dir("history");
+        let path = directory.path().join("access.log");
+        let logger = AccessLogger::new(path.to_str().unwrap()).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "not json").unwrap();
+        file.write_all(&vec![b'x'; MAX_AUDIT_LINE_BYTES + 1])
+            .unwrap();
+        writeln!(file).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&entry(1)).unwrap()).unwrap();
+        write!(file, "{}", serde_json::to_string(&entry(2)).unwrap()).unwrap();
+        assert_eq!(
+            logger
+                .history(Path::new("/credential"), Path::new("/usr/bin/tool"))
+                .unwrap(),
+            Some(AccessHistory {
+                file_allowed: 1,
+                file_denied: 0,
+                binary_allowed: 1,
+                binary_denied: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn history_distinguishes_missing_logs_from_zero_decisions() {
+        let file = Path::new("/credential");
+        let binary = Path::new("/usr/bin/tool");
+        assert_eq!(
+            AccessLogger::new("journal")
+                .unwrap()
+                .history(file, binary)
+                .unwrap(),
+            None
+        );
+        let directory = crate::testing::temp_dir("history");
+        let path = directory.path().join("access.log");
+        let logger = AccessLogger::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            logger.history(file, binary).unwrap(),
+            Some(AccessHistory::default())
+        );
+        std::fs::remove_file(path).unwrap();
+        assert!(logger.history(file, binary).is_err());
     }
 
     #[test]

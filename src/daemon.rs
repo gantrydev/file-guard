@@ -35,6 +35,7 @@ impl Daemon {
             config_runtime::agent_socket_path()?,
             Duration::from_secs(config.settings.prompt_timeout),
             guarded_uid,
+            Arc::clone(&logger),
         ));
 
         let rule_store = Arc::new(RuleStore::open(rule_lease)?);

@@ -67,6 +67,7 @@ const ITEMS: &[GuiItem] = &[
 ];
 
 const TITLE: &str = "file-guard: credential access";
+const SHORTCUTS: &str = "Alt+D: Deny once · Alt+A: Allow once · Alt+S: Allow this session\nAlt+W: Always allow · Alt+Y: Always deny";
 const MAX_STDOUT_BYTES: usize = 16 * 1024;
 const BACKSTOP_GRACE: Duration = Duration::from_secs(2);
 
@@ -103,7 +104,7 @@ async fn zenity(req: &AgentRequest, timeout: Duration) -> GuiResult {
     cmd.arg("--question")
         .arg("--switch")
         .arg(format!("--title={TITLE}"))
-        .arg(format!("--text={}", req.summary()))
+        .arg(format!("--text={}\n\n{SHORTCUTS}", req.summary()))
         .arg("--no-markup")
         .arg("--width=560")
         .arg("--height=320")
@@ -120,7 +121,10 @@ async fn kdialog(req: &AgentRequest, timeout: Duration) -> GuiResult {
     cmd.arg("--title")
         .arg(TITLE)
         .arg("--radiolist")
-        .arg(req.summary());
+        .arg(format!(
+            "{}\n\nUse the arrow keys to select an option, then press Enter to confirm.",
+            req.summary()
+        ));
     for (i, item) in ITEMS.iter().enumerate() {
         cmd.arg(item.key);
         cmd.arg(item.label);

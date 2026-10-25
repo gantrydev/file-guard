@@ -619,6 +619,7 @@ mod tests {
             PathBuf::from("/nonexistent.sock"),
             Duration::from_secs(1),
             0,
+            Arc::new(crate::logging::AccessLogger::new("stdout").unwrap()),
         ));
         PolicyEngine::new(&config, client, Arc::new(MemoryRuleStore::new())).unwrap()
     }
@@ -868,6 +869,7 @@ mod tests {
             PathBuf::from("/nonexistent.sock"),
             Duration::from_millis(50),
             0,
+            Arc::new(crate::logging::AccessLogger::new("stdout").unwrap()),
         ));
         let eng = PolicyEngine::new(&config, client, Arc::new(MemoryRuleStore::new())).unwrap();
         let file = Path::new("/tmp/credential");
@@ -914,6 +916,7 @@ mod tests {
             PathBuf::from("/nonexistent.sock"),
             Duration::from_secs(1),
             0,
+            Arc::new(crate::logging::AccessLogger::new("stdout").unwrap()),
         ));
         let store = Arc::new(MemoryRuleStore::new());
         let eng = PolicyEngine::new(&config, client, store.clone()).unwrap();
@@ -957,6 +960,7 @@ mod tests {
             PathBuf::from("/nonexistent.sock"),
             Duration::from_secs(1),
             0,
+            Arc::new(crate::logging::AccessLogger::new("stdout").unwrap()),
         ));
         let store = Arc::new(MemoryRuleStore::new());
         let eng = PolicyEngine::new(&config, client, store.clone()).unwrap();
@@ -980,6 +984,7 @@ mod tests {
             PathBuf::from("/nonexistent.sock"),
             Duration::from_secs(1),
             0,
+            Arc::new(crate::logging::AccessLogger::new("stdout").unwrap()),
         ));
         let store = Arc::new(MemoryRuleStore::new());
         let eng = PolicyEngine::new(&config, client, store.clone()).unwrap();
@@ -1007,6 +1012,7 @@ mod tests {
             PathBuf::from("/nonexistent.sock"),
             Duration::from_millis(50),
             0,
+            Arc::new(crate::logging::AccessLogger::new("stdout").unwrap()),
         ));
         let eng = PolicyEngine::new(&config, client, Arc::new(MemoryRuleStore::new())).unwrap();
         let proc = info_for(Path::new("/usr/bin/whatever"));

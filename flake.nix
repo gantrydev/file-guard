@@ -171,6 +171,18 @@
             # `file-guard status|log|rules …` against the running daemon.
             environment.systemPackages = [ cfg.package ];
 
+            services.logrotate.settings.file-guard = {
+              files = lib.mkDefault [ "/var/lib/file-guard/*.log" ];
+              frequency = lib.mkDefault "monthly";
+              rotate = lib.mkDefault 12;
+              missingok = true;
+              notifempty = true;
+              compress = true;
+              delaycompress = true;
+              dateext = false;
+              create = "0644 root root";
+            };
+
             # Let the guarded user's processes reach the root-owned FUSE mount.
             programs.fuse.userAllowOther = true;
 

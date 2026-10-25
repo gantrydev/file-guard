@@ -785,6 +785,7 @@ mod tests {
                     PathBuf::from("/nonexistent.sock"),
                     Duration::from_millis(50),
                     0,
+                    Arc::new(crate::logging::AccessLogger::new("stdout").unwrap()),
                 )),
                 Arc::new(MemoryRuleStore::new()),
             )
@@ -1141,6 +1142,7 @@ mod tests {
                     PathBuf::from("/x.sock"),
                     Duration::from_millis(50),
                     0,
+                    Arc::new(crate::logging::AccessLogger::new("stdout").unwrap()),
                 )),
                 Arc::new(MemoryRuleStore::new()),
             )

@@ -66,6 +66,21 @@ unreachable, the daemon applies `default_action` (deny by default) - it never
 blocks. See [the agent socket note](#security-model--limitations) for why the
 socket is root-anchored.
 
+With the Zenity prompt focused, use **Alt+D** to deny once, **Alt+A** to allow
+once, **Alt+S** to allow this session, **Alt+W** to always allow, or **Alt+Y**
+to always deny. These shortcuts activate the choice immediately. In kdialog,
+use the arrow keys to select an option and press **Enter** to confirm. Keyboard
+instructions are shown in both dialogs. In terminal mode, type the displayed
+choice number and press **Enter**.
+
+Prompts also show previous allowed/denied access decisions for the file overall
+and for that file by the requesting executable. Counts come from the current
+NDJSON audit log, survive daemon restarts, and exclude the pending request.
+They cover all read/write access modes and all scripts using that executable;
+they are not counts of individual reads or proof that an operation succeeded.
+Rotated logs are excluded. With journal-only logging or an unreadable audit
+file, the prompt shows that history is unavailable.
+
 ## Install
 
 ### Debian / Ubuntu
@@ -227,6 +242,26 @@ opening divergent views of that state. The daemon reads the configured TOML
 directly; NixOS configurations can point `configFile` at a `pkgs.writeText` file.
 
 ## CLI
+
+The Debian package and NixOS module configure monthly rotation of
+`/var/lib/file-guard/*.log`, keeping 12 archives. The newest archive stays
+uncompressed as `.1`; older archives become `.2.gz` through `.12.gz` on
+subsequent rotations. Delayed compression lets in-flight writes finish.
+Empty and missing logs are skipped. Dialog history counts cover only the
+active log and reset after rotation.
+
+For a standalone installation, install your distribution's `logrotate` package
+and copy the supplied rule from this checkout:
+
+```sh
+sudo install -m 0644 packaging/logrotate/file-guard /etc/logrotate.d/file-guard
+```
+
+Ensure your system runs logrotate through its timer or cron job. For a custom
+log location outside `/var/lib/file-guard/*.log`, edit that rule; on NixOS, set
+`services.logrotate.settings.file-guard.files` to your log path. The NixOS
+module enables the logrotate timer automatically. Installing the rule does not
+force an immediate rotation.
 
 For file audit logs, rotate by renaming the log and creating a new file with the
 same secure ownership and permissions. The writer reopens the pathname for each

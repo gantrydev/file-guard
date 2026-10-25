@@ -39,12 +39,15 @@ package_upstream=${package_without_epoch%-*}
 [[ "$package_arch" == "$(dpkg --print-architecture)" ]] || fail "metadata Architecture is $package_arch"
 [[ "$package_depends" == *fuse3* ]] || \
     fail "metadata Depends omits direct fuse3 dependency: $package_depends"
+[[ "$package_depends" == *logrotate* ]] || \
+    fail "metadata Depends omits logrotate dependency: $package_depends"
 pass "package metadata: $package_name $package_version $package_arch"
 
 expected_archive_paths=(
     ./usr/bin/file-guard
     ./etc/file-guard/config.toml
     ./etc/default/file-guard
+    ./etc/logrotate.d/file-guard
     ./lib/systemd/system/file-guard.service
     ./lib/systemd/system/file-guard-agent@.socket
     ./lib/systemd/system/file-guard-agent@.service
@@ -79,6 +82,7 @@ assert_mode /usr/bin/file-guard 755
 for path in \
     /etc/file-guard/config.toml \
     /etc/default/file-guard \
+    /etc/logrotate.d/file-guard \
     /lib/systemd/system/file-guard.service \
     '/lib/systemd/system/file-guard-agent@.socket' \
     '/lib/systemd/system/file-guard-agent@.service' \
@@ -86,6 +90,11 @@ for path in \
     assert_mode "$path" 644
 done
 pass "installed file modes"
+
+dpkg-query --show --showformat='${Conffiles}' file-guard | \
+    grep -Fq ' /etc/logrotate.d/file-guard ' || fail "logrotate rule is not a conffile"
+logrotate --debug --state /dev/null /etc/logrotate.d/file-guard
+pass "installed logrotate rule syntax and conffile registration"
 
 grep -Eq '^default_action[[:space:]]*=[[:space:]]*"deny"' /etc/file-guard/config.toml || \
     fail "config default_action is not deny"

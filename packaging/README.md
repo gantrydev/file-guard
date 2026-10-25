@@ -22,13 +22,22 @@ cargo deb                                            # -> target/debian/file-gua
 | `/usr/lib/tmpfiles.d/file-guard.conf` | creates root-owned `/run/file-guard` |
 | `/etc/file-guard/config.toml` | config (conffile; guards nothing by default) |
 | `/etc/default/file-guard` | daemon environment (set `FILE_GUARD_USER`) |
+| `/etc/logrotate.d/file-guard` | monthly audit-log rotation (conffile) |
 
-Runtime deps: `fuse3` for manual unmount and recovery utilities. The root daemon
-mounts FUSE directly through `mount(2)`.
+Runtime deps: `fuse3` for manual unmount and recovery utilities, and `logrotate`
+for monthly audit-log rotation. The root daemon mounts FUSE directly through
+`mount(2)`.
 Recommends: `zenity` 3.16.2+ and `libnotify-bin` for GUI prompts / notifications.
 
-Nothing is enabled or started on install - guarding real credentials is an
-explicit opt-in.
+The file-guard units are not enabled or started on install - guarding real
+credentials is an explicit opt-in.
+
+The rotation rule covers `/var/lib/file-guard/*.log`, including `access.log`
+and `audit.log`. It keeps 12 archives, leaves the newest as `.1`, and gzips
+older archives as `.2.gz` through `.12.gz`. Empty and missing logs are skipped;
+the new log is root-owned with mode `0644`. No daemon restart is needed.
+If you change `log_destination` to another directory or extension, update
+`/etc/logrotate.d/file-guard` to match.
 
 ## Linux archives
 

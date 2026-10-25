@@ -1,6 +1,6 @@
 [package]
 name = "file-guard"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "Per-process credential access control daemon for Linux (FUSE)"
 license = "MIT"
@@ -21,14 +21,15 @@ FUSE file over each watched secret and only lets binaries you have authorized \
 (pinned by content hash, and script path for interpreters) read or write it; \
 everything else is denied or prompted via a desktop agent."""
 # fuse3 provides recovery utilities; $auto adds detected shared-library deps.
-depends = "fuse3, $auto"
+depends = "fuse3, logrotate, $auto"
 recommends = "zenity (>= 3.16.2), libnotify-bin"
-conf-files = ["/etc/file-guard/config.toml", "/etc/default/file-guard"]
+conf-files = ["/etc/file-guard/config.toml", "/etc/default/file-guard", "/etc/logrotate.d/file-guard"]
 maintainer-scripts = "packaging/debian"
 assets = [
     ["target/release/file-guard", "usr/bin/", "755"],
     ["packaging/config.toml", "etc/file-guard/config.toml", "644"],
     ["packaging/default/file-guard", "etc/default/file-guard", "644"],
+    ["packaging/logrotate/file-guard", "etc/logrotate.d/file-guard", "644"],
     ["packaging/systemd/file-guard.service", "lib/systemd/system/file-guard.service", "644"],
     ["packaging/systemd/file-guard-agent@.socket", "lib/systemd/system/file-guard-agent@.socket", "644"],
     ["packaging/systemd/file-guard-agent@.service", "lib/systemd/system/file-guard-agent@.service", "644"],

@@ -253,6 +253,7 @@ mod tests {
                 parents: Vec::new(),
             },
             timeout_ms: 60_000,
+            history: None,
         }
     }
 

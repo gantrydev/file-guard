@@ -6,6 +6,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
+use crate::logging::AccessHistory;
 use crate::policy::rule::Access;
 use crate::process::identify::ProcessInfo;
 use crate::prompt::types::UserChoice;
@@ -58,6 +59,8 @@ pub struct AgentRequest {
     pub file: String,
     pub process: ProcessDesc,
     pub timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<AccessHistory>,
 }
 
 /// Agent → daemon: the outcome of rendering the prompt.
@@ -133,9 +136,23 @@ impl AgentRequest {
             self.access.verb().to_uppercase(),
             self.file,
         );
-        match &self.process.script {
+        let head = match &self.process.script {
             Some(script) => format!("{head}\n\nvia script: {script}"),
             None => head,
+        };
+        format!("{head}\n\n{}", self.history_summary())
+    }
+
+    pub fn history_summary(&self) -> String {
+        match &self.history {
+            Some(history) => format!(
+                "Previous access decisions (current audit log):\nFile overall: {} allowed, {} denied\nBy this executable (all scripts): {} allowed, {} denied",
+                history.file_allowed,
+                history.file_denied,
+                history.binary_allowed,
+                history.binary_denied,
+            ),
+            None => "Access history unavailable.".into(),
         }
     }
 }
@@ -144,6 +161,47 @@ impl AgentRequest {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn requests_without_history_remain_compatible_and_do_not_claim_zero_accesses() {
+        let mut request: AgentRequest = serde_json::from_value(serde_json::json!({
+            "v": 1, "id": 42, "access": "read", "file": "/credential",
+            "process": {
+                "pid": 1, "binary_path": "/usr/bin/tool", "binary_name": "tool",
+                "script": null, "parents": []
+            },
+            "timeout_ms": 30000
+        }))
+        .unwrap();
+        assert!(request.history.is_none());
+        assert!(request.summary().contains("Access history unavailable."));
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("history")
+                .is_none()
+        );
+
+        request.history = Some(AccessHistory {
+            file_allowed: 20,
+            file_denied: 3,
+            binary_allowed: 5,
+            binary_denied: 1,
+        });
+        let decoded: AgentRequest =
+            serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        assert_eq!(decoded.history, request.history);
+        assert!(
+            decoded
+                .summary()
+                .contains("File overall: 20 allowed, 3 denied")
+        );
+        assert!(
+            decoded
+                .summary()
+                .contains("By this executable (all scripts): 5 allowed, 1 denied")
+        );
+    }
 
     #[tokio::test]
     async fn framed_json_round_trips() {
