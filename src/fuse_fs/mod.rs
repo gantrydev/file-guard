@@ -49,7 +49,6 @@ mod integration_tests {
             PathBuf::from("/nonexistent.sock"),
             Duration::from_millis(50),
             0,
-            Arc::new(crate::logging::AccessLogger::new("stdout").unwrap()),
         ))
     }
 
@@ -119,7 +118,6 @@ mod integration_tests {
                     socket,
                     Duration::from_secs(1),
                     rustix::process::geteuid().as_raw(),
-                    Arc::new(crate::logging::AccessLogger::new("stdout").unwrap()),
                 )),
                 Arc::new(MemoryRuleStore::new()),
             )

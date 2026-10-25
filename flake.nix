@@ -26,6 +26,10 @@
               buildInputs = [ pkgs.fuse3 ];
               # Nix 2.35's Linux sandbox blocks xattr syscalls; CI runs cargo test separately.
               doCheck = false;
+              postInstall = ''
+                install -Dm644 LICENSE "$out/share/doc/file-guard/LICENSE"
+                install -Dm644 THIRD_PARTY_NOTICES "$out/share/doc/file-guard/THIRD_PARTY_NOTICES"
+              '';
               meta = {
                 description = "Per-process credential file access control (FUSE)";
                 homepage = "https://github.com/gantrydev/file-guard";

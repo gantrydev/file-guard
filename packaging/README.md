@@ -43,8 +43,9 @@ If you change `log_destination` to another directory or extension, update
 
 The `x86_64-linux` and `aarch64-linux` release tarballs contain the native
 Ubuntu 24.04 build also used by the Debian package. They require glibc 2.39 or
-newer and do not require Nix. They contain only the executable; use the Debian
-package or NixOS module for the systemd services and configuration.
+newer and do not require Nix. They contain the executable, `LICENSE`, and
+`THIRD_PARTY_NOTICES`; use the Debian package or NixOS module for the systemd
+services and configuration.
 
 Release CI extracts each archive and checks the CLI in a clean Ubuntu 24.04
 container without Nix before publishing it.

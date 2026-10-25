@@ -73,13 +73,8 @@ use the arrow keys to select an option and press **Enter** to confirm. Keyboard
 instructions are shown in both dialogs. In terminal mode, type the displayed
 choice number and press **Enter**.
 
-Prompts also show previous allowed/denied access decisions for the file overall
-and for that file by the requesting executable. Counts come from the current
-NDJSON audit log, survive daemon restarts, and exclude the pending request.
-They cover all read/write access modes and all scripts using that executable;
-they are not counts of individual reads or proof that an operation succeeded.
-Rotated logs are excluded. With journal-only logging or an unreadable audit
-file, the prompt shows that history is unavailable.
+TODO: add SQLite-backed access history with aggregates such as counts and last
+allowed access, and support time-limited grants. Prompts do not scan audit logs.
 
 ## Install
 
@@ -247,8 +242,7 @@ The Debian package and NixOS module configure monthly rotation of
 `/var/lib/file-guard/*.log`, keeping 12 archives. The newest archive stays
 uncompressed as `.1`; older archives become `.2.gz` through `.12.gz` on
 subsequent rotations. Delayed compression lets in-flight writes finish.
-Empty and missing logs are skipped. Dialog history counts cover only the
-active log and reset after rotation.
+Empty and missing logs are skipped.
 
 For a standalone installation, install your distribution's `logrotate` package
 and copy the supplied rule from this checkout:
@@ -403,3 +397,6 @@ with their safety rationale beside the code.
 ## License
 
 MIT - see [LICENSE](LICENSE).
+
+Additional dependency license notices are in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)
+and included in the release archives, Debian package, and Nix package.

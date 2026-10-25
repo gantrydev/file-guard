@@ -28,7 +28,6 @@ pub async fn prompt(req: &AgentRequest) -> Option<UserChoice> {
         eprintln!("║  Chain:   {parent_chain}");
     }
     eprintln!("║  File:    {}", req.file);
-    eprintln!("{}", req.history_summary());
     eprintln!("╠══════════════════════════════════════════════════════╣");
     eprintln!("║  [1] Allow once                                      ║");
     eprintln!("║  [2] Allow always                                    ║");

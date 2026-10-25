@@ -53,6 +53,7 @@ expected_archive_paths=(
     ./lib/systemd/system/file-guard-agent@.service
     ./usr/lib/tmpfiles.d/file-guard.conf
     ./usr/share/doc/file-guard/docs/storage-v2.md
+    ./usr/share/doc/file-guard/THIRD_PARTY_NOTICES
 )
 archive_contents=$(dpkg-deb --contents "$deb")
 for path in "${expected_archive_paths[@]}"; do
@@ -90,6 +91,7 @@ for path in \
     assert_mode "$path" 644
 done
 pass "installed file modes"
+assert_mode /usr/share/doc/file-guard/THIRD_PARTY_NOTICES 644
 
 dpkg-query --show --showformat='${Conffiles}' file-guard | \
     grep -Fq ' /etc/logrotate.d/file-guard ' || fail "logrotate rule is not a conffile"

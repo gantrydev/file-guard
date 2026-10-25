@@ -444,7 +444,6 @@ mod tests {
             PathBuf::from("/nonexistent.sock"),
             Duration::from_secs(1),
             rustix::process::getuid().as_raw(),
-            Arc::new(crate::logging::AccessLogger::new("stdout").unwrap()),
         ));
         Arc::new(PolicyEngine::new(&config, prompt, Arc::new(MemoryRuleStore::new())).unwrap())
     }

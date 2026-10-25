@@ -208,28 +208,24 @@ fn build_listener(socket: Option<PathBuf>) -> anyhow::Result<UnixListener> {
 /// to us. The root system socket unit owns the listening fd, so the socket name
 /// can't be hijacked by same-uid malware.
 fn systemd_listener() -> anyhow::Result<Option<std::os::unix::net::UnixListener>> {
-    use std::os::unix::io::FromRawFd;
+    use libsystemd::activation::IsType;
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
 
-    let Ok(listen_pid) = std::env::var("LISTEN_PID") else {
+    let Some(descriptor) = libsystemd::activation::receive_descriptors(false)?
+        .into_iter()
+        .next()
+    else {
         return Ok(None);
     };
-    if listen_pid.parse::<u32>().ok() != Some(std::process::id()) {
-        return Ok(None);
-    }
-    let count: i32 = std::env::var("LISTEN_FDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    if count < 1 {
-        return Ok(None);
+    if !descriptor.is_unix() {
+        anyhow::bail!("systemd agent listener must be a Unix socket");
     }
 
-    // SD_LISTEN_FDS_START - systemd passes the first listener as fd 3.
-    const SD_LISTEN_FDS_START: i32 = 3;
-    // SAFETY: matching LISTEN_PID/FDS transfers this live descriptor from
-    // systemd to this process; this function is called once during agent startup.
+    // SAFETY: libsystemd validated this inherited descriptor; it is adopted
+    // once during agent startup and owned by the listener from here on.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(SD_LISTEN_FDS_START) };
+    let listener =
+        unsafe { std::os::unix::net::UnixListener::from_raw_fd(descriptor.into_raw_fd()) };
     Ok(Some(listener))
 }
 
@@ -253,7 +249,6 @@ mod tests {
                 parents: Vec::new(),
             },
             timeout_ms: 60_000,
-            history: None,
         }
     }
 

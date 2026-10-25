@@ -38,8 +38,9 @@ jobs:
           SYSTEM: ${{ matrix.system }}
         run: |
           install -Dm755 target/release/file-guard "dist/file-guard"
+          install -m644 LICENSE THIRD_PARTY_NOTICES dist/
           mkdir -p release
-          tar -C dist -czf "release/file-guard-${RELEASE_TAG}-${SYSTEM}.tar.gz" file-guard
+          tar -C dist -czf "release/file-guard-${RELEASE_TAG}-${SYSTEM}.tar.gz" file-guard LICENSE THIRD_PARTY_NOTICES
       - name: Test built archive without Nix
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -51,6 +52,8 @@ jobs:
               test ! -e /nix
               mkdir /tmp/extracted
               tar -xzf /tmp/file-guard.tar.gz -C /tmp/extracted
+              test -s /tmp/extracted/LICENSE
+              test -s /tmp/extracted/THIRD_PARTY_NOTICES
               /tmp/extracted/file-guard --help
               /tmp/extracted/file-guard agent --help
             '

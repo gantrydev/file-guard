@@ -35,7 +35,6 @@ impl Daemon {
             config_runtime::agent_socket_path()?,
             Duration::from_secs(config.settings.prompt_timeout),
             guarded_uid,
-            Arc::clone(&logger),
         ));
 
         let rule_store = Arc::new(RuleStore::open(rule_lease)?);
@@ -199,75 +198,19 @@ fn remove_config_pointer() {
     }
 }
 
-/// Notify systemd that the daemon has finished startup (all mounts up). Uses
-/// the `NOTIFY_SOCKET` environment variable directly — no link-time dependency
-/// on libsystemd. If the daemon is not running under systemd (no socket), this
-/// is a silent no-op.
 fn notify_systemd_ready() {
-    send_systemd_notification(b"READY=1");
+    if let Err(error) = libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Ready])
+    {
+        tracing::warn!("systemd readiness notification failed: {error}");
+    }
 }
 
-/// Notify systemd that the daemon is stopping.
 fn notify_systemd_stopping() {
-    send_systemd_notification(b"STOPPING=1");
-}
-
-fn send_systemd_notification(state: &[u8]) {
-    let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") else {
-        return;
-    };
-
-    if socket_path.contains('\0') {
-        tracing::warn!("NOTIFY_SOCKET contains NUL byte, ignoring");
-        return;
+    if let Err(error) =
+        libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Stopping])
+    {
+        tracing::warn!("systemd stopping notification failed: {error}");
     }
-    if !socket_path.starts_with('/') && !socket_path.starts_with('@') {
-        tracing::warn!(
-            "NOTIFY_SOCKET must be absolute or abstract, ignoring: {}",
-            socket_path
-        );
-        return;
-    }
-    if socket_path.len() > 256 {
-        tracing::warn!("NOTIFY_SOCKET path is too long, ignoring");
-        return;
-    }
-
-    if let Err(error) = send_systemd_notification_to(&socket_path, state) {
-        tracing::warn!("systemd notification failed: {error}");
-    }
-}
-
-fn send_systemd_notification_to(socket_path: &str, state: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::net::UnixDatagram;
-
-    let socket = UnixDatagram::unbound()?;
-    if let Some(name) = socket_path.strip_prefix('@') {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::linux::net::SocketAddrExt;
-
-            let address = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
-            socket.send_to_addr(state, &address)?;
-            return Ok(());
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = name;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "abstract Unix sockets are only supported on Linux",
-            ));
-        }
-    }
-    if !socket_path.starts_with('/') {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "NOTIFY_SOCKET must be an absolute or abstract Unix socket path",
-        ));
-    }
-    socket.send_to(state, socket_path)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -317,11 +260,25 @@ mod tests {
         let path = directory.path().join("notify.sock");
         let listener = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
 
-        send_systemd_notification_to(path.to_str().unwrap(), b"READY=1").unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon::tests::send_systemd_notifications",
+                "--ignored",
+            ])
+            .env("NOTIFY_SOCKET", &path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        listener
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
 
         let mut received = [0; 32];
-        let length = listener.recv(&mut received).unwrap();
-        assert_eq!(&received[..length], b"READY=1");
+        for expected in [b"READY=1\n".as_slice(), b"STOPPING=1\n"] {
+            let length = listener.recv(&mut received).unwrap();
+            assert_eq!(&received[..length], expected);
+        }
         std::fs::remove_file(path).unwrap();
     }
 
@@ -334,10 +291,31 @@ mod tests {
         let address = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
         let listener = std::os::unix::net::UnixDatagram::bind_addr(&address).unwrap();
 
-        send_systemd_notification_to(&format!("@{name}"), b"STOPPING=1").unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "daemon::tests::send_systemd_notifications",
+                "--ignored",
+            ])
+            .env("NOTIFY_SOCKET", format!("@{name}"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        listener
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
 
         let mut received = [0; 32];
-        let length = listener.recv(&mut received).unwrap();
-        assert_eq!(&received[..length], b"STOPPING=1");
+        for expected in [b"READY=1\n".as_slice(), b"STOPPING=1\n"] {
+            let length = listener.recv(&mut received).unwrap();
+            assert_eq!(&received[..length], expected);
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess entry point for notification tests"]
+    fn send_systemd_notifications() {
+        notify_systemd_ready();
+        notify_systemd_stopping();
     }
 }

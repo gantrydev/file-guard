@@ -4,14 +4,12 @@
 //! never blocks indefinitely on a missing agent.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::net::UnixStream;
 
 use crate::config::DefaultAction;
-use crate::logging::AccessLogger;
 use crate::policy::rule::Access;
 use crate::process::identify::ProcessInfo;
 use crate::prompt::protocol::{
@@ -29,21 +27,14 @@ pub struct PromptClient {
     /// other uid is rejected - defense in depth on top of the root-owned socket
     /// directory.
     expected_uid: u32,
-    logger: Arc<AccessLogger>,
 }
 
 impl PromptClient {
-    pub fn new(
-        socket_path: PathBuf,
-        timeout: Duration,
-        expected_uid: u32,
-        logger: Arc<AccessLogger>,
-    ) -> Self {
+    pub fn new(socket_path: PathBuf, timeout: Duration, expected_uid: u32) -> Self {
         Self {
             socket_path,
             timeout,
             expected_uid,
-            logger,
         }
     }
 
@@ -98,23 +89,6 @@ impl PromptClient {
             })
             .collect();
 
-        let logger = Arc::clone(&self.logger);
-        let history_file = file.to_path_buf();
-        let binary = process.binary_path.clone();
-        let history =
-            match tokio::task::spawn_blocking(move || logger.history(&history_file, &binary)).await
-            {
-                Ok(Ok(history)) => history,
-                Ok(Err(error)) => {
-                    tracing::warn!("cannot read access history: {error}");
-                    None
-                }
-                Err(error) => {
-                    tracing::warn!("access history task failed: {error}");
-                    None
-                }
-            };
-
         let req = AgentRequest {
             v: PROTOCOL_VERSION,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -122,7 +96,6 @@ impl PromptClient {
             file: file.to_string_lossy().into_owned(),
             process: process_desc,
             timeout_ms: self.timeout.as_millis() as u64,
-            history,
         };
 
         let exchange = async {
