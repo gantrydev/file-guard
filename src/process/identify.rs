@@ -93,6 +93,10 @@ pub(crate) fn is_interpreter(name: &str) -> bool {
 // A process can change cwd after loading its script. Only absolute paths and
 // recognized argument forms can narrow an automatic permanent grant.
 fn extract_script(args: &[String], binary_name: &str) -> Option<PathBuf> {
+    let stem = binary_name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    if matches!(stem, "node" | "nodejs" | "bun" | "deno") {
+        return super::runtime_args::extract_script(args, stem).and_then(canonical_file);
+    }
     let mut it = args.iter().skip(1);
     if binary_name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.') == "java" {
         if it.next()? != "-jar" {
@@ -171,6 +175,26 @@ mod tests {
     }
 
     #[test]
+    fn javascript_entry_points_must_resolve_to_existing_absolute_files() {
+        let directory = crate::testing::temp_dir("runtime-script");
+        let script = directory.path().join("worker.js");
+        std::fs::write(&script, b"console.log('worker')").unwrap();
+        for runtime in ["node", "nodejs", "bun", "deno"] {
+            let mut args = vec![runtime.to_owned()];
+            if matches!(runtime, "bun" | "deno") {
+                args.push("run".to_owned());
+            }
+            args.extend(["--conditions".to_owned(), "development".to_owned()]);
+            args.push(script.to_str().unwrap().to_owned());
+            assert_eq!(extract_script(&args, runtime), Some(script.clone()));
+            *args.last_mut().unwrap() = directory.path().join("missing.js").display().to_string();
+            assert_eq!(extract_script(&args, runtime), None);
+            *args.last_mut().unwrap() = "worker.js".to_owned();
+            assert_eq!(extract_script(&args, runtime), None);
+        }
+    }
+
+    #[test]
     fn script_arguments_must_be_absolute_and_unambiguous() {
         let directory = crate::testing::temp_dir("script");
         let dir = directory.path();
@@ -216,7 +240,7 @@ mod tests {
                 &args(&["node", "--require", &value_path, &script_path]),
                 "node"
             ),
-            None
+            Some(script.clone())
         );
         assert_eq!(
             extract_script(&args(&["node", &script_path]), "node"),

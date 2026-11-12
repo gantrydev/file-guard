@@ -328,7 +328,12 @@ Known limitations - read before relying on this:
   impersonate the pinned contents. Automatic permanent grants require a
   resolved absolute script path in a recognized argument form. Relative paths,
   ambiguous options, and inline code can receive only transient grants; invoke
-  scripts by absolute path to create permanent rules. Nothing can stop a
+  scripts by absolute path to create permanent rules. Node, Bun, and Deno use a
+  shared parser with explicit runtime syntax tables, including Node worker
+  options and Bun/Deno `run` commands. Recognized options consume their own
+  values; unknown options, package tasks, and remote entry points stay unresolved.
+  Extend `src/process/runtime_args.rs` with syntax and regression cases when
+  adding runtime options. Nothing can stop a
   compromised dependency *inside* the legitimate tool from reading the secret
   that tool is authorized to use. Strongest for compiled tools, where the binary
   *is* the identity.

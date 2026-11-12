@@ -792,10 +792,45 @@ mod tests {
     }
 
     #[test]
+    fn resolved_javascript_grants_persist_and_remain_script_scoped() {
+        let directory = crate::testing::temp_dir("runtime-grant");
+        let script = directory.path().join("worker.js");
+        let other_script = directory.path().join("other.js");
+        std::fs::write(&script, b"console.log('worker')").unwrap();
+        std::fs::write(&other_script, b"console.log('other')").unwrap();
+        let file = Path::new("/protected");
+        for runtime in ["node", "nodejs", "bun", "deno"] {
+            let eng = engine();
+            let binary = directory.path().join(runtime);
+            std::fs::write(&binary, b"runtime").unwrap();
+            let mut process = info_for(&binary);
+            process.binary_name = runtime.into();
+            process.script = Some(script.clone());
+            eng.persist_rule(&process, file, Access::Any, Action::Allow)
+                .unwrap();
+            assert_eq!(eng.rules.managed_rules().len(), 1);
+            for access in [Access::Read, Access::Write] {
+                assert_eq!(
+                    eng.rules.lookup_rule(&process, file, access),
+                    Some(Action::Allow)
+                );
+            }
+            process.script = Some(other_script.clone());
+            assert_eq!(eng.rules.lookup_rule(&process, file, Access::Read), None);
+            process.script = None;
+            assert_eq!(eng.rules.lookup_rule(&process, file, Access::Read), None);
+        }
+    }
+
+    #[test]
     fn unresolved_interpreter_does_not_create_a_permanent_grant() {
         let eng = engine();
         let mut process = info_for(Path::new("/usr/bin/tool"));
         for name in [
+            "node",
+            "nodejs",
+            "bun",
+            "deno",
             "python3",
             "perl5.36.0",
             "ruby3.2",
